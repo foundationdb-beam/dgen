@@ -1,0 +1,4 @@
+-define(IS_DB(Db, Dir), {Db={erlfdb_database, _}, Dir}).
+-define(IS_TD, {{erlfdb_transaction, _}, _Dir}).
+-define(IS_TX(Tx, Dir), {Tx={erlfdb_transaction, _}, Dir}).
+-define(FUTURE(Var), {erlfdb_future, Var, _}).

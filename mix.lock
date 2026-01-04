@@ -1,0 +1,3 @@
+%{
+  "erlfdb": {:hex, :erlfdb, "0.3.3", "7d98a46a29f831a5f8d08add2afa3afc3be730a2fc1c1c011ee6e2778215b235", [:rebar3], [], "hexpm", "da94fe0c5c5443fda4d07a280d3f4c37c6a950b445b6a3aad6f3394a8ce8b497"},
+}
