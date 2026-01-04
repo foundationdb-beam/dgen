@@ -1,4 +1,4 @@
-# Dgen
+# DGen
 
 dgen provides a distributed gen_server.
 
