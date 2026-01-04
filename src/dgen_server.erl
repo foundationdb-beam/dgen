@@ -15,20 +15,20 @@
 -include("../include/dgen.hrl").
 
 -callback init(Args :: term()) -> {ok, State :: term()} | {error, Reason :: term()}.
--callback key(State :: term()) -> Key :: tuple().
+-callback tuid(State :: term()) -> Tuid :: tuple().
 -callback handle_cast(Msg :: term(), State :: term()) -> {noreply, NewState :: term()}.
 -callback handle_call(Request :: term(), From :: term(), State :: term()) ->
     {reply, Reply :: term(), NewState :: term()} | {noreply, NewState :: term()}.
 -callback handle_info(Info :: term(), State :: term()) -> {noreply, NewState :: term()}.
 
--optional_callbacks([key/1, handle_cast/2, handle_call/3, handle_info/2]).
+-optional_callbacks([tuid/1, handle_cast/2, handle_call/3, handle_info/2]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
--define(DefaultKey(Mod), {<<"dgen_server">>, atom_to_binary(Mod)}).
+-define(DefaultTuid(Mod), {<<"dgen_server">>, atom_to_binary(Mod)}).
 -define(TxCallbackTimeout, 5000).
 
--record(state, {tenant, mod, key, watch}).
+-record(state, {tenant, mod, tuid, watch}).
 
 start(Mod, Arg, Opts) ->
     Consume = proplists:get_value(consume, Opts, true),
@@ -87,7 +87,7 @@ init({Tenant, Mod, Arg, Consume, Reset}) ->
         {ok, InitialState} ->
             State0 = #state{tenant = Tenant, mod = Mod},
             State = State0#state{
-                key = invoke_pure_callback(key, [InitialState], State0, ?DefaultKey(Mod))
+                tuid = invoke_pure_callback(tuid, [InitialState], State0, ?DefaultTuid(Mod))
             },
             init_mod_state(Tenant, InitialState, Reset, State),
             [gen_server:cast(self(), consume) || Consume],
@@ -96,30 +96,23 @@ init({Tenant, Mod, Arg, Consume, Reset}) ->
             Other
     end.
 
-handle_call(
-    {call, Request, WatchTo}, _LocalFrom, State = #state{tenant = Tenant, key = Key, watch = undefined}
-) ->
-    % if there's no watch, then assume the queue is nonempty, and push the request
-    {CallKey, Watch} =  dgen_queue:push_call(Tenant, Key, Request, WatchTo),
-    {reply, {Tenant, CallKey, Watch}, State};
-handle_call(
-    {call, Request, WatchTo}, _LocalFrom, State = #state{tenant = Tenant, key = Key, watch = _ConsumeWatch}
-) ->
-    % if there's a watch, we pay for the queue length check, assuming it will be 0 in most cases. If
+handle_call( {call, Request, WatchTo}, _LocalFrom, State = #state{tenant = Tenant, tuid = Tuid} ) ->
+    % if there's no watch, then assume the queue is nonempty, and we must push the request
+    %
+    % @todo: if there's a watch, we can pay for a queue length check, assuming it will be 0 in most cases. If
     % it is zero, then we can handle the call immediately without pushing it onto the queue.
-    {Resp, Actions} = handle_new_call(Tenant, Tenant, Key, Request, WatchTo, State),
-    _ = handle_actions(Actions),
-    Resp;
+    {CallKeyBin, Watch} =  dgen:push_call(Tenant, Tuid, Request, WatchTo),
+    {reply, {noreply, {Tenant, CallKeyBin, Watch}}, State};
 handle_call({priority, Request}, _From, State = #state{tenant = Tenant}) ->
     From = make_ref(),
     {Actions, Reply, State2} = handle_new_priority_call(Tenant, Request, From, State),
     _ = handle_actions(Actions),
     {reply, Reply, State2}.
 
-handle_cast(consume, State = #state{tenant = Tenant, key = Key}) ->
+handle_cast(consume, State = #state{tenant = Tenant, tuid = Tuid}) ->
     % 1 at a time because we are limited to 5 seconds per transaction
     K = 1,
-    {Watch, Actions, State2} = handle_consume(Tenant, K, Key, State),
+    {Watch, Actions, State2} = handle_consume(Tenant, K, Tuid, State),
     _ = handle_actions(Actions),
     case Watch of
         undefined ->
@@ -128,18 +121,18 @@ handle_cast(consume, State = #state{tenant = Tenant, key = Key}) ->
             ok
     end,
     {noreply, State2#state{watch = Watch}};
-handle_cast({cast, Requests}, State = #state{tenant = Tenant, key = Key}) ->
-    dgen_queue:push_k(Tenant, Key, [{cast, Request} || Request <- Requests]),
+handle_cast({cast, Requests}, State = #state{tenant = Tenant, tuid = Tuid}) ->
+    dgen_queue:push_k(Tenant, Tuid, [{cast, Request} || Request <- Requests]),
     {noreply, State};
 handle_cast({priority, Request}, State = #state{tenant = Tenant}) ->
     {Actions, State2} = handle_new_priority_cast(Tenant, Request, State),
     _ = handle_actions(Actions),
     {noreply, State2};
-handle_cast({kill, Reason}, State = #state{tenant = Tenant, key = Key}) ->
-    delete(Tenant, Key),
+handle_cast({kill, Reason}, State = #state{tenant = Tenant, tuid = Tuid}) ->
+    delete(Tenant, Tuid),
     {stop, Reason, State}.
 
-handle_info({Ref, ready}, State = #state{watch = {erlfdb_future, Ref, _}}) ->
+handle_info({Ref, ready}, State = #state{watch = ?FUTURE(Ref)}) ->
     handle_cast(consume, State#state{watch = undefined});
 handle_info(Info, State = #state{tenant = Tenant}) ->
     {Actions, State2} = handle_info(Tenant, Info, State),
@@ -202,12 +195,12 @@ invoke_pure_callback(Callback, Args, #state{mod = Mod}) ->
 modify_args_for_callback(_, Args, ModState) ->
     Args ++ [ModState].
 
-delete(?IS_DB(Db, Dir), Key) ->
-    erlfdb:transactional(Db, fun(Tx) -> delete({Tx, Dir}, Key) end);
-delete(?IS_TX(Tx, Dir), Key) ->
-    clear_mod_state(Tx, Key),
-    dgen_queue:delete(Tx, Key),
-    WaitingKey = dgen:get_waiting_key(Key),
+delete(?IS_DB(Db, Dir), Tuid) ->
+    erlfdb:transactional(Db, fun(Tx) -> delete({Tx, Dir}, Tuid) end);
+delete(?IS_TX(Tx, Dir), Tuid) ->
+    clear_mod_state(Tx, Tuid),
+    dgen_queue:delete(Tx, Tuid),
+    WaitingKey = dgen:get_waiting_key(Tuid),
     {SK, EK} = erlfdb_directory:range(Dir, WaitingKey),
     erlfdb:clear_range(Tx, SK, EK).
 
@@ -223,17 +216,17 @@ init_mod_state(?IS_TD = Td, InitialState, Reset, State) ->
             set_mod_state(Td, InitialState, State)
     end.
 
-clear_mod_state(?IS_DB(Db, Dir), Key) ->
-    erlfdb:transactional(Db, fun(Tx) -> clear_mod_state({Tx, Dir}, Key) end);
-clear_mod_state(?IS_TX(Tx, Dir), Key) ->
-    StateKey = get_state_key(Key),
+clear_mod_state(?IS_DB(Db, Dir), Tuid) ->
+    erlfdb:transactional(Db, fun(Tx) -> clear_mod_state({Tx, Dir}, Tuid) end);
+clear_mod_state(?IS_TX(Tx, Dir), Tuid) ->
+    StateKey = get_state_key(Tuid),
     {SK, EK} = erlfdb_directory:range(Dir, StateKey),
     erlfdb:clear_range(Tx, SK, EK).
 
 get_mod_state(?IS_DB(Db, Dir), State) ->
     erlfdb:transactional(Db, fun(Tx) -> get_mod_state({Tx, Dir}, State) end);
-get_mod_state(?IS_TX(Tx, Dir), _State = #state{key = Key}) ->
-    StateKey = get_state_key(Key),
+get_mod_state(?IS_TX(Tx, Dir), _State = #state{tuid = Tuid}) ->
+    StateKey = get_state_key(Tuid),
     {SK, EK} = erlfdb_directory:range(Dir, StateKey),
     case erlfdb:get_range(Tx, SK, EK, [{wait, true}]) of
         [] ->
@@ -250,10 +243,10 @@ set_mod_state(DbOrTx, _OrigModState, ModState, State) ->
 
 set_mod_state(?IS_DB(Db, Dir), ModState, State) ->
     erlfdb:transactional(Db, fun(Tx) -> set_mod_state({Tx, Dir}, ModState, State) end);
-set_mod_state(?IS_TX(Tx, Dir), ModState, _State = #state{key = Key}) ->
+set_mod_state(?IS_TX(Tx, Dir), ModState, _State = #state{tuid = Tuid}) ->
     Bin = term_to_binary(ModState),
     Chunks = binary_chunk_every(Bin, 100000, []),
-    StateKey = get_state_key(Key),
+    StateKey = get_state_key(Tuid),
     {ChunkKeys, {FirstUnused, EK}} = partition_chunked_key(Dir, StateKey, length(Chunks)),
     [erlfdb:set(Tx, erlfdb_directory:pack(Dir, K), Chunk) || {K, Chunk} <- lists:zip(ChunkKeys, Chunks)],
     erlfdb:clear_range(Tx, erlfdb_directory:pack(Dir, FirstUnused), EK),
@@ -306,24 +299,6 @@ partition_chunked_key(Dir, BaseKey, N) ->
     FirstUnused = erlang:setelement(tuple_size(ChunkKey), ChunkKey, N),
     {ChunkKeys, {FirstUnused, EK}}.
 
-handle_new_call(?IS_DB(Db, Dir), Tenant, Key, Request, WatchTo, State) ->
-    erlfdb:transactional(Db, fun(Tx) -> handle_new_call({Tx, Dir}, Tenant, Key, Request, WatchTo, State) end);
-handle_new_call(?IS_TD = Td, Tenant, Key, Request, WatchTo, State) ->
-    case dgen_queue:length(Td, Key) of
-        0 ->
-            WaitingKey = dgen:get_waiting_key(Key),
-            From = dgen:get_from(WaitingKey, make_ref()),
-            case invoke_tx_callback(Td, handle_call, [Request, From], State) of
-                {error, Reason = {function_not_exported, _}} ->
-                    erlang:error(Reason);
-                {ok, {{reply, Reply, State2}, Actions}} ->
-                    {{reply, {reply, Reply}, State2}, Actions}
-            end;
-        _Len ->
-            {CallKey, Watch} = dgen:push_call(Td, Key, Request, WatchTo),
-            {{reply, {noreply, {Tenant, CallKey, Watch}}, State}, []}
-    end.
-
 handle_new_priority_call(?IS_DB(Db, Dir), Request, From, State) ->
     erlfdb:transactional(Db, fun(Tx) -> handle_new_priority_call({Tx, Dir}, Request, From, State) end);
 handle_new_priority_call(?IS_TD = Td, Request, From, State) ->
@@ -344,10 +319,10 @@ handle_new_priority_cast(?IS_TD = Td, Request, State) ->
             {Actions, State2}
     end.
 
-handle_consume(?IS_DB(Db, Dir), K, Key, State) ->
-    erlfdb:transactional(Db, fun(Tx) -> handle_consume({Tx, Dir}, K, Key, State) end);
-handle_consume(?IS_TD = Td = ?IS_TX(Tx, Dir), K, Key, State) ->
-    case dgen_queue:consume_k(Td, K, Key) of
+handle_consume(?IS_DB(Db, Dir), K, Tuid, State) ->
+    erlfdb:transactional(Db, fun(Tx) -> handle_consume({Tx, Dir}, K, Tuid, State) end);
+handle_consume(?IS_TD = Td = ?IS_TX(Tx, Dir), K, Tuid, State) ->
+    case dgen_queue:consume_k(Td, K, Tuid) of
         {[{call, Request, From}], Watch} ->
             case invoke_tx_callback(Td, handle_call, [Request, From], State) of
                 {error, Reason = {function_not_exported, _}} ->
