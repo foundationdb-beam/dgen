@@ -14,14 +14,13 @@
 
 -include("../include/dgen.hrl").
 
--callback init(Args :: term()) -> {ok, State :: term()} | {error, Reason :: term()}.
--callback tuid(State :: term()) -> Tuid :: tuple().
+-callback init(Args :: term()) -> {ok, State :: term()} | {ok, Tuid :: tuple(), State :: term()} | {error, Reason :: term()}.
 -callback handle_cast(Msg :: term(), State :: term()) -> {noreply, NewState :: term()}.
 -callback handle_call(Request :: term(), From :: term(), State :: term()) ->
     {reply, Reply :: term(), NewState :: term()} | {noreply, NewState :: term()}.
 -callback handle_info(Info :: term(), State :: term()) -> {noreply, NewState :: term()}.
 
--optional_callbacks([tuid/1, handle_cast/2, handle_call/3, handle_info/2]).
+-optional_callbacks([handle_cast/2, handle_call/3, handle_info/2]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
@@ -83,12 +82,9 @@ get_tenant(Opts) ->
     end.
 
 init({Tenant, Mod, Arg, Consume, Reset}) ->
-    case Mod:init(Arg) of
-        {ok, InitialState} ->
-            State0 = #state{tenant = Tenant, mod = Mod},
-            State = State0#state{
-                tuid = invoke_pure_callback(tuid, [InitialState], State0, ?DefaultTuid(Mod))
-            },
+    case init_tuid(Mod, Arg) of
+        {ok, Tuid, InitialState} ->
+            State = #state{tenant = Tenant, mod = Mod, tuid = Tuid},
             init_mod_state(Tenant, InitialState, Reset, State),
             [gen_server:cast(self(), consume) || Consume],
             {ok, State};
@@ -175,31 +171,14 @@ invoke_tx_callback(?IS_TD = Td, Callback, Args, State = #state{mod = Mod}) ->
             Result
     end.
 
-invoke_pure_callback(Callback, Args, State, Default) ->
-    case invoke_pure_callback(Callback, Args, State) of
-        {ok, Result} ->
-            Result;
-        {error, {function_not_exported, _}} ->
-            Default
-    end.
-
-invoke_pure_callback(Callback, Args, #state{mod = Mod}) ->
-    Arity = length(Args),
-    case erlang:function_exported(Mod, Callback, Arity) of
-        true ->
-            {ok, erlang:apply(Mod, Callback, Args)};
-        false ->
-            {error, {function_not_exported, {Mod, Callback, Arity}}}
-    end.
-
 modify_args_for_callback(_, Args, ModState) ->
     Args ++ [ModState].
 
 delete(?IS_DB(Db, Dir), Tuid) ->
     erlfdb:transactional(Db, fun(Tx) -> delete({Tx, Dir}, Tuid) end);
-delete(?IS_TX(Tx, Dir), Tuid) ->
-    clear_mod_state(Tx, Tuid),
-    dgen_queue:delete(Tx, Tuid),
+delete(Td = ?IS_TD = ?IS_TX(Tx, Dir), Tuid) ->
+    clear_mod_state(Td, Tuid),
+    dgen_queue:delete(Td, Tuid),
     WaitingKey = dgen:get_waiting_key(Tuid),
     {SK, EK} = erlfdb_directory:range(Dir, WaitingKey),
     erlfdb:clear_range(Tx, SK, EK).
@@ -352,4 +331,12 @@ handle_info(?IS_TD = Td, Info, State) ->
             {[], State};
         {ok, {{noreply, State2}, Actions}} ->
             {Actions, State2}
+    end.
+
+init_tuid(Mod, Arg) ->
+    case Mod:init(Arg) of
+        {ok, InitialState} ->
+            {ok, ?DefaultTuid(Mod), InitialState};
+        Other ->
+            Other
     end.

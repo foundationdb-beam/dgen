@@ -1,9 +1,6 @@
 defmodule DGenServer do
   @callback init(args :: term) ::
-              {:ok, state :: term()} | {:error, reason :: term()}
-
-  @callback key(state :: term) ::
-              key :: tuple
+              {:ok, state :: term()} | {:ok, tuid :: tuple()} | {:error, reason :: term()}
 
   @callback handle_cast(msg :: term, state :: term) ::
               {:noreply, new_state :: term}
@@ -14,7 +11,7 @@ defmodule DGenServer do
   @callback handle_info(info :: term, state :: term) ::
               {:noreply, new_state :: term}
 
-  @optional_callbacks key: 1, handle_cast: 2, handle_call: 3, handle_info: 2
+  @optional_callbacks handle_cast: 2, handle_call: 3, handle_info: 2
 
   @doc false
   defmacro __using__(opts) do
