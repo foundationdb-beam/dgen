@@ -13,7 +13,7 @@ cleaning up the call-key-bin on timeout.
 ### Call Request Flow
 
 1. The caller invokes `dgen_server:call/3` which delegates to `call/4`.
-2. A call request is pushed onto the durable queue via `push_call/4`,
+2. A call request is pushed onto the durable queue via `push_call/5`,
    which creates a `CallKeyBin` (the reply slot) and an FDB watch.
 3. The caller blocks in `await_call_reply/4` until the watch fires or
    the timeout expires.
@@ -24,7 +24,7 @@ cleaning up the call-key-bin on timeout.
 """.
 -endif.
 
--export([get_waiting_key/1, get_from/2, call/4, push_call/4]).
+-export([get_waiting_key/1, get_from/2, call/4, push_call/5]).
 
 -include("../include/dgen.hrl").
 
@@ -37,15 +37,15 @@ sets an FDB watch on it directed to `WatchTo`, and enqueues the request.
 Returns `{CallKeyBin, Watch}`.
 """.
 -endif.
-push_call(?IS_DB(Db, Dir), Tuid, Request, WatchTo) ->
-    erlfdb:transactional(Db, fun(Tx) -> push_call({Tx, Dir}, Tuid, Request, WatchTo) end);
-push_call(Td = ?IS_TX(Tx, Dir), Tuid, Request, WatchTo) ->
+push_call(?IS_DB(Db, Dir), Tuid, Request, WatchTo, Options) ->
+    erlfdb:transactional(Db, fun(Tx) -> push_call({Tx, Dir}, Tuid, Request, WatchTo, Options) end);
+push_call(Td = ?IS_TX(Tx, Dir), Tuid, Request, WatchTo, Options) ->
     WaitingKey = get_waiting_key(Tuid),
     From = get_from(WaitingKey, make_ref()),
     CallKeyBin = erlfdb_directory:pack(Dir, From),
     erlfdb:set(Tx, CallKeyBin, term_to_binary(noreply)),
     Future = erlfdb:watch(Tx, CallKeyBin, [{to, WatchTo}]),
-    dgen_queue:push_k(Td, Tuid, [{call, Request, From}]),
+    dgen_queue:push_k(Td, Tuid, [{call, Request, From, Options}]),
     {CallKeyBin, Future}.
 
 -if(?DOCATTRS).

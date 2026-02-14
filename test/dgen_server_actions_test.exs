@@ -17,10 +17,10 @@ defmodule DGenServer.ActionsTest do
       tenant = context[:tenant]
       {:ok, pid} = ActionEcho.start_link(tenant, {"act_cast"})
 
-      ActionEcho.incr_with_action(pid, self())
+      ActionEcho.incr_then_take_action(pid, self())
       assert_receive {:action_executed, :cast}, 5_000
 
-      assert 1 = ActionEcho.get_with_action(pid, self())
+      assert 1 = ActionEcho.get_then_take_action(pid, self())
       assert_receive {:action_executed, :call}, 5_000
 
       kill(pid)
@@ -30,8 +30,18 @@ defmodule DGenServer.ActionsTest do
       tenant = context[:tenant]
       {:ok, pid} = ActionEcho.start_link(tenant, {"act_call"})
 
-      assert 0 = ActionEcho.get_with_action(pid, self())
+      assert 0 = ActionEcho.get_then_take_action(pid, self())
       assert_receive {:action_executed, :call}, 5_000
+
+      kill(pid)
+    end
+
+    test "handle_call executes reply and actions after commit when using reply_with_effects",
+         context do
+      tenant = context[:tenant]
+      {:ok, pid} = ActionEcho.start_link(tenant, {"act_call"})
+
+      assert {0, [:call]} = ActionEcho.get_with_action(pid)
 
       kill(pid)
     end
@@ -40,10 +50,10 @@ defmodule DGenServer.ActionsTest do
       tenant = context[:tenant]
       {:ok, pid} = ActionEcho.start_link(tenant, {"act_info"})
 
-      send(pid, {:info_with_action, self()})
+      send(pid, {:info_then_take_action, self()})
       assert_receive {:action_executed, :info}, 5_000
 
-      assert 1 = ActionEcho.get_with_action(pid, self())
+      assert 1 = ActionEcho.get_then_take_action(pid, self())
       assert_receive {:action_executed, :call}, 5_000
 
       kill(pid)
@@ -53,7 +63,7 @@ defmodule DGenServer.ActionsTest do
       tenant = context[:tenant]
       {:ok, pid} = ActionEcho.start_link(tenant, {"act_pcall"})
 
-      assert 0 = ActionEcho.priority_get_with_action(pid, self())
+      assert 0 = ActionEcho.priority_get_then_take_action(pid, self())
       assert_receive {:action_executed, :call}, 5_000
 
       kill(pid)
@@ -63,10 +73,10 @@ defmodule DGenServer.ActionsTest do
       tenant = context[:tenant]
       {:ok, pid} = ActionEcho.start_link(tenant, {"act_pcast"})
 
-      ActionEcho.priority_incr_with_action(pid, self())
+      ActionEcho.priority_incr_then_take_action(pid, self())
       assert_receive {:action_executed, :cast}, 5_000
 
-      assert 1 = ActionEcho.priority_get_with_action(pid, self())
+      assert 1 = ActionEcho.priority_get_then_take_action(pid, self())
       assert_receive {:action_executed, :call}, 5_000
 
       kill(pid)

@@ -66,6 +66,7 @@ argument is the
 
 -define(DefaultTuid(Mod), {<<"dgen_server">>, atom_to_binary(Mod)}).
 -define(TxCallbackTimeout, 5000).
+-define(DefaultCallTimeout, 5000).
 
 -record(state, {tenant, mod, tuid, watch}).
 
@@ -136,7 +137,7 @@ cast_k(Server, Requests) ->
 -doc "Sends a synchronous call request via the durable queue. Default timeout 5000ms.".
 -endif.
 call(Server, Request) ->
-    call(Server, Request, 5000).
+    call(Server, Request, ?DefaultCallTimeout).
 
 -if(?DOCATTRS).
 -doc """
@@ -144,10 +145,35 @@ Sends a synchronous call request via the durable queue.
 
 The request is enqueued durably and the caller blocks until a consumer
 processes it and writes the reply, or until `Timeout` milliseconds elapse.
+
+## Options
+
+- `timeout`: Default `5000`. Timeout in milliseconds, or `infinity`.
+
+- `reply_with_effects`: Default `false`.
+
+  When `false`, the caller will receive the
+  intended Reply term like a standard `gen_server`. Any side-effects will be
+  executed some time afterward, and the result of that will be discarded.
+
+  When true, the Reply to the caller is deferred outside of the consume transaction.
+  The dgen_server executes the side-effects and then uses a new transaction to write
+  the reply in addition to the result of the effects. The caller will receive both the
+  intended Reply as well as the result of `handle_actions/3` side-effects as a
+  2-tuple: `{Reply :: term(), Effects :: list()}`.
 """.
 -endif.
-call(Server, Request, Timeout) ->
-    dgen:call(gen_server, Server, {call, Request, self()}, Timeout).
+call(Server, Request, Timeout) when Timeout =:= infinity orelse is_integer(Timeout) ->
+    call(Server, Request, [{timeout, Timeout}]);
+call(Server, Request, Options) when is_list(Options) ->
+    {Timeout, CallOptions} =
+        case lists:keytake(timeout, 1, Options) of
+            false ->
+                {?DefaultCallTimeout, Options};
+            {value, {timeout, T}, Rest} ->
+                {T, Rest}
+        end,
+    dgen:call(gen_server, Server, {call, Request, self(), CallOptions}, Timeout).
 
 -if(?DOCATTRS).
 -doc """
@@ -204,12 +230,14 @@ init({Tenant, Mod, Arg, Consume, Reset}) ->
             Other
     end.
 
-handle_call({call, Request, WatchTo}, _LocalFrom, State = #state{tenant = Tenant, tuid = Tuid}) ->
+handle_call(
+    {call, Request, WatchTo, Options}, _LocalFrom, State = #state{tenant = Tenant, tuid = Tuid}
+) ->
     % if there's no watch, then assume the queue is nonempty, and we must push the request
     %
     % @todo: if there's a watch, we can pay for a queue length check, assuming it will be 0 in most cases. If
     % it is zero, then we can handle the call immediately without pushing it onto the queue.
-    {CallKeyBin, Watch} = dgen:push_call(Tenant, Tuid, Request, WatchTo),
+    {CallKeyBin, Watch} = dgen:push_call(Tenant, Tuid, Request, WatchTo, Options),
     {reply, {noreply, {Tenant, CallKeyBin, Watch}}, State};
 handle_call({priority, Request}, _From, State = #state{tenant = Tenant}) ->
     From = make_ref(),
@@ -220,8 +248,8 @@ handle_call({priority, Request}, _From, State = #state{tenant = Tenant}) ->
 handle_cast(consume, State = #state{tenant = Tenant, tuid = Tuid}) ->
     % 1 at a time because we are limited to 5 seconds per transaction
     K = 1,
-    {Watch, Actions, ModState, State2} = handle_consume(Tenant, K, Tuid, State),
-    _ = handle_actions(Actions, [], ModState),
+    {Watch, ActionFun, State2} = handle_consume(Tenant, K, Tuid, State),
+    _ = ActionFun(),
     case Watch of
         undefined ->
             gen_server:cast(self(), consume);
@@ -378,29 +406,42 @@ handle_new_priority_cast(?IS_TD = Td, Request, State) ->
             {Actions, ModState, State2}
     end.
 
-handle_consume(?IS_DB(Db, Dir), K, Tuid, State) ->
-    erlfdb:transactional(Db, fun(Tx) -> handle_consume({Tx, Dir}, K, Tuid, State) end);
-handle_consume(?IS_TD = Td, K, Tuid, State) ->
+handle_consume(Tenant = ?IS_DB(Db, Dir), K, Tuid, State) ->
+    erlfdb:transactional(Db, fun(Tx) -> handle_consume(Tenant, {Tx, Dir}, K, Tuid, State) end).
+
+handle_consume(Tenant = ?IS_DB(_Db, _Dir), ?IS_TD = Td, K, Tuid, State) ->
     case dgen_queue:consume_k(Td, K, Tuid) of
-        {[{call, Request, From}], Watch} ->
+        {[{call, Request, From, CallOptions}], Watch} ->
             case invoke_tx_callback(Td, handle_call, [Request, From], State) of
                 {error, Reason = {function_not_exported, _}} ->
                     erlang:error(Reason);
                 {ok, {{reply, Reply, State2}, Actions}, ModState} ->
-                    reply(Td, From, Reply),
-                    {Watch, Actions, ModState, State2}
+                    case proplists:get_value(reply_with_effects, CallOptions, false) of
+                        false ->
+                            reply(Td, From, Reply),
+                            {Watch, fun() -> handle_actions(Actions, [], ModState) end, State2};
+                        true ->
+                            {Watch,
+                                fun() ->
+                                    Effects = handle_actions(Actions, [], ModState),
+                                    reply(Tenant, From, {Reply, Effects})
+                                end,
+                                State2}
+                    end
             end;
         {[{cast, Request}], Watch} ->
             case invoke_tx_callback(Td, handle_cast, [Request], State) of
                 {error, Reason = {function_not_exported, _}} ->
                     erlang:error(Reason);
                 {ok, {{noreply, State2}, Actions}, ModState} ->
-                    {Watch, Actions, ModState, State2}
+                    {Watch, fun() -> handle_actions(Actions, [], ModState) end, State2}
             end;
         {[], Watch} ->
-            {Watch, [], undefined, State}
+            {Watch, fun() -> ok end, State}
     end.
 
+reply(?IS_DB(Db, Dir), From, Reply) ->
+    erlfdb:transactional(Db, fun(Tx) -> reply({Tx, Dir}, From, Reply) end);
 reply(?IS_TD = _Td = ?IS_TX(Tx, Dir), From, Reply) ->
     CallKeyBin = erlfdb_directory:pack(Dir, From),
     % Skip writing the reply if the caller timed out and cleared CallKeyBin
