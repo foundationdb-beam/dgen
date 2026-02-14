@@ -231,14 +231,25 @@ init({Tenant, Mod, Arg, Consume, Reset}) ->
     end.
 
 handle_call(
-    {call, Request, WatchTo, Options}, _LocalFrom, State = #state{tenant = Tenant, tuid = Tuid}
+    {call, Request, WatchTo, Options},
+    _LocalFrom,
+    State = #state{tenant = Tenant, tuid = Tuid, watch = Watch}
 ) ->
-    % if there's no watch, then assume the queue is nonempty, and we must push the request
-    %
-    % @todo: if there's a watch, we can pay for a queue length check, assuming it will be 0 in most cases. If
-    % it is zero, then we can handle the call immediately without pushing it onto the queue.
-    {From, Watch} = dgen:push_call(Tenant, Tuid, Request, WatchTo, Options),
-    {reply, {noreply, {Tenant, From, Watch}}, State};
+    case Watch of
+        undefined ->
+            {From, NewWatch} = dgen:push_call(Tenant, Tuid, Request, WatchTo, Options),
+            {reply, {noreply, {Tenant, From, NewWatch}}, State};
+        _ ->
+            From = make_ref(),
+            case handle_inline_call(Tenant, Request, From, Options, State) of
+                {inline, Reply, ActionFun, State2} ->
+                    _ = ActionFun(),
+                    {reply, {reply, Reply}, State2};
+                fallback ->
+                    {From2, NewWatch} = dgen:push_call(Tenant, Tuid, Request, WatchTo, Options),
+                    {reply, {noreply, {Tenant, From2, NewWatch}}, State}
+            end
+    end;
 handle_call({priority, Request}, _From, State = #state{tenant = Tenant}) ->
     From = make_ref(),
     {Actions, ModState, Reply, State2} = handle_new_priority_call(Tenant, Request, From, State),
@@ -404,6 +415,31 @@ handle_new_priority_cast(?IS_TD = Td, Request, State) ->
             erlang:error(Reason);
         {ok, {{noreply, State2}, Actions}, ModState} ->
             {Actions, ModState, State2}
+    end.
+
+handle_inline_call(Tenant = ?IS_DB(Db, Dir), Request, From, CallOptions, State) ->
+    erlfdb:transactional(Db, fun(Tx) ->
+        handle_inline_call(Tenant, {Tx, Dir}, Request, From, CallOptions, State)
+    end).
+
+handle_inline_call(_Tenant, ?IS_TD = Td, Request, From, CallOptions, State = #state{tuid = Tuid}) ->
+    case dgen_queue:length(Td, Tuid) of
+        0 ->
+            case invoke_tx_callback(Td, handle_call, [Request, From], State) of
+                {error, Reason = {function_not_exported, _}} ->
+                    erlang:error(Reason);
+                {ok, {{reply, Reply, State2}, Actions}, ModState} ->
+                    case proplists:get_value(reply_with_effects, CallOptions, false) of
+                        false ->
+                            {inline, Reply, fun() -> handle_actions(Actions, [], ModState) end,
+                                State2};
+                        true ->
+                            Effects = handle_actions(Actions, [], ModState),
+                            {inline, {Reply, Effects}, fun() -> ok end, State2}
+                    end
+            end;
+        _ ->
+            fallback
     end.
 
 handle_consume(Tenant = ?IS_DB(Db, Dir), K, Tuid, State) ->
