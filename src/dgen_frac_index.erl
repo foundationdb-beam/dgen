@@ -1,10 +1,17 @@
-%% @doc Fractional indexing for ordered sequences.
-%%
-%% Generates lexicographically-sortable binary strings using base-62 digits
-%% (0-9, A-Z, a-z in ASCII order). A new key can always be generated between
-%% any two existing keys, making this suitable for maintaining ordered lists
-%% in key-value stores without reindexing.
 -module(dgen_frac_index).
+
+-define(DOCATTRS, ?OTP_RELEASE >= 27).
+
+-if(?DOCATTRS).
+-moduledoc """
+Fractional indexing for ordered sequences.
+
+Generates lexicographically-sortable binary strings using base-62 digits
+(0-9, A-Z, a-z in ASCII order). A new key can always be generated between
+any two existing keys, making this suitable for maintaining ordered lists
+in key-value stores without reindexing.
+""".
+-endif.
 
 -export([
     first/0,
@@ -27,33 +34,44 @@
 -define(MIN_DIGIT, 0).
 -define(MAX_DIGIT, 61).
 
-%% @doc Returns the midpoint key of the full keyspace.
+-if(?DOCATTRS).
+-doc "Returns the midpoint key of the full keyspace.".
+-endif.
 -spec first() -> key().
 first() ->
     midpoint_char(?MIN_DIGIT, ?MAX_DIGIT + 1).
 
-%% @doc Returns a key that sorts before `Key'.
+-if(?DOCATTRS).
+-doc "Returns a key that sorts before `Key`.".
+-endif.
 -spec before(key()) -> key().
 before(Key) when is_binary(Key), byte_size(Key) > 0 ->
     between_bins(<<>>, Key).
 
-%% @doc Returns a key that sorts after `Key'.
+-if(?DOCATTRS).
+-doc "Returns a key that sorts after `Key`.".
+-endif.
 -spec after_(key()) -> key().
 after_(Key) when is_binary(Key), byte_size(Key) > 0 ->
     between_bins(Key, <<>>).
 
-%% @doc Returns a key that sorts between `A' and `B'. Requires `A < B'.
+-if(?DOCATTRS).
+-doc "Returns a key that sorts between `A` and `B`. Requires `A < B`.".
+-endif.
 -spec between(key(), key()) -> key().
 between(A, B) when is_binary(A), is_binary(B), A < B ->
     between_bins(A, B).
 
-%% @doc Returns `N' evenly-spaced keys across the full keyspace.
+-if(?DOCATTRS).
+-doc "Returns `N` evenly-spaced keys across the full keyspace.".
+-endif.
 -spec n_first(pos_integer()) -> [key()].
 n_first(N) when is_integer(N), N > 0 ->
     n_between(<<>>, <<>>, N).
 
-%% @doc Returns `N' evenly-spaced keys between `A' and `B'.
-%% Use `<<>>' for unbounded start/end.
+-if(?DOCATTRS).
+-doc "Returns `N` evenly-spaced keys between `A` and `B`. Use `<<>>` for unbounded start/end.".
+-endif.
 -spec n_between(binary(), binary(), non_neg_integer()) -> [key()].
 n_between(_A, _B, 0) ->
     [];

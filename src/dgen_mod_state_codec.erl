@@ -1,29 +1,35 @@
-%% @doc Encoder/decoder for dgen_server mod_state.
-%%
-%% Stores structured Erlang terms across FDB key-value pairs using a recursive
-%% encoding scheme. Three encoding types are supported:
-%%
-%% <ul>
-%%   <li><b>term</b> (fallback) - `term_to_binary', chunked into 100KB values</li>
-%%   <li><b>assigns map</b> - map with all atom keys; each entry stored at a
-%%       separate FDB key using `atom_to_binary(Key)' in the path</li>
-%%   <li><b>component list</b> - list of maps where every item has an atom `id'
-%%       key with a binary value; each item stored separately, ordered by a
-%%       fractional index embedded in the FDB key</li>
-%% </ul>
-%%
-%% The encoding is applied recursively. For example, an assigns map whose value
-%% is a component list will nest both encodings in the key path.
-%%
-%% Key structure:
-%% ```
-%% term:  {BaseKey, <<"t">>, ChunkIndex}
-%% map:   {BaseKey, <<"m">>}                       (marker)
-%%        {BaseKey, <<"m">>, KeyBin, ...}           (recursive)
-%% list:  {BaseKey, <<"l">>}                        (marker, holds Id => FracIndex map)
-%%        {BaseKey, <<"l">>, FracIndex, Id, ...}    (recursive)
-%% '''
 -module(dgen_mod_state_codec).
+
+-define(DOCATTRS, ?OTP_RELEASE >= 27).
+
+-if(?DOCATTRS).
+-moduledoc """
+Encoder/decoder for dgen_server mod_state.
+
+Stores structured Erlang terms across FDB key-value pairs using a recursive
+encoding scheme. Three encoding types are supported:
+
+- **term** (fallback) - `term_to_binary`, chunked into 100KB values.
+- **assigns map** - map with all atom keys; each entry stored at a
+  separate FDB key using `atom_to_binary(Key)` in the path.
+- **component list** - list of maps where every item has an atom `id`
+  key with a binary value; each item stored separately, ordered by a
+  fractional index embedded in the FDB key.
+
+The encoding is applied recursively. For example, an assigns map whose value
+is a component list will nest both encodings in the key path.
+
+### Key structure
+
+```
+term:  {BaseKey, <<"t">>, ChunkIndex}
+map:   {BaseKey, <<"m">>}                       (marker)
+       {BaseKey, <<"m">>, KeyBin, ...}           (recursive)
+list:  {BaseKey, <<"l">>}                        (marker, holds Id => FracIndex map)
+       {BaseKey, <<"l">>, FracIndex, Id, ...}    (recursive)
+```
+""".
+-endif.
 
 -include("../include/dgen.hrl").
 
@@ -46,7 +52,9 @@
 %% Public API
 %%
 
-%% @doc Read mod_state from FDB at `BaseKey'.
+-if(?DOCATTRS).
+-doc "Reads mod_state from FDB at `BaseKey`.".
+-endif.
 -spec get(tenant(), base_key()) -> {ok, mod_state()} | {error, not_found}.
 get(?IS_DB(Db, Dir), BaseKey) ->
     erlfdb:transactional(Db, fun(Tx) -> get({Tx, Dir}, BaseKey) end);
@@ -59,7 +67,9 @@ get(?IS_TX(Tx, Dir) = Td, BaseKey) ->
             decode_kvs(Td, BaseKey, KVs)
     end.
 
-%% @doc Full write of `ModState' to FDB at `BaseKey'. Clears existing data first.
+-if(?DOCATTRS).
+-doc "Full write of `ModState` to FDB at `BaseKey`. Clears existing data first.".
+-endif.
 -spec set(tenant(), base_key(), mod_state()) -> ok.
 set(?IS_DB(Db, Dir), BaseKey, ModState) ->
     erlfdb:transactional(Db, fun(Tx) -> set({Tx, Dir}, BaseKey, ModState) end);
@@ -67,9 +77,13 @@ set(?IS_TX(_Tx, _Dir) = Td, BaseKey, ModState) ->
     clear(Td, BaseKey),
     write(Td, BaseKey, ModState).
 
-%% @doc Diff-based partial write. Compares `OldModState' and `NewModState' and
-%% only writes changed keys. Falls back to a full rewrite when the encoding
-%% type changes or both values are plain terms.
+-if(?DOCATTRS).
+-doc """
+Diff-based partial write. Compares `OldModState` and `NewModState` and
+only writes changed keys. Falls back to a full rewrite when the encoding
+type changes or both values are plain terms.
+""".
+-endif.
 -spec set(tenant(), base_key(), mod_state(), mod_state()) -> ok.
 set(_Td, _BaseKey, Same, Same) ->
     ok;
@@ -94,7 +108,9 @@ set(Td, BaseKey, OldModState, NewModState) ->
             end
     end.
 
-%% @doc Clear all state keys under `BaseKey'.
+-if(?DOCATTRS).
+-doc "Clears all state keys under `BaseKey`.".
+-endif.
 -spec clear(tenant(), base_key()) -> ok.
 clear(?IS_DB(Db, Dir), BaseKey) ->
     erlfdb:transactional(Db, fun(Tx) -> clear({Tx, Dir}, BaseKey) end);
@@ -108,10 +124,10 @@ clear(?IS_TX(Tx, Dir), BaseKey) ->
 
 -type encoding_type() :: term | map | list.
 
-%% @doc Classify a term into its encoding type.
-%% - `map'  : map with all atom keys (assigns map)
-%% - `list' : list of maps each with a binary `id' key (component list)
-%% - `term' : everything else (fallback)
+%% Classify a term into its encoding type.
+%% - map  : map with all atom keys (assigns map)
+%% - list : list of maps each with a binary id key (component list)
+%% - term : everything else (fallback)
 -spec classify(term()) -> encoding_type().
 classify(ModState) when is_map(ModState) ->
     case maps:size(ModState) of
@@ -389,7 +405,7 @@ diff_list(?IS_TX(Tx, Dir) = Td, BaseKey, OldList, NewList) ->
 
     ok.
 
-%% @doc Walk the new list in order and assign fractional indices to newly added
+%% Walk the new list in order and assign fractional indices to newly added
 %% items, placing each between its neighbours' existing indices.
 -spec assign_new_indices(list(), [binary()], map()) -> map().
 assign_new_indices(NewList, AddedIds, OrderMap) ->
@@ -447,7 +463,7 @@ extend_key(BaseKey, E1, E2) ->
 extend_key(BaseKey, E1, E2, E3) ->
     extend_key(extend_key(BaseKey, E1, E2), E3).
 
-%% @doc Group a sorted list of pre-unpacked KVs by the element at `Pos'.
+%% Group a sorted list of pre-unpacked KVs by the element at Pos.
 %% Relies on FDB key ordering to keep groups contiguous.
 -spec group_by_pos(pos_integer(), [{tuple(), binary(), binary()}]) ->
     [{term(), [{tuple(), binary(), binary()}]}].

@@ -1,6 +1,45 @@
 -module(dgen_server).
 -behaviour(gen_server).
 
+-define(DOCATTRS, ?OTP_RELEASE >= 27).
+
+-if(?DOCATTRS).
+-moduledoc """
+A durable, distributed gen_server backed by FoundationDB.
+
+A dgen_server is an abstract entity composed of durable state and operations on
+that state. The state lives in FoundationDB and the operations are defined by a
+callback module implementing the `dgen_server` behaviour. This allows a
+gen_server to outlive any single Erlang process, node, or cluster.
+
+Zero or more Erlang processes may act on a dgen_server at any time. Processes
+with `consume` enabled consume messages from the durable queue and invoke
+callbacks; processes without it only publish messages.
+
+## Options
+
+The following options may be passed via the `Opts` proplist:
+
+- `tenant` (required) - `{erlfdb:database(), erlfdb_directory:dir()}` pair
+  identifying the FDB subspace.
+- `consume` (default `true`) - whether this process consumes messages from
+  the queue.
+- `reset` (default `false`) - when `true`, re-initialise the durable state
+  even if it already exists.
+
+## Callbacks
+
+- `init/1` - return `{ok, State}` or `{ok, Tuid, State}`.
+- `handle_call/3` - return `{reply, Reply, State}` or
+  `{reply, Reply, State, Actions}`.
+- `handle_cast/2` - return `{noreply, State}` or `{noreply, State, Actions}`.
+- `handle_info/2` - return `{noreply, State}` or `{noreply, State, Actions}`.
+
+`Actions` is a list of 1-arity funs executed after the transaction commits. The
+argument is the
+""".
+-endif.
+
 -export([
     start/3, start/4,
     start_link/3, start_link/4,
@@ -30,47 +69,119 @@
 
 -record(state, {tenant, mod, tuid, watch}).
 
+-if(?DOCATTRS).
+-doc """
+Starts a dgen_server process without linking.
+
+See `start_link/3` for details on `Mod`, `Arg`, and `Opts`.
+""".
+-endif.
 start(Mod, Arg, Opts) ->
     Consume = proplists:get_value(consume, Opts, true),
     Reset = proplists:get_value(reset, Opts, false),
     gen_server:start(?MODULE, {get_tenant(Opts), Mod, Arg, Consume, Reset}, Opts).
 
+-if(?DOCATTRS).
+-doc """
+Starts a dgen_server process without linking, registered as `Reg`.
+
+See `start_link/3` for details on `Mod`, `Arg`, and `Opts`.
+""".
+-endif.
 start(Reg, Mod, Arg, Opts) ->
     Consume = proplists:get_value(consume, Opts, true),
     Reset = proplists:get_value(reset, Opts, false),
     gen_server:start(Reg, ?MODULE, {get_tenant(Opts), Mod, Arg, Consume, Reset}, Opts).
 
+-if(?DOCATTRS).
+-doc """
+Starts a dgen_server process linked to the calling process.
+
+- `Mod` is the callback module implementing the `dgen_server` behaviour.
+- `Arg` is passed to `Mod:init/1`.
+- `Opts` is a proplist that must include `{tenant, {Db, Dir}}` and may
+  include `consume` and `reset`.
+""".
+-endif.
 start_link(Mod, Arg, Opts) ->
     Consume = proplists:get_value(consume, Opts, true),
     Reset = proplists:get_value(reset, Opts, false),
     gen_server:start_link(?MODULE, {get_tenant(Opts), Mod, Arg, Consume, Reset}, Opts).
 
+-if(?DOCATTRS).
+-doc """
+Starts a dgen_server process linked to the calling process, registered as `Reg`.
+
+See `start_link/3` for details on `Mod`, `Arg`, and `Opts`.
+""".
+-endif.
 start_link(Reg, Mod, Arg, Opts) ->
     Consume = proplists:get_value(consume, Opts, true),
     Reset = proplists:get_value(reset, Opts, false),
     gen_server:start_link(Reg, ?MODULE, {get_tenant(Opts), Mod, Arg, Consume, Reset}, Opts).
 
+-if(?DOCATTRS).
+-doc "Sends an asynchronous cast request to the dgen_server's durable queue.".
+-endif.
 cast(Server, Request) ->
     cast_k(Server, [Request]).
 
+-if(?DOCATTRS).
+-doc "Sends a batch of cast requests to the dgen_server's durable queue atomically.".
+-endif.
 cast_k(Server, Requests) ->
     gen_server:cast(Server, {cast, Requests}).
 
+-if(?DOCATTRS).
+-doc "Sends a synchronous call request via the durable queue. Default timeout 5000ms.".
+-endif.
 call(Server, Request) ->
     call(Server, Request, 5000).
 
+-if(?DOCATTRS).
+-doc """
+Sends a synchronous call request via the durable queue.
+
+The request is enqueued durably and the caller blocks until a consumer
+processes it and writes the reply, or until `Timeout` milliseconds elapse.
+""".
+-endif.
 call(Server, Request, Timeout) ->
     dgen:call(gen_server, Server, {call, Request, self()}, Timeout).
 
+-if(?DOCATTRS).
+-doc """
+Sends a cast that bypasses the durable queue and is handled immediately.
+
+Use with caution: this breaks ordering guarantees with respect to queued
+messages.
+""".
+-endif.
 priority_cast(Server, Request) ->
     gen_server:cast(Server, {priority, Request}).
 
+-if(?DOCATTRS).
+-doc """
+Sends a call that bypasses the durable queue and is handled immediately.
+
+Use with caution: this breaks ordering guarantees. Useful for snapshot reads.
+""".
+-endif.
 priority_call(Server, Request) ->
     gen_server:call(Server, {priority, Request}).
 
+-if(?DOCATTRS).
+-doc "Like `priority_call/2` but with an explicit timeout.".
+-endif.
 priority_call(Server, Request, Timeout) ->
     gen_server:call(Server, {priority, Request}, Timeout).
 
+-if(?DOCATTRS).
+-doc """
+Kills the dgen_server, deleting all durable state, queue items, and waiting
+call keys. The process exits with `Reason`.
+""".
+-endif.
 kill(Server, Reason) ->
     gen_server:cast(Server, {kill, Reason}).
 
@@ -102,15 +213,15 @@ handle_call({call, Request, WatchTo}, _LocalFrom, State = #state{tenant = Tenant
     {reply, {noreply, {Tenant, CallKeyBin, Watch}}, State};
 handle_call({priority, Request}, _From, State = #state{tenant = Tenant}) ->
     From = make_ref(),
-    {Actions, Reply, State2} = handle_new_priority_call(Tenant, Request, From, State),
-    _ = handle_actions(Actions),
+    {Actions, ModState, Reply, State2} = handle_new_priority_call(Tenant, Request, From, State),
+    _ = handle_actions(Actions, [], ModState),
     {reply, Reply, State2}.
 
 handle_cast(consume, State = #state{tenant = Tenant, tuid = Tuid}) ->
     % 1 at a time because we are limited to 5 seconds per transaction
     K = 1,
-    {Watch, Actions, State2} = handle_consume(Tenant, K, Tuid, State),
-    _ = handle_actions(Actions),
+    {Watch, Actions, ModState, State2} = handle_consume(Tenant, K, Tuid, State),
+    _ = handle_actions(Actions, [], ModState),
     case Watch of
         undefined ->
             gen_server:cast(self(), consume);
@@ -122,8 +233,8 @@ handle_cast({cast, Requests}, State = #state{tenant = Tenant, tuid = Tuid}) ->
     dgen_queue:push_k(Tenant, Tuid, [{cast, Request} || Request <- Requests]),
     {noreply, State};
 handle_cast({priority, Request}, State = #state{tenant = Tenant}) ->
-    {Actions, State2} = handle_new_priority_cast(Tenant, Request, State),
-    _ = handle_actions(Actions),
+    {Actions, ModState, State2} = handle_new_priority_cast(Tenant, Request, State),
+    _ = handle_actions(Actions, [], ModState),
     {noreply, State2};
 handle_cast({kill, Reason}, State = #state{tenant = Tenant, tuid = Tuid}) ->
     delete(Tenant, Tuid),
@@ -132,8 +243,8 @@ handle_cast({kill, Reason}, State = #state{tenant = Tenant, tuid = Tuid}) ->
 handle_info({Ref, ready}, State = #state{watch = ?FUTURE(Ref)}) ->
     handle_cast(consume, State#state{watch = undefined});
 handle_info(Info, State = #state{tenant = Tenant}) ->
-    {Actions, State2} = handle_info(Tenant, Info, State),
-    _ = handle_actions(Actions),
+    {Actions, ModState, State2} = handle_info(Tenant, Info, State),
+    _ = handle_actions(Actions, [], ModState),
     {noreply, State2}.
 
 terminate(_Reason, _State) ->
@@ -155,7 +266,8 @@ invoke_tx_callback(?IS_TD = Td, Callback, Args, State = #state{mod = Mod}) ->
                         {ok,
                             handle_callback_result(
                                 Td, Callback, CallbackResult, ModState, State
-                            )};
+                            ),
+                            ModState};
                     {error, not_found} ->
                         {error, {mod_state_not_found, Mod}}
                 end;
@@ -194,38 +306,19 @@ init_mod_state(?IS_TD = Td, InitialState, Reset, State) ->
             set_mod_state(Td, InitialState, State)
     end.
 
-clear_mod_state(?IS_TX(Tx, Dir), Tuid) ->
-    StateKey = get_state_key(Tuid),
-    {SK, EK} = erlfdb_directory:range(Dir, StateKey),
-    erlfdb:clear_range(Tx, SK, EK).
+clear_mod_state(Td, Tuid) ->
+    dgen_mod_state_codec:clear(Td, get_state_key(Tuid)).
 
-get_mod_state(?IS_TX(Tx, Dir), _State = #state{tuid = Tuid}) ->
-    StateKey = get_state_key(Tuid),
-    {SK, EK} = erlfdb_directory:range(Dir, StateKey),
-    case erlfdb:get_range(Tx, SK, EK, [{wait, true}]) of
-        [] ->
-            {error, not_found};
-        KVs ->
-            {_, Vs} = lists:unzip(KVs),
-            {ok, binary_to_term(iolist_to_binary(Vs))}
-    end.
+get_mod_state(Td, _State = #state{tuid = Tuid}) ->
+    dgen_mod_state_codec:get(Td, get_state_key(Tuid)).
 
-set_mod_state(_DbOrTx, ModState, ModState, _State) ->
+set_mod_state(_Td, ModState, ModState, _State) ->
     ok;
-set_mod_state(DbOrTx, _OrigModState, ModState, State) ->
-    set_mod_state(DbOrTx, ModState, State).
+set_mod_state(Td, OrigModState, ModState, State) ->
+    dgen_mod_state_codec:set(Td, get_state_key(State#state.tuid), OrigModState, ModState).
 
-set_mod_state(?IS_TX(Tx, Dir), ModState, _State = #state{tuid = Tuid}) ->
-    Bin = term_to_binary(ModState),
-    Chunks = binary_chunk_every(Bin, 100000, []),
-    StateKey = get_state_key(Tuid),
-    {ChunkKeys, {FirstUnused, EK}} = partition_chunked_key(Dir, StateKey, length(Chunks)),
-    [
-        erlfdb:set(Tx, erlfdb_directory:pack(Dir, K), Chunk)
-     || {K, Chunk} <- lists:zip(ChunkKeys, Chunks)
-    ],
-    erlfdb:clear_range(Tx, erlfdb_directory:pack(Dir, FirstUnused), EK),
-    ok.
+set_mod_state(Td, ModState, _State = #state{tuid = Tuid}) ->
+    dgen_mod_state_codec:set(Td, get_state_key(Tuid), ModState).
 
 handle_callback_result(?IS_TD = Td, handle_cast, {noreply, ModState}, OrigModState, State) ->
     set_mod_state(Td, OrigModState, ModState, State),
@@ -248,31 +341,20 @@ handle_callback_result(?IS_TD = Td, handle_info, {noreply, ModState, Actions}, O
     set_mod_state(Td, OrigModState, ModState, State),
     {{noreply, State}, Actions}.
 
-binary_chunk_every(<<>>, _Size, Acc) ->
-    lists:reverse(Acc);
-binary_chunk_every(Bin, Size, Acc) ->
-    case Bin of
-        <<Chunk:Size/binary, Rest/binary>> ->
-            binary_chunk_every(Rest, Size, [Chunk | Acc]);
-        Chunk ->
-            lists:reverse([Chunk | Acc])
+handle_actions([], Acc, _ModState) ->
+    lists:append(lists:reverse(Acc));
+handle_actions([Action | Actions], Acc, ModState) ->
+    case Action(ModState) of
+        {cont, Items} ->
+            handle_actions(Actions, [Items | Acc], ModState);
+        halt ->
+            ok;
+        _ ->
+            handle_actions(Actions, Acc, ModState)
     end.
-
-handle_actions([]) ->
-    ok;
-handle_actions([Action | Actions]) ->
-    Action(),
-    handle_actions(Actions).
 
 get_state_key(Tuple) ->
     erlang:insert_element(1 + tuple_size(Tuple), Tuple, <<"s">>).
-
-partition_chunked_key(Dir, BaseKey, N) ->
-    {_, EK} = erlfdb_directory:range(Dir, BaseKey),
-    ChunkKey = erlang:insert_element(1 + tuple_size(BaseKey), BaseKey, 0),
-    ChunkKeys = [erlang:setelement(tuple_size(ChunkKey), ChunkKey, X) || X <- lists:seq(0, N - 1)],
-    FirstUnused = erlang:setelement(tuple_size(ChunkKey), ChunkKey, N),
-    {ChunkKeys, {FirstUnused, EK}}.
 
 handle_new_priority_call(?IS_DB(Db, Dir), Request, From, State) ->
     erlfdb:transactional(Db, fun(Tx) ->
@@ -282,8 +364,8 @@ handle_new_priority_call(?IS_TD = Td, Request, From, State) ->
     case invoke_tx_callback(Td, handle_call, [Request, From], State) of
         {error, Reason = {function_not_exported, _}} ->
             erlang:error(Reason);
-        {ok, {{reply, Reply, State2}, Actions}} ->
-            {Actions, Reply, State2}
+        {ok, {{reply, Reply, State2}, Actions}, ModState} ->
+            {Actions, ModState, Reply, State2}
     end.
 
 handle_new_priority_cast(?IS_DB(Db, Dir), Request, State) ->
@@ -292,33 +374,39 @@ handle_new_priority_cast(?IS_TD = Td, Request, State) ->
     case invoke_tx_callback(Td, handle_cast, [Request], State) of
         {error, Reason = {function_not_exported, _}} ->
             erlang:error(Reason);
-        {ok, {{noreply, State2}, Actions}} ->
-            {Actions, State2}
+        {ok, {{noreply, State2}, Actions}, ModState} ->
+            {Actions, ModState, State2}
     end.
 
 handle_consume(?IS_DB(Db, Dir), K, Tuid, State) ->
     erlfdb:transactional(Db, fun(Tx) -> handle_consume({Tx, Dir}, K, Tuid, State) end);
-handle_consume(?IS_TD = Td = ?IS_TX(Tx, Dir), K, Tuid, State) ->
+handle_consume(?IS_TD = Td, K, Tuid, State) ->
     case dgen_queue:consume_k(Td, K, Tuid) of
         {[{call, Request, From}], Watch} ->
             case invoke_tx_callback(Td, handle_call, [Request, From], State) of
                 {error, Reason = {function_not_exported, _}} ->
                     erlang:error(Reason);
-                {ok, {{reply, Reply, State2}, Actions}} ->
-                    erlfdb:set(
-                        Tx, erlfdb_directory:pack(Dir, From), term_to_binary({reply, Reply})
-                    ),
-                    {Watch, Actions, State2}
+                {ok, {{reply, Reply, State2}, Actions}, ModState} ->
+                    reply(Td, From, Reply),
+                    {Watch, Actions, ModState, State2}
             end;
         {[{cast, Request}], Watch} ->
             case invoke_tx_callback(Td, handle_cast, [Request], State) of
                 {error, Reason = {function_not_exported, _}} ->
                     erlang:error(Reason);
-                {ok, {{noreply, State2}, Actions}} ->
-                    {Watch, Actions, State2}
+                {ok, {{noreply, State2}, Actions}, ModState} ->
+                    {Watch, Actions, ModState, State2}
             end;
         {[], Watch} ->
-            {Watch, [], State}
+            {Watch, [], undefined, State}
+    end.
+
+reply(?IS_TD = _Td = ?IS_TX(Tx, Dir), From, Reply) ->
+    CallKeyBin = erlfdb_directory:pack(Dir, From),
+    % Skip writing the reply if the caller timed out and cleared CallKeyBin
+    case erlfdb:wait(erlfdb:get(Tx, CallKeyBin)) of
+        not_found -> ok;
+        _ -> erlfdb:set(Tx, CallKeyBin, term_to_binary({reply, Reply}))
     end.
 
 handle_info(?IS_DB(Db, Dir), Info, State) ->
@@ -327,8 +415,8 @@ handle_info(?IS_TD = Td, Info, State) ->
     case invoke_tx_callback(Td, handle_info, [Info], State) of
         {error, {function_not_exported, _}} ->
             {[], State};
-        {ok, {{noreply, State2}, Actions}} ->
-            {Actions, State2}
+        {ok, {{noreply, State2}, Actions}, ModState} ->
+            {Actions, ModState, State2}
     end.
 
 init_tuid(Mod, Arg) ->

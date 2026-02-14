@@ -1,5 +1,17 @@
 -module(dgen_queue).
 
+-define(DOCATTRS, ?OTP_RELEASE >= 27).
+
+-if(?DOCATTRS).
+-moduledoc """
+Durable FIFO queue backed by FoundationDB.
+
+Each dgen_server has its own queue keyed under `{Tuid, <<"q">>}`. Items are
+ordered by FDB versionstamps, guaranteeing strict FIFO across transactions.
+Push and pop counts are tracked with atomic `add` operations for O(1) length.
+""".
+-endif.
+
 -export([push_k/3, consume_k/3, delete/2, length/2]).
 
 -include("../include/dgen.hrl").
@@ -11,6 +23,13 @@
     erlfdb:get_next_tx_id(Tx)
 }).
 
+-if(?DOCATTRS).
+-doc """
+Pushes a list of items onto the queue atomically.
+
+Each item is stored with a versionstamped key to ensure FIFO ordering.
+""".
+-endif.
 push_k(?IS_DB(Db, Dir), Tuid, Items) ->
     erlfdb:transactional(Db, fun(Tx) -> push_k({Tx, Dir}, Tuid, Items) end);
 push_k(?IS_TX(Tx, Dir), Tuid, Items) ->
@@ -36,6 +55,14 @@ push_k(?IS_TX(Tx, Dir), Tuid, Items) ->
     PushKey = get_push_key(QueueKey),
     erlfdb:add(Tx, erlfdb_directory:pack(Dir, PushKey), length(Items)).
 
+-if(?DOCATTRS).
+-doc """
+Pops up to `K` items from the queue.
+
+Returns `{Items, Watch}` where `Watch` is `undefined` if the queue still has
+items, or an FDB future that fires when new items are pushed.
+""".
+-endif.
 consume_k(?IS_DB(Db, Dir), K, Tuid) ->
     erlfdb:transactional(Db, fun(Tx) -> consume_k({Tx, Dir}, K, Tuid) end);
 consume_k(?IS_TD = Td, K, Tuid) ->
@@ -46,6 +73,9 @@ consume_k(?IS_TD = Td, K, Tuid) ->
             {Vals, watch_push(Td, Tuid)}
     end.
 
+-if(?DOCATTRS).
+-doc "Deletes the entire queue for the given `Tuid`, including all items and counters.".
+-endif.
 delete(?IS_DB(Db, Dir), Tuid) ->
     erlfdb:transactional(Db, fun(Tx) -> delete({Tx, Dir}, Tuid) end);
 delete(?IS_TX(Tx, Dir), Tuid) ->
@@ -53,6 +83,9 @@ delete(?IS_TX(Tx, Dir), Tuid) ->
     {SK, EK} = erlfdb_directory:range(Dir, QueueKey),
     erlfdb:clear_range(Tx, SK, EK).
 
+-if(?DOCATTRS).
+-doc "Returns the number of items currently in the queue (pushes minus pops).".
+-endif.
 length(?IS_DB(Db, Dir), Tuid) ->
     erlfdb:transactional(Db, fun(Tx) -> length({Tx, Dir}, Tuid) end);
 length(?IS_TX(Tx, Dir), Tuid) ->
