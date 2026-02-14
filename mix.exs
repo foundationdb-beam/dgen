@@ -24,7 +24,7 @@ defmodule Dgen.MixProject do
 
   defp deps do
     [
-      {:erlfdb, "~> 0.3"},
+      {:erlfdb, "~> 0.3", optional: true},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false}
     ]
   end

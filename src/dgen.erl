@@ -7,11 +7,11 @@
 Internal helpers for the dgen_server call/reply protocol.
 
 This module implements the client-side call flow: pushing a call request
-onto the durable queue, waiting for the reply via an FDB watch, and
+onto the durable queue, waiting for the reply via a watch, and
 cleaning up reply keys on timeout.
 
 Reply payloads are stored using the codec's chunked term encoding so that
-replies can exceed the FDB single-value size limit. The watch is placed on
+replies can exceed the single-value size limit. The watch is placed on
 the first chunk key; the client always reads via `get_range`.
 
 ### Call Request Flow
@@ -19,7 +19,7 @@ the first chunk key; the client always reads via `get_range`.
 1. The caller invokes `dgen_server:call/3` which delegates to `call/4`.
 2. A call request is pushed onto the durable queue via `push_call/5`,
    which writes `noreply` as a chunked term under the from-key and sets
-   an FDB watch on the first chunk key.
+   a watch on the first chunk key.
 3. The caller blocks in `await_call_reply/4` until the watch fires or
    the timeout expires.
 4. A consumer processes the request and writes `{reply, Reply}` as a
@@ -37,21 +37,22 @@ the first chunk key; the client always reads via `get_range`.
 -doc """
 Pushes a call request onto the durable queue.
 
-Writes `noreply` as a chunked term under the from-key prefix, sets an FDB
+Writes `noreply` as a chunked term under the from-key prefix, sets a
 watch on the first chunk key directed to `WatchTo`, and enqueues the request.
 Returns `{From, Watch}` where `From` is the from-key tuple.
 """.
 -endif.
-push_call(?IS_DB(Db, Dir), Tuid, Request, WatchTo, Options) ->
-    erlfdb:transactional(Db, fun(Tx) -> push_call({Tx, Dir}, Tuid, Request, WatchTo, Options) end);
-push_call(Td = ?IS_TX(Tx, Dir), Tuid, Request, WatchTo, Options) ->
-    WaitingKey = get_waiting_key(Tuid),
-    From = get_from(WaitingKey, make_ref()),
-    dgen_mod_state_codec:write_term(Td, From, noreply),
-    ReplySentinelKey = dgen_mod_state_codec:term_first_key(Dir, From),
-    Future = erlfdb:watch(Tx, ReplySentinelKey, [{to, WatchTo}]),
-    dgen_queue:push_k(Td, Tuid, [{call, Request, From, Options}]),
-    {From, Future}.
+push_call(Tenant, Tuid, Request, WatchTo, Options) ->
+    dgen_backend:transactional(Tenant, fun({Tx, Dir}) ->
+        B = dgen_config:backend(),
+        WaitingKey = get_waiting_key(Tuid),
+        From = get_from(WaitingKey, make_ref()),
+        dgen_mod_state_codec:write_term({Tx, Dir}, From, noreply),
+        ReplySentinelKey = dgen_mod_state_codec:term_first_key(Dir, From),
+        Future = B:watch(Tx, ReplySentinelKey, [{to, WatchTo}]),
+        dgen_queue:push_k({Tx, Dir}, Tuid, [{call, Request, From, Options}]),
+        {From, Future}
+    end).
 
 -if(?DOCATTRS).
 -doc "Appends the `<<\"c\">>` waiting-key tag to a tuid tuple.".
@@ -143,15 +144,16 @@ cleanup_call(undefined, _From) ->
 cleanup_call(Tenant, From) ->
     dgen_mod_state_codec:clear_term(Tenant, From).
 
-handle_call_ready(?IS_DB(Db, Dir), From) ->
-    erlfdb:transactional(Db, fun(Tx) -> handle_call_ready({Tx, Dir}, From) end);
-handle_call_ready(Td = ?IS_TX(Tx, Dir), From) ->
-    case dgen_mod_state_codec:read_term(Td, From) of
-        {error, not_found} ->
-            {watch, erlfdb:watch(Tx, dgen_mod_state_codec:term_first_key(Dir, From))};
-        {ok, noreply} ->
-            {watch, erlfdb:watch(Tx, dgen_mod_state_codec:term_first_key(Dir, From))};
-        {ok, {reply, Reply}} ->
-            dgen_mod_state_codec:clear_term(Td, From),
-            {reply, Reply}
-    end.
+handle_call_ready(Tenant, From) ->
+    dgen_backend:transactional(Tenant, fun({Tx, Dir}) ->
+        B = dgen_config:backend(),
+        case dgen_mod_state_codec:read_term({Tx, Dir}, From) of
+            {error, not_found} ->
+                {watch, B:watch(Tx, dgen_mod_state_codec:term_first_key(Dir, From))};
+            {ok, noreply} ->
+                {watch, B:watch(Tx, dgen_mod_state_codec:term_first_key(Dir, From))};
+            {ok, {reply, Reply}} ->
+                dgen_mod_state_codec:clear_term({Tx, Dir}, From),
+                {reply, Reply}
+        end
+    end).

@@ -5,12 +5,13 @@
 
 -if(?DOCATTRS).
 -moduledoc """
-A durable, distributed gen_server backed by FoundationDB.
+A durable, distributed gen_server backed by a pluggable storage backend.
 
 A dgen_server is an abstract entity composed of durable state and operations on
-that state. The state lives in FoundationDB and the operations are defined by a
-callback module implementing the `dgen_server` behaviour. This allows a
-gen_server to outlive any single Erlang process, node, or cluster.
+that state. The state lives in the configured backend (default: FoundationDB)
+and the operations are defined by a callback module implementing the
+`dgen_server` behaviour. This allows a gen_server to outlive any single Erlang
+process, node, or cluster.
 
 Zero or more Erlang processes may act on a dgen_server at any time. Processes
 with `consume` enabled consume messages from the durable queue and invoke
@@ -20,8 +21,7 @@ callbacks; processes without it only publish messages.
 
 The following options may be passed via the `Opts` proplist:
 
-- `tenant` (required) - `{erlfdb:database(), erlfdb_directory:dir()}` pair
-  identifying the FDB subspace.
+- `tenant` (required) - `{DbHandle, Dir}` pair identifying the backend subspace.
 - `consume` (default `true`) - whether this process consumes messages from
   the queue.
 - `reset` (default `false`) - when `true`, re-initialise the durable state
@@ -282,7 +282,7 @@ handle_cast({kill, Reason}, State = #state{tenant = Tenant, tuid = Tuid}) ->
 handle_info({Ref, ready}, State = #state{watch = ?FUTURE(Ref)}) ->
     handle_cast(consume, State#state{watch = undefined});
 handle_info(Info, State = #state{tenant = Tenant}) ->
-    {Actions, ModState, State2} = handle_info(Tenant, Info, State),
+    {Actions, ModState, State2} = handle_info_callback(Tenant, Info, State),
     _ = handle_actions(Actions, [], ModState),
     {noreply, State2}.
 
@@ -292,7 +292,7 @@ terminate(_Reason, _State) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
-invoke_tx_callback(?IS_TD = Td, Callback, Args, State = #state{mod = Mod}) ->
+invoke_tx_callback(Td, Callback, Args, State = #state{mod = Mod}) ->
     T1 = erlang:monotonic_time(millisecond),
     Arity = length(Args) + 1,
     Result =
@@ -324,26 +324,27 @@ invoke_tx_callback(?IS_TD = Td, Callback, Args, State = #state{mod = Mod}) ->
 modify_args_for_callback(_, Args, ModState) ->
     Args ++ [ModState].
 
-delete(?IS_DB(Db, Dir), Tuid) ->
-    erlfdb:transactional(Db, fun(Tx) -> delete({Tx, Dir}, Tuid) end);
-delete(Td = ?IS_TD = ?IS_TX(Tx, Dir), Tuid) ->
-    clear_mod_state(Td, Tuid),
-    dgen_queue:delete(Td, Tuid),
-    WaitingKey = dgen:get_waiting_key(Tuid),
-    {SK, EK} = erlfdb_directory:range(Dir, WaitingKey),
-    erlfdb:clear_range(Tx, SK, EK).
+delete(Tenant, Tuid) ->
+    dgen_backend:transactional(Tenant, fun(Td = {Tx, Dir}) ->
+        B = dgen_config:backend(),
+        clear_mod_state(Td, Tuid),
+        dgen_queue:delete(Td, Tuid),
+        WaitingKey = dgen:get_waiting_key(Tuid),
+        {SK, EK} = B:dir_range(Dir, WaitingKey),
+        B:clear_range(Tx, SK, EK)
+    end).
 
-init_mod_state(?IS_DB(Db, Dir), InitialState, Reset, State) ->
-    erlfdb:transactional(Db, fun(Tx) -> init_mod_state({Tx, Dir}, InitialState, Reset, State) end);
-init_mod_state(?IS_TD = Td, InitialState, Reset, State) ->
-    case {Reset, get_mod_state(Td, State)} of
-        {false, {ok, _ModState}} ->
-            ok;
-        {true, _ModState} ->
-            set_mod_state(Td, InitialState, State);
-        {_, {error, not_found}} ->
-            set_mod_state(Td, InitialState, State)
-    end.
+init_mod_state(Tenant, InitialState, Reset, State) ->
+    dgen_backend:transactional(Tenant, fun(Td) ->
+        case {Reset, get_mod_state(Td, State)} of
+            {false, {ok, _ModState}} ->
+                ok;
+            {true, _ModState} ->
+                set_mod_state(Td, InitialState, State);
+            {_, {error, not_found}} ->
+                set_mod_state(Td, InitialState, State)
+        end
+    end).
 
 clear_mod_state(Td, Tuid) ->
     dgen_mod_state_codec:clear(Td, get_state_key(Tuid)).
@@ -359,24 +360,24 @@ set_mod_state(Td, OrigModState, ModState, State) ->
 set_mod_state(Td, ModState, _State = #state{tuid = Tuid}) ->
     dgen_mod_state_codec:set(Td, get_state_key(Tuid), ModState).
 
-handle_callback_result(?IS_TD = Td, handle_cast, {noreply, ModState}, OrigModState, State) ->
+handle_callback_result(Td, handle_cast, {noreply, ModState}, OrigModState, State) ->
     set_mod_state(Td, OrigModState, ModState, State),
     {{noreply, State}, []};
-handle_callback_result(?IS_TD = Td, handle_cast, {noreply, ModState, Actions}, OrigModState, State) ->
+handle_callback_result(Td, handle_cast, {noreply, ModState, Actions}, OrigModState, State) ->
     set_mod_state(Td, OrigModState, ModState, State),
     {{noreply, State}, Actions};
-handle_callback_result(?IS_TD = Td, handle_call, {reply, Reply, ModState}, OrigModState, State) ->
+handle_callback_result(Td, handle_call, {reply, Reply, ModState}, OrigModState, State) ->
     set_mod_state(Td, OrigModState, ModState, State),
     {{reply, Reply, State}, []};
 handle_callback_result(
-    ?IS_TD = Td, handle_call, {reply, Reply, ModState, Actions}, OrigModState, State
+    Td, handle_call, {reply, Reply, ModState, Actions}, OrigModState, State
 ) ->
     set_mod_state(Td, OrigModState, ModState, State),
     {{reply, Reply, State}, Actions};
-handle_callback_result(?IS_TD = Td, handle_info, {noreply, ModState}, OrigModState, State) ->
+handle_callback_result(Td, handle_info, {noreply, ModState}, OrigModState, State) ->
     set_mod_state(Td, OrigModState, ModState, State),
     {{noreply, State}, []};
-handle_callback_result(?IS_TD = Td, handle_info, {noreply, ModState, Actions}, OrigModState, State) ->
+handle_callback_result(Td, handle_info, {noreply, ModState, Actions}, OrigModState, State) ->
     set_mod_state(Td, OrigModState, ModState, State),
     {{noreply, State}, Actions}.
 
@@ -395,109 +396,104 @@ handle_actions([Action | Actions], Acc, ModState) ->
 get_state_key(Tuple) ->
     erlang:insert_element(1 + tuple_size(Tuple), Tuple, <<"s">>).
 
-handle_new_priority_call(?IS_DB(Db, Dir), Request, From, State) ->
-    erlfdb:transactional(Db, fun(Tx) ->
-        handle_new_priority_call({Tx, Dir}, Request, From, State)
-    end);
-handle_new_priority_call(?IS_TD = Td, Request, From, State) ->
-    case invoke_tx_callback(Td, handle_call, [Request, From], State) of
-        {error, Reason = {function_not_exported, _}} ->
-            erlang:error(Reason);
-        {ok, {{reply, Reply, State2}, Actions}, ModState} ->
-            {Actions, ModState, Reply, State2}
-    end.
-
-handle_new_priority_cast(?IS_DB(Db, Dir), Request, State) ->
-    erlfdb:transactional(Db, fun(Tx) -> handle_new_priority_cast({Tx, Dir}, Request, State) end);
-handle_new_priority_cast(?IS_TD = Td, Request, State) ->
-    case invoke_tx_callback(Td, handle_cast, [Request], State) of
-        {error, Reason = {function_not_exported, _}} ->
-            erlang:error(Reason);
-        {ok, {{noreply, State2}, Actions}, ModState} ->
-            {Actions, ModState, State2}
-    end.
-
-handle_inline_call(Tenant = ?IS_DB(Db, Dir), Request, From, CallOptions, State) ->
-    erlfdb:transactional(Db, fun(Tx) ->
-        handle_inline_call(Tenant, {Tx, Dir}, Request, From, CallOptions, State)
+handle_new_priority_call(Tenant, Request, From, State) ->
+    dgen_backend:transactional(Tenant, fun(Td) ->
+        case invoke_tx_callback(Td, handle_call, [Request, From], State) of
+            {error, Reason = {function_not_exported, _}} ->
+                erlang:error(Reason);
+            {ok, {{reply, Reply, State2}, Actions}, ModState} ->
+                {Actions, ModState, Reply, State2}
+        end
     end).
 
-handle_inline_call(_Tenant, ?IS_TD = Td, Request, From, CallOptions, State = #state{tuid = Tuid}) ->
-    case dgen_queue:length(Td, Tuid) of
-        0 ->
-            case invoke_tx_callback(Td, handle_call, [Request, From], State) of
-                {error, Reason = {function_not_exported, _}} ->
-                    erlang:error(Reason);
-                {ok, {{reply, Reply, State2}, Actions}, ModState} ->
-                    case proplists:get_value(reply_with_effects, CallOptions, false) of
-                        false ->
-                            {inline, Reply, fun() -> handle_actions(Actions, [], ModState) end,
-                                State2};
-                        true ->
-                            Effects = handle_actions(Actions, [], ModState),
-                            {inline, {Reply, Effects}, fun() -> ok end, State2}
-                    end
-            end;
-        _ ->
-            fallback
-    end.
+handle_new_priority_cast(Tenant, Request, State) ->
+    dgen_backend:transactional(Tenant, fun(Td) ->
+        case invoke_tx_callback(Td, handle_cast, [Request], State) of
+            {error, Reason = {function_not_exported, _}} ->
+                erlang:error(Reason);
+            {ok, {{noreply, State2}, Actions}, ModState} ->
+                {Actions, ModState, State2}
+        end
+    end).
 
-handle_consume(Tenant = ?IS_DB(Db, Dir), K, Tuid, State) ->
-    erlfdb:transactional(Db, fun(Tx) -> handle_consume(Tenant, {Tx, Dir}, K, Tuid, State) end).
+handle_inline_call(Tenant, Request, From, CallOptions, State) ->
+    dgen_backend:transactional(Tenant, fun(Td) ->
+        case dgen_queue:length(Td, State#state.tuid) of
+            0 ->
+                case invoke_tx_callback(Td, handle_call, [Request, From], State) of
+                    {error, Reason = {function_not_exported, _}} ->
+                        erlang:error(Reason);
+                    {ok, {{reply, Reply, State2}, Actions}, ModState} ->
+                        case proplists:get_value(reply_with_effects, CallOptions, false) of
+                            false ->
+                                {inline, Reply, fun() -> handle_actions(Actions, [], ModState) end,
+                                    State2};
+                            true ->
+                                Effects = handle_actions(Actions, [], ModState),
+                                {inline, {Reply, Effects}, fun() -> ok end, State2}
+                        end
+                end;
+            _ ->
+                fallback
+        end
+    end).
 
-handle_consume(Tenant = ?IS_DB(_Db, _Dir), ?IS_TD = Td, K, Tuid, State) ->
-    case dgen_queue:consume_k(Td, K, Tuid) of
-        {[{call, Request, From, CallOptions}], Watch} ->
-            case invoke_tx_callback(Td, handle_call, [Request, From], State) of
-                {error, Reason = {function_not_exported, _}} ->
-                    erlang:error(Reason);
-                {ok, {{reply, Reply, State2}, Actions}, ModState} ->
-                    case proplists:get_value(reply_with_effects, CallOptions, false) of
-                        false ->
-                            reply(Td, From, Reply),
-                            {Watch, fun() -> handle_actions(Actions, [], ModState) end, State2};
-                        true ->
-                            {Watch,
-                                fun() ->
-                                    Effects = handle_actions(Actions, [], ModState),
-                                    reply(Tenant, From, {Reply, Effects})
-                                end,
-                                State2}
-                    end
-            end;
-        {[{cast, Request}], Watch} ->
-            case invoke_tx_callback(Td, handle_cast, [Request], State) of
-                {error, Reason = {function_not_exported, _}} ->
-                    erlang:error(Reason);
-                {ok, {{noreply, State2}, Actions}, ModState} ->
-                    {Watch, fun() -> handle_actions(Actions, [], ModState) end, State2}
-            end;
-        {[], Watch} ->
-            {Watch, fun() -> ok end, State}
-    end.
+handle_consume(Tenant, K, Tuid, State) ->
+    dgen_backend:transactional(Tenant, fun(Td) ->
+        case dgen_queue:consume_k(Td, K, Tuid) of
+            {[{call, Request, From, CallOptions}], Watch} ->
+                case invoke_tx_callback(Td, handle_call, [Request, From], State) of
+                    {error, Reason = {function_not_exported, _}} ->
+                        erlang:error(Reason);
+                    {ok, {{reply, Reply, State2}, Actions}, ModState} ->
+                        case proplists:get_value(reply_with_effects, CallOptions, false) of
+                            false ->
+                                reply(Td, From, Reply),
+                                {Watch, fun() -> handle_actions(Actions, [], ModState) end, State2};
+                            true ->
+                                {Watch,
+                                    fun() ->
+                                        Effects = handle_actions(Actions, [], ModState),
+                                        reply(Tenant, From, {Reply, Effects})
+                                    end,
+                                    State2}
+                        end
+                end;
+            {[{cast, Request}], Watch} ->
+                case invoke_tx_callback(Td, handle_cast, [Request], State) of
+                    {error, Reason = {function_not_exported, _}} ->
+                        erlang:error(Reason);
+                    {ok, {{noreply, State2}, Actions}, ModState} ->
+                        {Watch, fun() -> handle_actions(Actions, [], ModState) end, State2}
+                end;
+            {[], Watch} ->
+                {Watch, fun() -> ok end, State}
+        end
+    end).
 
-reply(?IS_DB(Db, Dir), From, Reply) ->
-    erlfdb:transactional(Db, fun(Tx) -> reply({Tx, Dir}, From, Reply) end);
-reply(?IS_TD = Td = ?IS_TX(Tx, Dir), From, Reply) ->
-    ReplySentinelKey = dgen_mod_state_codec:term_first_key(Dir, From),
-    % Skip writing the reply if the caller timed out and cleared the reply keys
-    case erlfdb:wait(erlfdb:get(Tx, ReplySentinelKey)) of
-        not_found ->
-            ok;
-        _ ->
-            dgen_mod_state_codec:clear_term(Td, From),
-            dgen_mod_state_codec:write_term(Td, From, {reply, Reply})
-    end.
+reply(Tenant, From, Reply) ->
+    dgen_backend:transactional(Tenant, fun({Tx, Dir}) ->
+        B = dgen_config:backend(),
+        ReplySentinelKey = dgen_mod_state_codec:term_first_key(Dir, From),
+        % Skip writing the reply if the caller timed out and cleared the reply keys
+        case B:wait(B:get(Tx, ReplySentinelKey)) of
+            not_found ->
+                ok;
+            _ ->
+                dgen_mod_state_codec:clear_term({Tx, Dir}, From),
+                dgen_mod_state_codec:write_term({Tx, Dir}, From, {reply, Reply})
+        end
+    end).
 
-handle_info(?IS_DB(Db, Dir), Info, State) ->
-    erlfdb:transactional(Db, fun(Tx) -> handle_info({Tx, Dir}, Info, State) end);
-handle_info(?IS_TD = Td, Info, State) ->
-    case invoke_tx_callback(Td, handle_info, [Info], State) of
-        {error, {function_not_exported, _}} ->
-            {[], State};
-        {ok, {{noreply, State2}, Actions}, ModState} ->
-            {Actions, ModState, State2}
-    end.
+handle_info_callback(Tenant, Info, State) ->
+    dgen_backend:transactional(Tenant, fun(Td) ->
+        case invoke_tx_callback(Td, handle_info, [Info], State) of
+            {error, {function_not_exported, _}} ->
+                {[], undefined, State};
+            {ok, {{noreply, State2}, Actions}, ModState} ->
+                {Actions, ModState, State2}
+        end
+    end).
 
 init_tuid(Mod, Arg) ->
     case Mod:init(Arg) of

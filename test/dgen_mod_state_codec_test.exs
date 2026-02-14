@@ -405,8 +405,10 @@ defmodule DGenModStateCodec.Test do
     test "set and get within a single transaction", %{tenant: {db, dir}} do
       key = base_key()
 
+      b = :dgen_config.backend()
+
       result =
-        :erlfdb.transactional(db, fn tx ->
+        b.transactional(db, fn tx ->
           td = {tx, dir}
           :ok = :dgen_mod_state_codec.set(td, key, %{a: 1})
           :dgen_mod_state_codec.get(td, key)

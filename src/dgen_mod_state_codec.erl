@@ -31,13 +31,9 @@ list:  {BaseKey, <<"l">>}                        (marker, holds Id => FracIndex 
 """.
 -endif.
 
--include("../include/dgen.hrl").
-
 -export([get/2, set/3, set/4, clear/2, write_term/3, read_term/2, clear_term/2, term_first_key/2]).
 
--type tenant() ::
-    {erlfdb:database(), term()}
-    | {erlfdb:transaction(), term()}.
+-type tenant() :: {term(), term()}.
 -type base_key() :: tuple().
 -type mod_state() :: term().
 
@@ -53,29 +49,31 @@ list:  {BaseKey, <<"l">>}                        (marker, holds Id => FracIndex 
 %%
 
 -if(?DOCATTRS).
--doc "Reads mod_state from FDB at `BaseKey`.".
+-doc "Reads mod_state from the backend at `BaseKey`.".
 -endif.
 -spec get(tenant(), base_key()) -> {ok, mod_state()} | {error, not_found}.
-get(?IS_DB(Db, Dir), BaseKey) ->
-    erlfdb:transactional(Db, fun(Tx) -> get({Tx, Dir}, BaseKey) end);
-get(?IS_TX(Tx, Dir) = Td, BaseKey) ->
-    {SK, EK} = erlfdb_directory:range(Dir, BaseKey),
-    case erlfdb:get_range(Tx, SK, EK, [{wait, true}]) of
+get(Tenant, BaseKey) ->
+    dgen_backend:transactional(Tenant, fun(Td) -> get_tx(Td, BaseKey) end).
+
+get_tx({Tx, Dir}, BaseKey) ->
+    B = dgen_config:backend(),
+    {SK, EK} = B:dir_range(Dir, BaseKey),
+    case B:get_range(Tx, SK, EK, [{wait, true}]) of
         [] ->
             {error, not_found};
         KVs ->
-            decode_kvs(Td, BaseKey, KVs)
+            decode_kvs(Dir, BaseKey, KVs)
     end.
 
 -if(?DOCATTRS).
--doc "Full write of `ModState` to FDB at `BaseKey`. Clears existing data first.".
+-doc "Full write of `ModState` at `BaseKey`. Clears existing data first.".
 -endif.
 -spec set(tenant(), base_key(), mod_state()) -> ok.
-set(?IS_DB(Db, Dir), BaseKey, ModState) ->
-    erlfdb:transactional(Db, fun(Tx) -> set({Tx, Dir}, BaseKey, ModState) end);
-set(?IS_TX(_Tx, _Dir) = Td, BaseKey, ModState) ->
-    clear(Td, BaseKey),
-    write(Td, BaseKey, ModState).
+set(Tenant, BaseKey, ModState) ->
+    dgen_backend:transactional(Tenant, fun(Td) ->
+        clear_tx(Td, BaseKey),
+        write(Td, BaseKey, ModState)
+    end).
 
 -if(?DOCATTRS).
 -doc """
@@ -87,40 +85,42 @@ type changes or both values are plain terms.
 -spec set(tenant(), base_key(), mod_state(), mod_state()) -> ok.
 set(_Td, _BaseKey, Same, Same) ->
     ok;
-set(?IS_DB(Db, Dir), BaseKey, OldModState, NewModState) ->
-    erlfdb:transactional(Db, fun(Tx) -> set({Tx, Dir}, BaseKey, OldModState, NewModState) end);
-set(Td, BaseKey, OldModState, NewModState) ->
-    OldType = classify(OldModState),
-    NewType = classify(NewModState),
-    case OldType =:= NewType of
-        false ->
-            clear(Td, BaseKey),
-            write(Td, BaseKey, NewModState);
-        true ->
-            case OldType of
-                term ->
-                    clear(Td, BaseKey),
-                    write(Td, BaseKey, NewModState);
-                map ->
-                    diff_map(Td, BaseKey, OldModState, NewModState);
-                list ->
-                    diff_list(Td, BaseKey, OldModState, NewModState)
-            end
-    end.
+set(Tenant, BaseKey, OldModState, NewModState) ->
+    dgen_backend:transactional(Tenant, fun(Td) ->
+        OldType = classify(OldModState),
+        NewType = classify(NewModState),
+        case OldType =:= NewType of
+            false ->
+                clear_tx(Td, BaseKey),
+                write(Td, BaseKey, NewModState);
+            true ->
+                case OldType of
+                    term ->
+                        clear_tx(Td, BaseKey),
+                        write(Td, BaseKey, NewModState);
+                    map ->
+                        diff_map(Td, BaseKey, OldModState, NewModState);
+                    list ->
+                        diff_list(Td, BaseKey, OldModState, NewModState)
+                end
+        end
+    end).
 
 -if(?DOCATTRS).
 -doc "Clears all state keys under `BaseKey`.".
 -endif.
 -spec clear(tenant(), base_key()) -> ok.
-clear(?IS_DB(Db, Dir), BaseKey) ->
-    erlfdb:transactional(Db, fun(Tx) -> clear({Tx, Dir}, BaseKey) end);
-clear(?IS_TX(Tx, Dir), BaseKey) ->
-    {SK, EK} = erlfdb_directory:range(Dir, BaseKey),
-    erlfdb:clear_range(Tx, SK, EK).
+clear(Tenant, BaseKey) ->
+    dgen_backend:transactional(Tenant, fun(Td) -> clear_tx(Td, BaseKey) end).
+
+clear_tx({Tx, Dir}, BaseKey) ->
+    B = dgen_config:backend(),
+    {SK, EK} = B:dir_range(Dir, BaseKey),
+    B:clear_range(Tx, SK, EK).
 
 -if(?DOCATTRS).
 -doc """
-Reads a term-encoded value from FDB at `BaseKey`.
+Reads a term-encoded value at `BaseKey`.
 
 Unlike `get/2`, this only reads the term encoding (`{BaseKey, <<"t">>, N}` keys)
 and does not attempt to decode map or list encodings. Used by the call/reply
@@ -128,15 +128,16 @@ protocol to read chunked reply payloads.
 """.
 -endif.
 -spec read_term(tenant(), base_key()) -> {ok, term()} | {error, not_found}.
-read_term(?IS_DB(Db, Dir), BaseKey) ->
-    erlfdb:transactional(Db, fun(Tx) -> read_term({Tx, Dir}, BaseKey) end);
-read_term(?IS_TX(Tx, Dir), BaseKey) ->
-    TermBaseKey = extend_key(BaseKey, ?TAG_TERM),
-    {SK, EK} = erlfdb_directory:range(Dir, TermBaseKey),
-    case erlfdb:get_range(Tx, SK, EK, [{wait, true}]) of
-        [] -> {error, not_found};
-        KVs -> decode_term(KVs)
-    end.
+read_term(Tenant, BaseKey) ->
+    dgen_backend:transactional(Tenant, fun({Tx, Dir}) ->
+        B = dgen_config:backend(),
+        TermBaseKey = extend_key(BaseKey, ?TAG_TERM),
+        {SK, EK} = B:dir_range(Dir, TermBaseKey),
+        case B:get_range(Tx, SK, EK, [{wait, true}]) of
+            [] -> {error, not_found};
+            KVs -> decode_term(KVs)
+        end
+    end).
 
 -if(?DOCATTRS).
 -doc """
@@ -147,24 +148,26 @@ protocol to clear chunked reply payloads.
 """.
 -endif.
 -spec clear_term(tenant(), base_key()) -> ok.
-clear_term(?IS_DB(Db, Dir), BaseKey) ->
-    erlfdb:transactional(Db, fun(Tx) -> clear_term({Tx, Dir}, BaseKey) end);
-clear_term(?IS_TX(Tx, Dir), BaseKey) ->
-    TermBaseKey = extend_key(BaseKey, ?TAG_TERM),
-    {SK, EK} = erlfdb_directory:range(Dir, TermBaseKey),
-    erlfdb:clear_range(Tx, SK, EK).
+clear_term(Tenant, BaseKey) ->
+    dgen_backend:transactional(Tenant, fun({Tx, Dir}) ->
+        B = dgen_config:backend(),
+        TermBaseKey = extend_key(BaseKey, ?TAG_TERM),
+        {SK, EK} = B:dir_range(Dir, TermBaseKey),
+        B:clear_range(Tx, SK, EK)
+    end).
 
 -if(?DOCATTRS).
 -doc """
-Returns the packed FDB key for chunk 0 of a term-encoded payload at `BaseKey`.
+Returns the packed key for chunk 0 of a term-encoded payload at `BaseKey`.
 
 This is the key that is written first by `write_term/3` and is suitable for
-placing an FDB watch on a term-encoded value.
+placing a watch on a term-encoded value.
 """.
 -endif.
 -spec term_first_key(term(), base_key()) -> binary().
 term_first_key(Dir, BaseKey) ->
-    erlfdb_directory:pack(Dir, extend_key(BaseKey, ?TAG_TERM, 0)).
+    B = dgen_config:backend(),
+    B:dir_pack(Dir, extend_key(BaseKey, ?TAG_TERM, 0)).
 
 %%
 %% Classification
@@ -235,23 +238,25 @@ write(Td, BaseKey, ModState) ->
         list -> write_list(Td, BaseKey, ModState)
     end.
 
-write_term(?IS_TX(Tx, Dir), BaseKey, ModState) ->
+write_term({Tx, Dir}, BaseKey, ModState) ->
+    B = dgen_config:backend(),
     Bin = term_to_binary(ModState),
     Chunks = binary_chunk_every(Bin, ?CHUNK_SIZE, []),
     TermBaseKey = extend_key(BaseKey, ?TAG_TERM),
-    write_chunks(Tx, Dir, TermBaseKey, Chunks, 0),
+    write_chunks(B, Tx, Dir, TermBaseKey, Chunks, 0),
     ok.
 
-write_chunks(_Tx, _Dir, _BaseKey, [], _Idx) ->
+write_chunks(_B, _Tx, _Dir, _BaseKey, [], _Idx) ->
     ok;
-write_chunks(Tx, Dir, BaseKey, [Chunk | Rest], Idx) ->
+write_chunks(B, Tx, Dir, BaseKey, [Chunk | Rest], Idx) ->
     Key = extend_key(BaseKey, Idx),
-    erlfdb:set(Tx, erlfdb_directory:pack(Dir, Key), Chunk),
-    write_chunks(Tx, Dir, BaseKey, Rest, Idx + 1).
+    B:set(Tx, B:dir_pack(Dir, Key), Chunk),
+    write_chunks(B, Tx, Dir, BaseKey, Rest, Idx + 1).
 
-write_map(?IS_TX(Tx, Dir) = Td, BaseKey, ModState) ->
+write_map({Tx, Dir} = Td, BaseKey, ModState) ->
+    B = dgen_config:backend(),
     MarkerKey = extend_key(BaseKey, ?TAG_MAP),
-    erlfdb:set(Tx, erlfdb_directory:pack(Dir, MarkerKey), <<>>),
+    B:set(Tx, B:dir_pack(Dir, MarkerKey), <<>>),
     maps:foreach(
         fun(AtomKey, Value) ->
             SubBaseKey = extend_key(BaseKey, ?TAG_MAP, atom_to_binary(AtomKey)),
@@ -261,18 +266,19 @@ write_map(?IS_TX(Tx, Dir) = Td, BaseKey, ModState) ->
     ),
     ok.
 
-write_list(?IS_TX(Tx, Dir) = Td, BaseKey, ModState) ->
+write_list({Tx, Dir} = Td, BaseKey, ModState) ->
+    B = dgen_config:backend(),
     MarkerKey = extend_key(BaseKey, ?TAG_LIST),
     case ModState of
         [] ->
-            erlfdb:set(Tx, erlfdb_directory:pack(Dir, MarkerKey), term_to_binary(#{})),
+            B:set(Tx, B:dir_pack(Dir, MarkerKey), term_to_binary(#{})),
             ok;
         _ ->
             N = length(ModState),
             FracIndices = dgen_frac_index:n_first(N),
             ItemsWithIndex = lists:zip(ModState, FracIndices),
             OrderMap = maps:from_list([{maps:get(id, Item), FI} || {Item, FI} <- ItemsWithIndex]),
-            erlfdb:set(Tx, erlfdb_directory:pack(Dir, MarkerKey), term_to_binary(OrderMap)),
+            B:set(Tx, B:dir_pack(Dir, MarkerKey), term_to_binary(OrderMap)),
             lists:foreach(
                 fun({#{id := Id} = Item, FI}) ->
                     SubBaseKey = extend_key(BaseKey, ?TAG_LIST, FI, Id),
@@ -287,27 +293,28 @@ write_list(?IS_TX(Tx, Dir) = Td, BaseKey, ModState) ->
 %% Decode
 %%
 
--spec decode_kvs(tenant(), base_key(), [{binary(), binary()}]) ->
+-spec decode_kvs(term(), base_key(), [{binary(), binary()}]) ->
     {ok, mod_state()}.
-decode_kvs(?IS_TX(_Tx, Dir) = Td, BaseKey, KVs) ->
+decode_kvs(Dir, BaseKey, KVs) ->
+    B = dgen_config:backend(),
     BaseSize = tuple_size(BaseKey),
     {FirstPackedKey, _FirstVal} = hd(KVs),
-    FirstTuple = erlfdb_directory:unpack(Dir, FirstPackedKey),
+    FirstTuple = B:dir_unpack(Dir, FirstPackedKey),
     Tag = element(BaseSize + 1, FirstTuple),
     case Tag of
         ?TAG_TERM -> decode_term(KVs);
-        ?TAG_MAP -> decode_map(Td, BaseKey, KVs);
-        ?TAG_LIST -> decode_list(Td, BaseKey, KVs)
+        ?TAG_MAP -> decode_map(B, Dir, BaseKey, KVs);
+        ?TAG_LIST -> decode_list(B, Dir, BaseKey, KVs)
     end.
 
 decode_term(KVs) ->
     {_, Vs} = lists:unzip(KVs),
     {ok, binary_to_term(iolist_to_binary(Vs))}.
 
-decode_map(?IS_TX(_Tx, Dir) = Td, BaseKey, KVs) ->
+decode_map(B, Dir, BaseKey, KVs) ->
     BaseSize = tuple_size(BaseKey),
     MarkerSize = BaseSize + 1,
-    Unpacked = [{erlfdb_directory:unpack(Dir, PK), PK, V} || {PK, V} <- KVs],
+    Unpacked = [{B:dir_unpack(Dir, PK), PK, V} || {PK, V} <- KVs],
     DataKVs = [{T, PK, V} || {T, PK, V} <- Unpacked, tuple_size(T) > MarkerSize],
     case DataKVs of
         [] ->
@@ -319,7 +326,7 @@ decode_map(?IS_TX(_Tx, Dir) = Td, BaseKey, KVs) ->
                     AtomKey = binary_to_atom(GroupKey),
                     SubBaseKey = extend_key(BaseKey, ?TAG_MAP, GroupKey),
                     SubKVs = [{PK, V} || {_T, PK, V} <- GroupKVs],
-                    {ok, Value} = decode_kvs(Td, SubBaseKey, SubKVs),
+                    {ok, Value} = decode_kvs(Dir, SubBaseKey, SubKVs),
                     {AtomKey, Value}
                 end
              || {GroupKey, GroupKVs} <- Groups
@@ -327,10 +334,10 @@ decode_map(?IS_TX(_Tx, Dir) = Td, BaseKey, KVs) ->
             {ok, Map}
     end.
 
-decode_list(?IS_TX(_Tx, Dir) = Td, BaseKey, KVs) ->
+decode_list(B, Dir, BaseKey, KVs) ->
     BaseSize = tuple_size(BaseKey),
     MarkerSize = BaseSize + 1,
-    Unpacked = [{erlfdb_directory:unpack(Dir, PK), PK, V} || {PK, V} <- KVs],
+    Unpacked = [{B:dir_unpack(Dir, PK), PK, V} || {PK, V} <- KVs],
     DataKVs = [{T, PK, V} || {T, PK, V} <- Unpacked, tuple_size(T) > MarkerSize],
     case DataKVs of
         [] ->
@@ -347,7 +354,7 @@ decode_list(?IS_TX(_Tx, Dir) = Td, BaseKey, KVs) ->
                     FracIndex = element(BaseSize + 2, FirstTuple),
                     SubBaseKey = extend_key(BaseKey, ?TAG_LIST, FracIndex, GroupId),
                     SubKVs = [{PK, V} || {_T, PK, V} <- GroupKVs],
-                    {ok, Item} = decode_kvs(Td, SubBaseKey, SubKVs),
+                    {ok, Item} = decode_kvs(Dir, SubBaseKey, SubKVs),
                     Item
                 end
              || {_GroupFI, GroupKVs} <- Groups
@@ -369,7 +376,7 @@ diff_map(Td, BaseKey, OldMap, NewMap) ->
     lists:foreach(
         fun(AtomKey) ->
             SubBaseKey = extend_key(BaseKey, ?TAG_MAP, atom_to_binary(AtomKey)),
-            clear(Td, SubBaseKey)
+            clear_tx(Td, SubBaseKey)
         end,
         Removed
     ),
@@ -385,14 +392,37 @@ diff_map(Td, BaseKey, OldMap, NewMap) ->
             OldVal = maps:get(AtomKey, OldMap),
             NewVal = maps:get(AtomKey, NewMap),
             SubBaseKey = extend_key(BaseKey, ?TAG_MAP, atom_to_binary(AtomKey)),
-            set(Td, SubBaseKey, OldVal, NewVal)
+            set_tx(Td, SubBaseKey, OldVal, NewVal)
         end,
         Common
     ),
     ok.
 
+%% Internal diff-set that operates on an already-transactional tenant
+set_tx(_Td, _BaseKey, Same, Same) ->
+    ok;
+set_tx(Td, BaseKey, OldModState, NewModState) ->
+    OldType = classify(OldModState),
+    NewType = classify(NewModState),
+    case OldType =:= NewType of
+        false ->
+            clear_tx(Td, BaseKey),
+            write(Td, BaseKey, NewModState);
+        true ->
+            case OldType of
+                term ->
+                    clear_tx(Td, BaseKey),
+                    write(Td, BaseKey, NewModState);
+                map ->
+                    diff_map(Td, BaseKey, OldModState, NewModState);
+                list ->
+                    diff_list(Td, BaseKey, OldModState, NewModState)
+            end
+    end.
+
 -spec diff_list(tenant(), base_key(), list(), list()) -> ok.
-diff_list(?IS_TX(Tx, Dir) = Td, BaseKey, OldList, NewList) ->
+diff_list({Tx, Dir} = Td, BaseKey, OldList, NewList) ->
+    B = dgen_config:backend(),
     OldById = maps:from_list([{maps:get(id, Item), Item} || Item <- OldList]),
     NewById = maps:from_list([{maps:get(id, Item), Item} || Item <- NewList]),
     OldIds = maps:keys(OldById),
@@ -403,9 +433,9 @@ diff_list(?IS_TX(Tx, Dir) = Td, BaseKey, OldList, NewList) ->
 
     %% Read current order map (Id => FracIndex) from the marker key
     MarkerKey = extend_key(BaseKey, ?TAG_LIST),
-    PackedMarker = erlfdb_directory:pack(Dir, MarkerKey),
+    PackedMarker = B:dir_pack(Dir, MarkerKey),
     OldOrderMap =
-        case erlfdb:wait(erlfdb:get(Tx, PackedMarker)) of
+        case B:wait(B:get(Tx, PackedMarker)) of
             not_found -> #{};
             OrderBin -> binary_to_term(OrderBin)
         end,
@@ -417,14 +447,14 @@ diff_list(?IS_TX(Tx, Dir) = Td, BaseKey, OldList, NewList) ->
     OrderMap2 = assign_new_indices(NewList, AddedIds, OrderMap1),
 
     %% Write updated order map
-    erlfdb:set(Tx, PackedMarker, term_to_binary(OrderMap2)),
+    B:set(Tx, PackedMarker, term_to_binary(OrderMap2)),
 
     %% Clear removed items (using old frac index in key path)
     lists:foreach(
         fun(Id) ->
             OldFI = maps:get(Id, OldOrderMap),
             SubBaseKey = extend_key(BaseKey, ?TAG_LIST, OldFI, Id),
-            clear(Td, SubBaseKey)
+            clear_tx(Td, SubBaseKey)
         end,
         RemovedIds
     ),
@@ -446,7 +476,7 @@ diff_list(?IS_TX(Tx, Dir) = Td, BaseKey, OldList, NewList) ->
             NewItem = maps:get(Id, NewById),
             FI = maps:get(Id, OldOrderMap),
             SubBaseKey = extend_key(BaseKey, ?TAG_LIST, FI, Id),
-            set(Td, SubBaseKey, OldItem, NewItem)
+            set_tx(Td, SubBaseKey, OldItem, NewItem)
         end,
         CommonIds
     ),
