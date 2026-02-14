@@ -14,7 +14,8 @@
 
 -include("../include/dgen.hrl").
 
--callback init(Args :: term()) -> {ok, State :: term()} | {ok, Tuid :: tuple(), State :: term()} | {error, Reason :: term()}.
+-callback init(Args :: term()) ->
+    {ok, State :: term()} | {ok, Tuid :: tuple(), State :: term()} | {error, Reason :: term()}.
 -callback handle_cast(Msg :: term(), State :: term()) -> {noreply, NewState :: term()}.
 -callback handle_call(Request :: term(), From :: term(), State :: term()) ->
     {reply, Reply :: term(), NewState :: term()} | {noreply, NewState :: term()}.
@@ -92,12 +93,12 @@ init({Tenant, Mod, Arg, Consume, Reset}) ->
             Other
     end.
 
-handle_call( {call, Request, WatchTo}, _LocalFrom, State = #state{tenant = Tenant, tuid = Tuid} ) ->
+handle_call({call, Request, WatchTo}, _LocalFrom, State = #state{tenant = Tenant, tuid = Tuid}) ->
     % if there's no watch, then assume the queue is nonempty, and we must push the request
     %
     % @todo: if there's a watch, we can pay for a queue length check, assuming it will be 0 in most cases. If
     % it is zero, then we can handle the call immediately without pushing it onto the queue.
-    {CallKeyBin, Watch} =  dgen:push_call(Tenant, Tuid, Request, WatchTo),
+    {CallKeyBin, Watch} = dgen:push_call(Tenant, Tuid, Request, WatchTo),
     {reply, {noreply, {Tenant, CallKeyBin, Watch}}, State};
 handle_call({priority, Request}, _From, State = #state{tenant = Tenant}) ->
     From = make_ref(),
@@ -227,12 +228,17 @@ set_mod_state(?IS_TX(Tx, Dir), ModState, _State = #state{tuid = Tuid}) ->
     Chunks = binary_chunk_every(Bin, 100000, []),
     StateKey = get_state_key(Tuid),
     {ChunkKeys, {FirstUnused, EK}} = partition_chunked_key(Dir, StateKey, length(Chunks)),
-    [erlfdb:set(Tx, erlfdb_directory:pack(Dir, K), Chunk) || {K, Chunk} <- lists:zip(ChunkKeys, Chunks)],
+    [
+        erlfdb:set(Tx, erlfdb_directory:pack(Dir, K), Chunk)
+     || {K, Chunk} <- lists:zip(ChunkKeys, Chunks)
+    ],
     erlfdb:clear_range(Tx, erlfdb_directory:pack(Dir, FirstUnused), EK),
     ok.
 
 handle_callback_result(?IS_DB(Db, Dir), Origin, Result, OrigModState, State) ->
-    erlfdb:transactional(Db, fun(Tx) -> handle_callback_result({Tx, Dir}, Origin, Result, OrigModState, State) end);
+    erlfdb:transactional(Db, fun(Tx) ->
+        handle_callback_result({Tx, Dir}, Origin, Result, OrigModState, State)
+    end);
 handle_callback_result(?IS_TD = Td, handle_cast, {noreply, ModState}, OrigModState, State) ->
     set_mod_state(Td, OrigModState, ModState, State),
     {{noreply, State}, []};
@@ -242,7 +248,9 @@ handle_callback_result(?IS_TD = Td, handle_cast, {noreply, ModState, Actions}, O
 handle_callback_result(?IS_TD = Td, handle_call, {reply, Reply, ModState}, OrigModState, State) ->
     set_mod_state(Td, OrigModState, ModState, State),
     {{reply, Reply, State}, []};
-handle_callback_result(?IS_TD = Td, handle_call, {reply, Reply, ModState, Actions}, OrigModState, State) ->
+handle_callback_result(
+    ?IS_TD = Td, handle_call, {reply, Reply, ModState, Actions}, OrigModState, State
+) ->
     set_mod_state(Td, OrigModState, ModState, State),
     {{reply, Reply, State}, Actions};
 handle_callback_result(?IS_TD = Td, handle_info, {noreply, ModState}, OrigModState, State) ->
@@ -279,7 +287,9 @@ partition_chunked_key(Dir, BaseKey, N) ->
     {ChunkKeys, {FirstUnused, EK}}.
 
 handle_new_priority_call(?IS_DB(Db, Dir), Request, From, State) ->
-    erlfdb:transactional(Db, fun(Tx) -> handle_new_priority_call({Tx, Dir}, Request, From, State) end);
+    erlfdb:transactional(Db, fun(Tx) ->
+        handle_new_priority_call({Tx, Dir}, Request, From, State)
+    end);
 handle_new_priority_call(?IS_TD = Td, Request, From, State) ->
     case invoke_tx_callback(Td, handle_call, [Request, From], State) of
         {error, Reason = {function_not_exported, _}} ->

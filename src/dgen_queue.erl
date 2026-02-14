@@ -30,11 +30,11 @@ push_k(?IS_TX(Tx, Dir), Tuid, Items) ->
             ),
             term_to_binary(Item)
         )
-        || Item <- Items
-        ],
+     || Item <- Items
+    ],
 
-        PushKey = get_push_key(QueueKey),
-        erlfdb:add(Tx, erlfdb_directory:pack(Dir, PushKey), length(Items)).
+    PushKey = get_push_key(QueueKey),
+    erlfdb:add(Tx, erlfdb_directory:pack(Dir, PushKey), length(Items)).
 
 consume_k(?IS_DB(Db, Dir), K, Tuid) ->
     erlfdb:transactional(Db, fun(Tx) -> consume_k({Tx, Dir}, K, Tuid) end);
@@ -59,7 +59,10 @@ length(?IS_TX(Tx, Dir), Tuid) ->
     QueueKey = get_queue_key(Tuid),
     PushKey = get_push_key(QueueKey),
     PopKey = get_pop_key(QueueKey),
-    F = [erlfdb:get(Tx, erlfdb_directory:pack(Dir, PushKey)), erlfdb:get(Tx, erlfdb_directory:pack(Dir, PopKey))],
+    F = [
+        erlfdb:get(Tx, erlfdb_directory:pack(Dir, PushKey)),
+        erlfdb:get(Tx, erlfdb_directory:pack(Dir, PopKey))
+    ],
     [Push, Pop] = erlfdb:wait_for_all(F),
     decode_as_int(Push, 0) - decode_as_int(Pop, 0).
 
