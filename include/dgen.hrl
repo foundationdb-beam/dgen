@@ -1,4 +1,2 @@
--define(IS_DB(Db, Dir), {Db={erlfdb_database, _}, Dir}).
--define(IS_TD, {{erlfdb_transaction, _}, _Dir}).
--define(IS_TX(Tx, Dir), {Tx={erlfdb_transaction, _}, Dir}).
--define(FUTURE(Var), {erlfdb_future, Var, _}).
+%% Pattern-match a {dgen_future, Ref, _} tuple, binding Ref.
+-define(FUTURE(Var), {dgen_future, Var, _}).
