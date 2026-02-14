@@ -6,16 +6,10 @@ defmodule DGen.Case do
   @test_case_dir_name "DGen.Case"
 
   def init() do
-    :dgen_config.init()
     b = :dgen_config.backend()
 
-    db = b.sandbox_open(@test_sandbox_name)
+    {db, dir} = b.sandbox_open(@test_sandbox_name, @test_case_dir_name)
     :persistent_term.put({__MODULE__, :db}, db)
-
-    root = b.dir_root(node_prefix: <<0xFE>>, content_prefix: <<>>)
-    :persistent_term.put({__MODULE__, :root}, root)
-
-    dir = b.dir_create_or_open(db, root, @test_case_dir_name)
     :persistent_term.put({__MODULE__, :dir}, dir)
   end
 

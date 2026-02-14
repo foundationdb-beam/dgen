@@ -1,0 +1,137 @@
+# Distributed GenServer Introduction
+
+```elixir
+Mix.install([
+  {:dgen, path: "../dgen"},
+  {:erlfdb, "~> 0.3"}
+])
+```
+
+## Section
+
+```elixir
+defmodule Message do
+  defstruct [:id, :name, :text]
+end
+
+defmodule Chat do
+  use GenServer
+
+  defstruct idx: 0, messages: []
+
+  def start(), do: GenServer.start(__MODULE__, [])
+
+  def restart(pid) do
+    GenServer.stop(pid)
+    start()
+  end
+
+  def new_message(pid, name, text), do: GenServer.call(pid, {:new_message, name, text})
+
+  def history(pid), do: GenServer.call(pid, :history)
+
+  @impl true
+  def init([]) do
+    {:ok, %Chat{}}
+  end
+
+  @impl true
+  def handle_call({:new_message, name, text}, _from, state=%Chat{}) do
+    %{messages: messages, idx: idx} = state
+    message = %Message{id: "#{idx+1}", name: name, text: text}
+    resp_text = "Thanks for the message"
+    response = %Message{id: "#{idx+2}", name: "system", text: resp_text}
+    {:reply, resp_text, %{state | idx: idx+2, messages: messages ++ [message, response]}}
+  end
+
+  @impl true
+  def handle_call(:history, _from, state=%Chat{}) do
+    %{messages: messages} = state
+    {:reply, messages, state}
+  end
+end
+```
+
+```elixir
+{:ok, pid} = Chat.start()
+```
+
+```elixir
+Chat.new_message(pid, "Alice", "Hello there")
+```
+
+```elixir
+Chat.history(pid)
+```
+
+```elixir
+{:ok, pid} = Chat.restart(pid)
+```
+
+```elixir
+Chat.history(pid)
+```
+
+```elixir
+defmodule DChat do
+  use DGenServer
+
+  defstruct idx: 0, messages: []
+
+  def start(tenant), do: DGenServer.start(__MODULE__, [], [tenant: tenant])
+
+  def restart(pid, tenant) do
+    GenServer.stop(pid)
+    start(tenant)
+  end
+
+  def new_message(pid, name, text), do: DGenServer.call(pid, {:new_message, name, text})
+
+  def history(pid), do: DGenServer.call(pid, :history)
+
+  @impl true
+  def init([]) do
+    {:ok, %DChat{}}
+  end
+
+  @impl true
+  def handle_call({:new_message, name, text}, _from, state=%DChat{}) do
+    %{messages: messages, idx: idx} = state
+    message = %Message{id: "#{idx+1}", name: name, text: text}
+    resp_text = "Thanks for the message"
+    response = %Message{id: "#{idx+2}", name: "system", text: resp_text}
+    {:reply, resp_text, %{state | idx: idx+2, messages: messages ++ [message, response]}}
+  end
+
+  @impl true
+  def handle_call(:history, _from, state=%DChat{}) do
+    %{messages: messages} = state
+    {:reply, messages, state}
+  end
+end
+```
+
+```elixir
+b = :dgen_config.backend()
+tenant = b.sandbox_open("DGen.Livebook", "Intro")
+```
+
+```elixir
+{:ok, pid} = DChat.start(tenant)
+```
+
+```elixir
+DChat.new_message(pid, "Bob", "Greetings")
+```
+
+```elixir
+DChat.history(pid)
+```
+
+```elixir
+{:ok, pid} = DChat.restart(pid, tenant)
+```
+
+```elixir
+DChat.history(pid)
+```

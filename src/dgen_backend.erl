@@ -83,15 +83,13 @@ when
 -callback key_strinc(Key :: binary()) -> binary().
 
 %% Directory management
--callback dir_root(Opts :: list()) -> Dir :: term().
--callback dir_create_or_open(Db :: term(), Dir :: term(), Name :: term()) -> Dir :: term().
 -callback dir_create(Db :: term(), Dir :: term(), Name :: term()) -> Dir :: term().
 -callback dir_remove(Db :: term(), Dir :: term(), Name :: term()) -> ok.
 
 %% Sandbox / test support
--callback sandbox_open(Name :: term()) -> Db :: term().
+-callback sandbox_open(Name :: term(), DirName :: term()) -> {Db :: term(), Dir :: term()}.
 
--optional_callbacks([sandbox_open/1]).
+-optional_callbacks([sandbox_open/2]).
 
 -if(?DOCATTRS).
 -doc """

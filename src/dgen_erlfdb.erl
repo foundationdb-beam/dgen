@@ -20,11 +20,9 @@
     dir_pack_vs/2,
     dir_unpack/2,
     key_strinc/1,
-    dir_root/1,
-    dir_create_or_open/3,
     dir_create/3,
     dir_remove/3,
-    sandbox_open/1
+    sandbox_open/2
 ]).
 
 %% Transaction management
@@ -100,12 +98,6 @@ key_strinc(Key) ->
 
 %% Directory management
 
-dir_root(Opts) ->
-    erlfdb_directory:root(Opts).
-
-dir_create_or_open(Db, Dir, Name) ->
-    erlfdb_directory:create_or_open(Db, Dir, Name).
-
 dir_create(Db, Dir, Name) ->
     erlfdb_directory:create(Db, Dir, Name).
 
@@ -114,5 +106,8 @@ dir_remove(Db, Dir, Name) ->
 
 %% Sandbox / test support
 
-sandbox_open(Name) ->
-    erlfdb_sandbox:open(Name).
+sandbox_open(Name, DirName) ->
+    Db = erlfdb_sandbox:open(Name),
+    Root = erlfdb_directory:root([{node_prefix, <<16#FE>>}, {content_prefix, <<>>}]),
+    Dir = erlfdb_directory:create_or_open(Db, Root, DirName),
+    {Db, Dir}.
