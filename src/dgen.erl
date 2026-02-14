@@ -8,19 +8,24 @@ Internal helpers for the dgen_server call/reply protocol.
 
 This module implements the client-side call flow: pushing a call request
 onto the durable queue, waiting for the reply via an FDB watch, and
-cleaning up the call-key-bin on timeout.
+cleaning up reply keys on timeout.
+
+Reply payloads are stored using the codec's chunked term encoding so that
+replies can exceed the FDB single-value size limit. The watch is placed on
+the first chunk key; the client always reads via `get_range`.
 
 ### Call Request Flow
 
 1. The caller invokes `dgen_server:call/3` which delegates to `call/4`.
 2. A call request is pushed onto the durable queue via `push_call/5`,
-   which creates a `CallKeyBin` (the reply slot) and an FDB watch.
+   which writes `noreply` as a chunked term under the from-key and sets
+   an FDB watch on the first chunk key.
 3. The caller blocks in `await_call_reply/4` until the watch fires or
    the timeout expires.
-4. A consumer processes the request and writes `{reply, Reply}` into
-   `CallKeyBin`.
-5. The watch fires, the caller reads and clears `CallKeyBin`.
-6. On timeout the caller clears `CallKeyBin` to avoid leaking the key.
+4. A consumer processes the request and writes `{reply, Reply}` as a
+   chunked term under the from-key.
+5. The watch fires, the caller reads and clears the chunked reply.
+6. On timeout the caller clears the chunked reply keys to avoid leaks.
 """.
 -endif.
 
@@ -32,9 +37,9 @@ cleaning up the call-key-bin on timeout.
 -doc """
 Pushes a call request onto the durable queue.
 
-Creates a unique `CallKeyBin` (the reply slot) under the waiting-key prefix,
-sets an FDB watch on it directed to `WatchTo`, and enqueues the request.
-Returns `{CallKeyBin, Watch}`.
+Writes `noreply` as a chunked term under the from-key prefix, sets an FDB
+watch on the first chunk key directed to `WatchTo`, and enqueues the request.
+Returns `{From, Watch}` where `From` is the from-key tuple.
 """.
 -endif.
 push_call(?IS_DB(Db, Dir), Tuid, Request, WatchTo, Options) ->
@@ -42,11 +47,11 @@ push_call(?IS_DB(Db, Dir), Tuid, Request, WatchTo, Options) ->
 push_call(Td = ?IS_TX(Tx, Dir), Tuid, Request, WatchTo, Options) ->
     WaitingKey = get_waiting_key(Tuid),
     From = get_from(WaitingKey, make_ref()),
-    CallKeyBin = erlfdb_directory:pack(Dir, From),
-    erlfdb:set(Tx, CallKeyBin, term_to_binary(noreply)),
-    Future = erlfdb:watch(Tx, CallKeyBin, [{to, WatchTo}]),
+    dgen_mod_state_codec:write_term(Td, From, noreply),
+    ReplySentinelKey = dgen_mod_state_codec:term_first_key(Dir, From),
+    Future = erlfdb:watch(Tx, ReplySentinelKey, [{to, WatchTo}]),
     dgen_queue:push_k(Td, Tuid, [{call, Request, From, Options}]),
-    {CallKeyBin, Future}.
+    {From, Future}.
 
 -if(?DOCATTRS).
 -doc "Appends the `<<\"c\">>` waiting-key tag to a tuid tuple.".
@@ -74,7 +79,7 @@ get_from(WaitingKey, Ref) ->
 Sends a synchronous call through the durable queue and waits for the reply.
 
 `Module` is the gen_server-compatible module used to send the initial message
-(typically `gen_server`). On timeout, the `CallKeyBin` is cleared to prevent
+(typically `gen_server`). On timeout, the reply keys are cleared to prevent
 durable key leaks.
 """.
 -endif.
@@ -87,8 +92,8 @@ call(Module, Server, Request, Timeout) ->
         catch
             error:{timeout, _} ->
                 % gen_server:call timed out before returning. If push_call
-                % committed, CallKeyBin is abandoned (we don't have it).
-                % It will be cleaned up when the dgen_server is killed,
+                % committed, the reply keys are abandoned (we don't have From).
+                % They will be cleaned up when the dgen_server is killed,
                 % which clears the entire waiting-key range.
                 {noreply, {undefined, undefined, undefined}}
         end,
@@ -96,28 +101,28 @@ call(Module, Server, Request, Timeout) ->
     case CallResult of
         {reply, Reply} ->
             Reply;
-        {noreply, {Tenant, CallKeyBin, Watch}} ->
+        {noreply, {Tenant, From, Watch}} ->
             T2 = erlang:monotonic_time(millisecond),
 
-            case await_call_reply(Tenant, CallKeyBin, Watch, Timeout - (T2 - T1)) of
+            case await_call_reply(Tenant, From, Watch, Timeout - (T2 - T1)) of
                 {error, timeout} ->
-                    cleanup_call(Tenant, CallKeyBin),
+                    cleanup_call(Tenant, From),
                     erlang:error(timeout);
                 Reply ->
                     Reply
             end
     end.
 
-await_call_reply(undefined, _CallKeyBin, _Watch, _Timeout) ->
+await_call_reply(undefined, _From, _Watch, _Timeout) ->
     {error, timeout};
-await_call_reply(_Tenant, _CallKeyBin, _Watch, Timeout) when Timeout =< 0 -> {error, timeout};
-await_call_reply(Tenant, CallKeyBin, ?FUTURE(WatchRef), Timeout) ->
+await_call_reply(_Tenant, _From, _Watch, Timeout) when Timeout =< 0 -> {error, timeout};
+await_call_reply(Tenant, From, ?FUTURE(WatchRef), Timeout) ->
     T1 = erlang:monotonic_time(millisecond),
 
     Result =
         receive
             {WatchRef, ready} ->
-                handle_call_ready(Tenant, CallKeyBin)
+                handle_call_ready(Tenant, From)
         after Timeout ->
             {error, timeout}
         end,
@@ -128,32 +133,25 @@ await_call_reply(Tenant, CallKeyBin, ?FUTURE(WatchRef), Timeout) ->
         {reply, Reply} ->
             Reply;
         {watch, Watch} ->
-            await_call_reply(Tenant, CallKeyBin, Watch, Timeout - (T2 - T1));
+            await_call_reply(Tenant, From, Watch, Timeout - (T2 - T1));
         {error, timeout} ->
             {error, timeout}
     end.
 
-cleanup_call(undefined, _CallKeyBin) ->
+cleanup_call(undefined, _From) ->
     ok;
-cleanup_call(?IS_DB(Db, _Dir), CallKeyBin) ->
-    erlfdb:transactional(Db, fun(Tx) -> erlfdb:clear(Tx, CallKeyBin) end).
+cleanup_call(Tenant, From) ->
+    dgen_mod_state_codec:clear_term(Tenant, From).
 
-handle_call_ready(?IS_DB(Db, Dir), CallKeyBin) ->
-    erlfdb:transactional(Db, fun(Tx) -> handle_call_ready({Tx, Dir}, CallKeyBin) end);
-handle_call_ready(?IS_TX(Tx, _Dir), CallKeyBin) ->
-    Future = erlfdb:get(Tx, CallKeyBin),
-    case erlfdb:wait(Future) of
-        not_found ->
-            {watch, erlfdb:watch(Tx, CallKeyBin)};
-        Value ->
-            CallState = binary_to_term(Value),
-            case CallState of
-                {reply, Reply} ->
-                    erlfdb:clear(Tx, CallKeyBin),
-                    {reply, Reply};
-                noreply ->
-                    {watch, erlfdb:watch(Tx, CallKeyBin)};
-                _ ->
-                    {error, timeout}
-            end
+handle_call_ready(?IS_DB(Db, Dir), From) ->
+    erlfdb:transactional(Db, fun(Tx) -> handle_call_ready({Tx, Dir}, From) end);
+handle_call_ready(Td = ?IS_TX(Tx, Dir), From) ->
+    case dgen_mod_state_codec:read_term(Td, From) of
+        {error, not_found} ->
+            {watch, erlfdb:watch(Tx, dgen_mod_state_codec:term_first_key(Dir, From))};
+        {ok, noreply} ->
+            {watch, erlfdb:watch(Tx, dgen_mod_state_codec:term_first_key(Dir, From))};
+        {ok, {reply, Reply}} ->
+            dgen_mod_state_codec:clear_term(Td, From),
+            {reply, Reply}
     end.

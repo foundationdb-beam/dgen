@@ -39,7 +39,10 @@ strict serializability to guarantee that your operations yield consistent result
 
 - **key-bin**: A key-tuple encoded into a binary using the tenant subspace.
 - **waiting-key**: A prefix key-tuple that contains all entities waiting on the result of some call-request.
-- **call-key-bin**: The encoded from-key. This is where the result of the call-request is stored.
+- **reply-sentinel-key**: The first chunk key of the reply term under the from-key. The reply is stored
+  using chunked term encoding (`{From, <<"t">>, 0}`, `{From, <<"t">>, 1}`, ...) so that replies
+  can exceed the FDB single-value size limit. The FDB watch is placed on the reply-sentinel-key
+  (chunk 0). The client reads the reply via `get_range` and clears it via `clear_range`.
 - **queue-key**: A prefix key-tuple that contains all key-values for the message-queue.
 - **item-key**: A key-tuple that identifies an item in the queue (i.e. a call-request or cast-request).
 - **push-key**: A key-tuple that tracks the number of pushes onto the queue.
@@ -49,19 +52,19 @@ strict serializability to guarantee that your operations yield consistent result
 
 1. Some Erlang process calls `dgen_server:call/3` (the calling entity).
 2. A call-request is pushed onto the message-queue, along with the from-key.
-3. The call-key-bin and watch are returned to the calling entity.
+3. The from-key and watch are returned to the calling entity.
 4. One of the dgen_server consumers consumes the call-request.
 5. The consumer retrieves the state.
 6. The consumer calls the `handle_call/3` function on the module that implements the dgen_server behaviour.
 7. The callback returns a new state and an optional list of side-effects.
 8. The consumer updates the state.
-9. The consumer checks whether the call-key-bin still exists (the caller may have timed out and cleared it).
-   If present, the consumer writes the reply into the call-key-bin; if absent, the write is skipped.
+9. The consumer checks whether the reply-sentinel-key still exists (the caller may have timed out and cleared it).
+   If present, the consumer writes `{reply, Reply}` as a chunked term under the from-key; if absent, the write is skipped.
 10. The consumer commits the transaction.
 11. (concurrent with 12) The consumer executes the side-effects.
-12. (concurrent with 11) The calling entity receives the watch notification and then retrieves the result.
+12. (concurrent with 11) The calling entity receives the watch notification, reads the chunked reply via `get_range`, and clears the reply keys.
 
-On timeout, the calling entity clears the call-key-bin to prevent durable key leaks. The callback still
+On timeout, the calling entity clears the reply keys to prevent durable key leaks. The callback still
 runs and state still mutates (just like `gen_server` — a timed-out call still executes), only the orphan
 reply key is eliminated.
 

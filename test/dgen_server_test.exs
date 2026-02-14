@@ -64,6 +64,18 @@ defmodule DGenServer.Test do
       kill(pid)
     end
 
+    test "large reply spanning multiple chunks", context do
+      tenant = context[:tenant]
+      {:ok, pid} = DCounter.start_link(tenant, {"a"})
+
+      # 250KB exceeds the 100KB chunk size, forcing a multi-chunk reply
+      blob = DCounter.get_blob(pid, 250_000)
+      assert byte_size(blob) == 250_000
+      assert blob == :binary.copy(<<0>>, 250_000)
+
+      kill(pid)
+    end
+
     test "kill reset", context do
       tenant = context[:tenant]
       {:ok, pid} = DCounter.start_link(tenant, {"a"})

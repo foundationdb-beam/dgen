@@ -237,8 +237,8 @@ handle_call(
     %
     % @todo: if there's a watch, we can pay for a queue length check, assuming it will be 0 in most cases. If
     % it is zero, then we can handle the call immediately without pushing it onto the queue.
-    {CallKeyBin, Watch} = dgen:push_call(Tenant, Tuid, Request, WatchTo, Options),
-    {reply, {noreply, {Tenant, CallKeyBin, Watch}}, State};
+    {From, Watch} = dgen:push_call(Tenant, Tuid, Request, WatchTo, Options),
+    {reply, {noreply, {Tenant, From, Watch}}, State};
 handle_call({priority, Request}, _From, State = #state{tenant = Tenant}) ->
     From = make_ref(),
     {Actions, ModState, Reply, State2} = handle_new_priority_call(Tenant, Request, From, State),
@@ -442,12 +442,15 @@ handle_consume(Tenant = ?IS_DB(_Db, _Dir), ?IS_TD = Td, K, Tuid, State) ->
 
 reply(?IS_DB(Db, Dir), From, Reply) ->
     erlfdb:transactional(Db, fun(Tx) -> reply({Tx, Dir}, From, Reply) end);
-reply(?IS_TD = _Td = ?IS_TX(Tx, Dir), From, Reply) ->
-    CallKeyBin = erlfdb_directory:pack(Dir, From),
-    % Skip writing the reply if the caller timed out and cleared CallKeyBin
-    case erlfdb:wait(erlfdb:get(Tx, CallKeyBin)) of
-        not_found -> ok;
-        _ -> erlfdb:set(Tx, CallKeyBin, term_to_binary({reply, Reply}))
+reply(?IS_TD = Td = ?IS_TX(Tx, Dir), From, Reply) ->
+    ReplySentinelKey = dgen_mod_state_codec:term_first_key(Dir, From),
+    % Skip writing the reply if the caller timed out and cleared the reply keys
+    case erlfdb:wait(erlfdb:get(Tx, ReplySentinelKey)) of
+        not_found ->
+            ok;
+        _ ->
+            dgen_mod_state_codec:clear_term(Td, From),
+            dgen_mod_state_codec:write_term(Td, From, {reply, Reply})
     end.
 
 handle_info(?IS_DB(Db, Dir), Info, State) ->

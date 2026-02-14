@@ -33,7 +33,7 @@ list:  {BaseKey, <<"l">>}                        (marker, holds Id => FracIndex 
 
 -include("../include/dgen.hrl").
 
--export([get/2, set/3, set/4, clear/2]).
+-export([get/2, set/3, set/4, clear/2, write_term/3, read_term/2, clear_term/2, term_first_key/2]).
 
 -type tenant() ::
     {erlfdb:database(), term()}
@@ -117,6 +117,54 @@ clear(?IS_DB(Db, Dir), BaseKey) ->
 clear(?IS_TX(Tx, Dir), BaseKey) ->
     {SK, EK} = erlfdb_directory:range(Dir, BaseKey),
     erlfdb:clear_range(Tx, SK, EK).
+
+-if(?DOCATTRS).
+-doc """
+Reads a term-encoded value from FDB at `BaseKey`.
+
+Unlike `get/2`, this only reads the term encoding (`{BaseKey, <<"t">>, N}` keys)
+and does not attempt to decode map or list encodings. Used by the call/reply
+protocol to read chunked reply payloads.
+""".
+-endif.
+-spec read_term(tenant(), base_key()) -> {ok, term()} | {error, not_found}.
+read_term(?IS_DB(Db, Dir), BaseKey) ->
+    erlfdb:transactional(Db, fun(Tx) -> read_term({Tx, Dir}, BaseKey) end);
+read_term(?IS_TX(Tx, Dir), BaseKey) ->
+    TermBaseKey = extend_key(BaseKey, ?TAG_TERM),
+    {SK, EK} = erlfdb_directory:range(Dir, TermBaseKey),
+    case erlfdb:get_range(Tx, SK, EK, [{wait, true}]) of
+        [] -> {error, not_found};
+        KVs -> decode_term(KVs)
+    end.
+
+-if(?DOCATTRS).
+-doc """
+Clears the term-encoded keys under `BaseKey`.
+
+Removes all `{BaseKey, <<"t">>, N}` chunk keys. Used by the call/reply
+protocol to clear chunked reply payloads.
+""".
+-endif.
+-spec clear_term(tenant(), base_key()) -> ok.
+clear_term(?IS_DB(Db, Dir), BaseKey) ->
+    erlfdb:transactional(Db, fun(Tx) -> clear_term({Tx, Dir}, BaseKey) end);
+clear_term(?IS_TX(Tx, Dir), BaseKey) ->
+    TermBaseKey = extend_key(BaseKey, ?TAG_TERM),
+    {SK, EK} = erlfdb_directory:range(Dir, TermBaseKey),
+    erlfdb:clear_range(Tx, SK, EK).
+
+-if(?DOCATTRS).
+-doc """
+Returns the packed FDB key for chunk 0 of a term-encoded payload at `BaseKey`.
+
+This is the key that is written first by `write_term/3` and is suitable for
+placing an FDB watch on a term-encoded value.
+""".
+-endif.
+-spec term_first_key(term(), base_key()) -> binary().
+term_first_key(Dir, BaseKey) ->
+    erlfdb_directory:pack(Dir, extend_key(BaseKey, ?TAG_TERM, 0)).
 
 %%
 %% Classification
