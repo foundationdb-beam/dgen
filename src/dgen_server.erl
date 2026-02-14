@@ -142,8 +142,6 @@ terminate(_Reason, _State) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
-invoke_tx_callback(?IS_DB(Db, Dir), Callback, Args, State) ->
-    erlfdb:transactional(Db, fun(Tx) -> invoke_tx_callback({Tx, Dir}, Callback, Args, State) end);
 invoke_tx_callback(?IS_TD = Td, Callback, Args, State = #state{mod = Mod}) ->
     T1 = erlang:monotonic_time(millisecond),
     Arity = length(Args) + 1,
@@ -196,15 +194,11 @@ init_mod_state(?IS_TD = Td, InitialState, Reset, State) ->
             set_mod_state(Td, InitialState, State)
     end.
 
-clear_mod_state(?IS_DB(Db, Dir), Tuid) ->
-    erlfdb:transactional(Db, fun(Tx) -> clear_mod_state({Tx, Dir}, Tuid) end);
 clear_mod_state(?IS_TX(Tx, Dir), Tuid) ->
     StateKey = get_state_key(Tuid),
     {SK, EK} = erlfdb_directory:range(Dir, StateKey),
     erlfdb:clear_range(Tx, SK, EK).
 
-get_mod_state(?IS_DB(Db, Dir), State) ->
-    erlfdb:transactional(Db, fun(Tx) -> get_mod_state({Tx, Dir}, State) end);
 get_mod_state(?IS_TX(Tx, Dir), _State = #state{tuid = Tuid}) ->
     StateKey = get_state_key(Tuid),
     {SK, EK} = erlfdb_directory:range(Dir, StateKey),
@@ -221,8 +215,6 @@ set_mod_state(_DbOrTx, ModState, ModState, _State) ->
 set_mod_state(DbOrTx, _OrigModState, ModState, State) ->
     set_mod_state(DbOrTx, ModState, State).
 
-set_mod_state(?IS_DB(Db, Dir), ModState, State) ->
-    erlfdb:transactional(Db, fun(Tx) -> set_mod_state({Tx, Dir}, ModState, State) end);
 set_mod_state(?IS_TX(Tx, Dir), ModState, _State = #state{tuid = Tuid}) ->
     Bin = term_to_binary(ModState),
     Chunks = binary_chunk_every(Bin, 100000, []),
@@ -235,10 +227,6 @@ set_mod_state(?IS_TX(Tx, Dir), ModState, _State = #state{tuid = Tuid}) ->
     erlfdb:clear_range(Tx, erlfdb_directory:pack(Dir, FirstUnused), EK),
     ok.
 
-handle_callback_result(?IS_DB(Db, Dir), Origin, Result, OrigModState, State) ->
-    erlfdb:transactional(Db, fun(Tx) ->
-        handle_callback_result({Tx, Dir}, Origin, Result, OrigModState, State)
-    end);
 handle_callback_result(?IS_TD = Td, handle_cast, {noreply, ModState}, OrigModState, State) ->
     set_mod_state(Td, OrigModState, ModState, State),
     {{noreply, State}, []};

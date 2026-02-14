@@ -66,15 +66,11 @@ length(?IS_TX(Tx, Dir), Tuid) ->
     [Push, Pop] = erlfdb:wait_for_all(F),
     decode_as_int(Push, 0) - decode_as_int(Pop, 0).
 
-watch_push(?IS_DB(Db, Dir), Tuid) ->
-    erlfdb:transactional(Db, fun(Tx) -> watch_push({Tx, Dir}, Tuid) end);
 watch_push(?IS_TX(Tx, Dir), Tuid) ->
     QueueKey = get_queue_key(Tuid),
     PushKey = get_push_key(QueueKey),
     erlfdb:watch(Tx, erlfdb_directory:pack(Dir, PushKey)).
 
-pop_k(?IS_DB(Db, Dir), K, Tuid) ->
-    erlfdb:transactional(Db, fun(Tx) -> pop_k({Tx, Dir}, K, Tuid) end);
 pop_k(?IS_TX(Tx, Dir), K, Tuid) ->
     QueueKey = get_queue_key(Tuid),
     ItemKey = get_item_key(QueueKey),

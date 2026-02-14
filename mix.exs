@@ -35,7 +35,7 @@ defmodule Dgen.MixProject do
         "format --check-formatted",
         "cmd rebar3 fmt --check",
         "deps.unlock --check-unused",
-        "dialyzer --format short"
+        "dialyzer"
       ]
     ]
   end

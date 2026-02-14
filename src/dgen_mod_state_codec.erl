@@ -30,8 +30,8 @@
 -export([get/2, set/3, set/4, clear/2]).
 
 -type tenant() ::
-    {erlfdb:database(), erlfdb_directory:dir()}
-    | {erlfdb:transaction(), erlfdb_directory:dir()}.
+    {erlfdb:database(), term()}
+    | {erlfdb:transaction(), term()}.
 -type base_key() :: tuple().
 -type mod_state() :: term().
 
