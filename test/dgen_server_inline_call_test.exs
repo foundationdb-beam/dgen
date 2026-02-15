@@ -42,16 +42,6 @@ defmodule DGenServer.InlineCallTest do
       kill(pid)
     end
 
-    # test "inline call with reply_with_effects", context do
-    #  tenant = context[:tenant]
-    #  {:ok, pid} = ActionEcho.start_link(tenant, {"inline_effects"})
-
-    #  assert {0, [:call]} = ActionEcho.get_with_action(pid)
-    #  assert {0, [:call]} = ActionEcho.get_with_action(pid)
-
-    #  kill(pid)
-    # end
-
     test "interleaved casts and calls maintain correct state", context do
       tenant = context[:tenant]
       {:ok, pid} = DCounter.start_link(tenant, {"inline_interleave"})

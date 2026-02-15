@@ -7,9 +7,6 @@ defmodule DGen.ActionEcho do
   def get_then_take_action(pid, notify_pid),
     do: DGenServer.call(pid, {:get_then_take_action, notify_pid})
 
-  def get_with_action(pid),
-    do: DGenServer.call(pid, {:get_with_action}, reply_with_effects: true)
-
   def incr_then_take_action(pid, notify_pid, n \\ 1),
     do: DGenServer.cast(pid, {:incr_then_take_action, notify_pid, n})
 
@@ -25,10 +22,6 @@ defmodule DGen.ActionEcho do
   @impl true
   def handle_call({:get_then_take_action, notify_pid}, _from, state) do
     {:reply, state, state, [&handle_action_executed(:call, notify_pid, &1)]}
-  end
-
-  def handle_call({:get_with_action}, _from, state) do
-    {:reply, state, state, [&handle_action_executed(:call, nil, &1)]}
   end
 
   @impl true

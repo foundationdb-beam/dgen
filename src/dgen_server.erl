@@ -193,18 +193,6 @@ processes it and writes the reply, or until `Timeout` milliseconds elapse.
 ## Options
 
 - `timeout`: Default `5000`. Timeout in milliseconds, or `infinity`.
-
-- `reply_with_effects`: Default `false`.
-
-  When `false`, the caller will receive the
-  intended Reply term like a standard `gen_server`. Any side-effects will be
-  executed some time afterward, and the result of that will be discarded.
-
-  When true, the Reply to the caller is deferred outside of the consume transaction.
-  The dgen_server executes the side-effects and then uses a new transaction to write
-  the reply in addition to the result of the effects. The caller will receive both the
-  intended Reply as well as the result of `handle_actions/3` side-effects as a
-  2-tuple: `{Reply :: term(), Effects :: list()}`.
 """.
 -endif.
 -spec call(server(), term(), timeout() | list()) -> term().
