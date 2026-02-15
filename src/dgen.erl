@@ -64,7 +64,7 @@ push_call({Tx, Dir}, Tuid, Request, WatchTo, Options) ->
 -endif.
 -spec get_waiting_key(tuid()) -> dgen_backend:tuple_key().
 get_waiting_key(Tuple) ->
-    erlang:insert_element(1 + tuple_size(Tuple), Tuple, <<"c">>).
+    dgen_key:extend(Tuple, <<"c">>).
 
 -if(?DOCATTRS).
 -doc """
@@ -79,8 +79,7 @@ Key structure: `{WaitingKey..., Timestamp, term_to_binary(Ref)}`.
 get_from(WaitingKey, Ref) ->
     Ts = erlang:system_time(second),
     Bin = term_to_binary(Ref),
-    K1 = erlang:insert_element(1 + tuple_size(WaitingKey), WaitingKey, Ts),
-    erlang:insert_element(1 + tuple_size(K1), K1, Bin).
+    dgen_key:extend(WaitingKey, Ts, Bin).
 
 -if(?DOCATTRS).
 -doc """

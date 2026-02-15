@@ -12,7 +12,7 @@ Push and pop counts are tracked with atomic `add` operations for O(1) length.
 """.
 -endif.
 
--export([push_k/3, consume_k/3, delete/2, length/2]).
+-export([push_k/3, consume_k/3, delete/2, length/2, watch_push/2, notify/2]).
 
 -include("../include/dgen.hrl").
 
@@ -36,7 +36,7 @@ push_k(Tenant, Tuid, Items) ->
         B = dgen_config:backend(),
         QueueKey = get_queue_key(Tuid),
         ItemKey = get_item_key(QueueKey),
-        ItemKey2 = erlang:insert_element(1 + tuple_size(ItemKey), ItemKey, undefined),
+        ItemKey2 = dgen_key:extend(ItemKey, undefined),
         [
             B:set_versionstamped_key(
                 Tx,
@@ -56,6 +56,14 @@ push_k(Tenant, Tuid, Items) ->
         PushKey = get_push_key(QueueKey),
         B:add(Tx, B:dir_pack(Dir, PushKey), length(Items))
     end).
+
+notify({Tx, Dir}, Tuid) ->
+    B = dgen_config:backend(),
+    QueueKey = get_queue_key(Tuid),
+    PushKey = get_push_key(QueueKey),
+    PopKey = get_pop_key(QueueKey),
+    B:add(Tx, B:dir_pack(Dir, PushKey), 1),
+    B:add(Tx, B:dir_pack(Dir, PopKey), 1).
 
 -if(?DOCATTRS).
 -doc """
@@ -137,16 +145,16 @@ pop_k({Tx, Dir}, K, Tuid) ->
     end.
 
 get_queue_key(Tuple) ->
-    erlang:insert_element(1 + tuple_size(Tuple), Tuple, <<"q">>).
+    dgen_key:extend(Tuple, <<"q">>).
 
 get_item_key(QueueKey) ->
-    erlang:insert_element(1 + tuple_size(QueueKey), QueueKey, <<"i">>).
+    dgen_key:extend(QueueKey, <<"i">>).
 
 get_push_key(QueueKey) ->
-    erlang:insert_element(1 + tuple_size(QueueKey), QueueKey, <<"n">>).
+    dgen_key:extend(QueueKey, <<"n">>).
 
 get_pop_key(QueueKey) ->
-    erlang:insert_element(1 + tuple_size(QueueKey), QueueKey, <<"p">>).
+    dgen_key:extend(QueueKey, <<"p">>).
 
 decode_as_int(not_found, Default) -> Default;
 decode_as_int(Val, _Default) -> binary:decode_unsigned(Val, little).
