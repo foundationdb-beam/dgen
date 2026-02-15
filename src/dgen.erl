@@ -47,19 +47,17 @@ watch on the first chunk key directed to `WatchTo`, and enqueues the request.
 Returns `{From, Watch}` where `From` is the from-key tuple.
 """.
 -endif.
--spec push_call(dgen_backend:tenant(), tuid(), term(), pid(), list()) ->
+-spec push_call(term(), tuid(), term(), pid(), list()) ->
     {from(), dgen_backend:future()}.
-push_call(Tenant, Tuid, Request, WatchTo, Options) ->
-    dgen_backend:transactional(Tenant, fun({Tx, Dir}) ->
-        B = dgen_config:backend(),
-        WaitingKey = get_waiting_key(Tuid),
-        From = get_from(WaitingKey, make_ref()),
-        dgen_mod_state_codec:write_term({Tx, Dir}, From, noreply),
-        ReplySentinelKey = dgen_mod_state_codec:term_first_key(Dir, From),
-        Future = B:watch(Tx, ReplySentinelKey, [{to, WatchTo}]),
-        dgen_queue:push_k({Tx, Dir}, Tuid, [{call, Request, From, Options}]),
-        {From, Future}
-    end).
+push_call({Tx, Dir}, Tuid, Request, WatchTo, Options) ->
+    B = dgen_config:backend(),
+    WaitingKey = get_waiting_key(Tuid),
+    From = get_from(WaitingKey, make_ref()),
+    dgen_mod_state_codec:write_term({Tx, Dir}, From, noreply),
+    ReplySentinelKey = dgen_mod_state_codec:term_first_key(Dir, From),
+    Future = B:watch(Tx, ReplySentinelKey, [{to, WatchTo}]),
+    dgen_queue:push_k({Tx, Dir}, Tuid, [{call, Request, From, Options}]),
+    {From, Future}.
 
 -if(?DOCATTRS).
 -doc "Appends the `<<\"c\">>` waiting-key tag to a tuid tuple.".

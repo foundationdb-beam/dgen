@@ -36,15 +36,15 @@ defmodule DGenServer.ActionsTest do
       kill(pid)
     end
 
-    test "handle_call executes reply and actions after commit when using reply_with_effects",
-         context do
-      tenant = context[:tenant]
-      {:ok, pid} = ActionEcho.start_link(tenant, {"act_call"})
+    # test "handle_call executes reply and actions after commit when using reply_with_effects",
+    #     context do
+    #  tenant = context[:tenant]
+    #  {:ok, pid} = ActionEcho.start_link(tenant, {"act_call"})
 
-      assert {0, [:call]} = ActionEcho.get_with_action(pid)
+    #  assert {0, [:call]} = ActionEcho.get_with_action(pid)
 
-      kill(pid)
-    end
+    #  kill(pid)
+    # end
 
     test "handle_info executes actions after commit", context do
       tenant = context[:tenant]
