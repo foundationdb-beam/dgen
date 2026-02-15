@@ -68,7 +68,16 @@ argument is the
 -define(TxCallbackTimeout, 5000).
 -define(DefaultCallTimeout, 5000).
 
--record(state, {tenant, mod, tuid, watch}).
+-record(state, {
+    tenant :: dgen_backend:tenant(),
+    mod :: atom(),
+    tuid :: tuple(),
+    watch :: undefined | dgen_backend:future(),
+    cache :: boolean(),
+    mod_state_cache ::
+        undefined
+        | {dgen_backend:versionstamp() | dgen_backend:future(), {ok, term()} | {error, not_found}}
+}).
 
 -if(?DOCATTRS).
 -doc """
@@ -80,7 +89,8 @@ See `start_link/3` for details on `Mod`, `Arg`, and `Opts`.
 start(Mod, Arg, Opts) ->
     Consume = proplists:get_value(consume, Opts, true),
     Reset = proplists:get_value(reset, Opts, false),
-    gen_server:start(?MODULE, {get_tenant(Opts), Mod, Arg, Consume, Reset}, Opts).
+    Cache = proplists:get_value(cache, Opts, true),
+    gen_server:start(?MODULE, {get_tenant(Opts), Mod, Arg, Consume, Reset, Cache}, Opts).
 
 -if(?DOCATTRS).
 -doc """
@@ -92,7 +102,8 @@ See `start_link/3` for details on `Mod`, `Arg`, and `Opts`.
 start(Reg, Mod, Arg, Opts) ->
     Consume = proplists:get_value(consume, Opts, true),
     Reset = proplists:get_value(reset, Opts, false),
-    gen_server:start(Reg, ?MODULE, {get_tenant(Opts), Mod, Arg, Consume, Reset}, Opts).
+    Cache = proplists:get_value(cache, Opts, true),
+    gen_server:start(Reg, ?MODULE, {get_tenant(Opts), Mod, Arg, Consume, Reset, Cache}, Opts).
 
 -if(?DOCATTRS).
 -doc """
@@ -107,7 +118,8 @@ Starts a dgen_server process linked to the calling process.
 start_link(Mod, Arg, Opts) ->
     Consume = proplists:get_value(consume, Opts, true),
     Reset = proplists:get_value(reset, Opts, false),
-    gen_server:start_link(?MODULE, {get_tenant(Opts), Mod, Arg, Consume, Reset}, Opts).
+    Cache = proplists:get_value(cache, Opts, true),
+    gen_server:start_link(?MODULE, {get_tenant(Opts), Mod, Arg, Consume, Reset, Cache}, Opts).
 
 -if(?DOCATTRS).
 -doc """
@@ -119,7 +131,8 @@ See `start_link/3` for details on `Mod`, `Arg`, and `Opts`.
 start_link(Reg, Mod, Arg, Opts) ->
     Consume = proplists:get_value(consume, Opts, true),
     Reset = proplists:get_value(reset, Opts, false),
-    gen_server:start_link(Reg, ?MODULE, {get_tenant(Opts), Mod, Arg, Consume, Reset}, Opts).
+    Cache = proplists:get_value(cache, Opts, true),
+    gen_server:start_link(Reg, ?MODULE, {get_tenant(Opts), Mod, Arg, Consume, Reset, Cache}, Opts).
 
 -if(?DOCATTRS).
 -doc "Sends an asynchronous cast request to the dgen_server's durable queue.".
@@ -219,13 +232,13 @@ get_tenant(Opts) ->
             Tenant
     end.
 
-init({Tenant, Mod, Arg, Consume, Reset}) ->
+init({Tenant, Mod, Arg, Consume, Reset, Cache}) ->
     case init_tuid(Mod, Arg) of
         {ok, Tuid, InitialState} ->
-            State = #state{tenant = Tenant, mod = Mod, tuid = Tuid},
-            init_mod_state(Tenant, InitialState, Reset, State),
+            State = #state{tenant = Tenant, mod = Mod, tuid = Tuid, cache = Cache},
+            {_, State1} = init_mod_state(Tenant, InitialState, Reset, State),
             [gen_server:cast(self(), consume) || Consume],
-            {ok, State};
+            {ok, State1};
         Other ->
             Other
     end.
@@ -277,7 +290,7 @@ handle_cast({priority, Request}, State = #state{tenant = Tenant}) ->
     {noreply, State2};
 handle_cast({kill, Reason}, State = #state{tenant = Tenant, tuid = Tuid}) ->
     delete(Tenant, Tuid),
-    {stop, Reason, State}.
+    {stop, Reason, State#state{mod_state_cache = undefined}}.
 
 handle_info({Ref, ready}, State = #state{watch = ?FUTURE(Ref)}) ->
     handle_cast(consume, State#state{watch = undefined});
@@ -299,15 +312,15 @@ invoke_tx_callback(Td, Callback, Args, State = #state{mod = Mod}) ->
         case erlang:function_exported(Mod, Callback, Arity) of
             true ->
                 case get_mod_state(Td, State) of
-                    {ok, ModState} ->
+                    {{ok, ModState}, State1} ->
                         Args2 = modify_args_for_callback(Callback, Args, ModState),
                         CallbackResult = erlang:apply(Mod, Callback, Args2),
                         {ok,
                             handle_callback_result(
-                                Td, Callback, CallbackResult, ModState, State
+                                Td, Callback, CallbackResult, ModState, State1
                             ),
                             ModState};
-                    {error, not_found} ->
+                    {{error, not_found}, _State1} ->
                         {error, {mod_state_not_found, Mod}}
                 end;
             false ->
@@ -335,51 +348,83 @@ delete(Tenant, Tuid) ->
     end).
 
 init_mod_state(Tenant, InitialState, Reset, State) ->
-    dgen_backend:transactional(Tenant, fun(Td) ->
+    {Result, State1} = dgen_backend:transactional(Tenant, fun(Td) ->
         case {Reset, get_mod_state(Td, State)} of
-            {false, {ok, _ModState}} ->
-                ok;
-            {true, _ModState} ->
-                set_mod_state(Td, InitialState, State);
-            {_, {error, not_found}} ->
-                set_mod_state(Td, InitialState, State)
+            {false, {{ok, _ModState}, State1}} ->
+                {ok, State1};
+            {true, {_ModState, State1}} ->
+                set_mod_state(Td, undefined, InitialState, State1);
+            {_, {{error, not_found}, State1}} ->
+                set_mod_state(Td, undefined, InitialState, State1)
         end
-    end).
+    end),
+    {Result, resolve_version(State1)}.
 
 clear_mod_state(Td, Tuid) ->
     dgen_mod_state_codec:clear(Td, get_state_key(Tuid)).
 
-get_mod_state(Td, _State = #state{tuid = Tuid}) ->
-    dgen_mod_state_codec:get(Td, get_state_key(Tuid)).
+get_mod_state(Td, State = #state{cache = true}) ->
+    #state{tuid = Tuid, mod_state_cache = MSCache} = State,
+    {Vsn, ModState} =
+        case MSCache of
+            {CVsn, {ok, CModState}} ->
+                {CVsn, CModState};
+            _ ->
+                {<<>>, undefined}
+        end,
+    case dgen_mod_state_codec:get_version(Td, get_state_key(Tuid)) of
+        {ok, Vsn} ->
+            {{ok, ModState}, State};
+        {ok, OtherVsn} ->
+            ActualModStateResult = dgen_mod_state_codec:get(Td, get_state_key(Tuid)),
+            MSCache1 = {OtherVsn, ActualModStateResult},
+            {ActualModStateResult, State#state{mod_state_cache = MSCache1}};
+        {error, not_found} ->
+            ActualModStateResult = dgen_mod_state_codec:get(Td, get_state_key(Tuid)),
+            {ActualModStateResult, State#state{mod_state_cache = undefined}}
+    end;
+get_mod_state(Td, State = #state{}) ->
+    #state{tuid = Tuid} = State,
+    {dgen_mod_state_codec:get(Td, get_state_key(Tuid)), State}.
 
-set_mod_state(_Td, ModState, ModState, _State) ->
-    ok;
-set_mod_state(Td, OrigModState, ModState, State) ->
-    dgen_mod_state_codec:set(Td, get_state_key(State#state.tuid), OrigModState, ModState).
-
-set_mod_state(Td, ModState, _State = #state{tuid = Tuid}) ->
-    dgen_mod_state_codec:set(Td, get_state_key(Tuid), ModState).
+set_mod_state(_Td, ModState, ModState, State) ->
+    {ok, State};
+set_mod_state(Td = {Tx, _Dir}, OrigModState, ModState, State = #state{}) ->
+    % @todo: get the version number
+    B = dgen_config:backend(),
+    Result = dgen_mod_state_codec:set(
+        Td, get_state_key(State#state.tuid), OrigModState, ModState, [{versioned, true}]
+    ),
+    State1 =
+        case State of
+            #state{cache = true} ->
+                VF = B:get_versionstamp(Tx),
+                State#state{mod_state_cache = {VF, {ok, ModState}}};
+            _ ->
+                State
+        end,
+    {Result, State1}.
 
 handle_callback_result(Td, handle_cast, {noreply, ModState}, OrigModState, State) ->
-    set_mod_state(Td, OrigModState, ModState, State),
-    {{noreply, State}, []};
+    {_, State1} = set_mod_state(Td, OrigModState, ModState, State),
+    {{noreply, State1}, []};
 handle_callback_result(Td, handle_cast, {noreply, ModState, Actions}, OrigModState, State) ->
-    set_mod_state(Td, OrigModState, ModState, State),
-    {{noreply, State}, Actions};
+    {_, State1} = set_mod_state(Td, OrigModState, ModState, State),
+    {{noreply, State1}, Actions};
 handle_callback_result(Td, handle_call, {reply, Reply, ModState}, OrigModState, State) ->
-    set_mod_state(Td, OrigModState, ModState, State),
-    {{reply, Reply, State}, []};
+    {_, State1} = set_mod_state(Td, OrigModState, ModState, State),
+    {{reply, Reply, State1}, []};
 handle_callback_result(
     Td, handle_call, {reply, Reply, ModState, Actions}, OrigModState, State
 ) ->
-    set_mod_state(Td, OrigModState, ModState, State),
-    {{reply, Reply, State}, Actions};
+    {_, State1} = set_mod_state(Td, OrigModState, ModState, State),
+    {{reply, Reply, State1}, Actions};
 handle_callback_result(Td, handle_info, {noreply, ModState}, OrigModState, State) ->
-    set_mod_state(Td, OrigModState, ModState, State),
-    {{noreply, State}, []};
+    {_, State1} = set_mod_state(Td, OrigModState, ModState, State),
+    {{noreply, State1}, []};
 handle_callback_result(Td, handle_info, {noreply, ModState, Actions}, OrigModState, State) ->
-    set_mod_state(Td, OrigModState, ModState, State),
-    {{noreply, State}, Actions}.
+    {_, State1} = set_mod_state(Td, OrigModState, ModState, State),
+    {{noreply, State1}, Actions}.
 
 handle_actions([], Acc, _ModState) ->
     lists:append(lists:reverse(Acc));
@@ -397,31 +442,33 @@ get_state_key(Tuple) ->
     erlang:insert_element(1 + tuple_size(Tuple), Tuple, <<"s">>).
 
 handle_new_priority_call(Tenant, Request, From, State) ->
-    dgen_backend:transactional(Tenant, fun(Td) ->
+    {Actions, ModState, Reply, State2} = dgen_backend:transactional(Tenant, fun(Td) ->
         case invoke_tx_callback(Td, handle_call, [Request, From], State) of
-            {error, Reason = {function_not_exported, _}} ->
+            {error, Reason} ->
                 erlang:error(Reason);
             {ok, {{reply, Reply, State2}, Actions}, ModState} ->
                 {Actions, ModState, Reply, State2}
         end
-    end).
+    end),
+    {Actions, ModState, Reply, resolve_version(State2)}.
 
 handle_new_priority_cast(Tenant, Request, State) ->
-    dgen_backend:transactional(Tenant, fun(Td) ->
+    {Actions, ModState, State2} = dgen_backend:transactional(Tenant, fun(Td) ->
         case invoke_tx_callback(Td, handle_cast, [Request], State) of
-            {error, Reason = {function_not_exported, _}} ->
+            {error, Reason} ->
                 erlang:error(Reason);
             {ok, {{noreply, State2}, Actions}, ModState} ->
                 {Actions, ModState, State2}
         end
-    end).
+    end),
+    {Actions, ModState, resolve_version(State2)}.
 
 handle_inline_call(Tenant, Request, From, CallOptions, State) ->
-    dgen_backend:transactional(Tenant, fun(Td) ->
+    Result = dgen_backend:transactional(Tenant, fun(Td) ->
         case dgen_queue:length(Td, State#state.tuid) of
             0 ->
                 case invoke_tx_callback(Td, handle_call, [Request, From], State) of
-                    {error, Reason = {function_not_exported, _}} ->
+                    {error, Reason} ->
                         erlang:error(Reason);
                     {ok, {{reply, Reply, State2}, Actions}, ModState} ->
                         case proplists:get_value(reply_with_effects, CallOptions, false) of
@@ -436,14 +483,21 @@ handle_inline_call(Tenant, Request, From, CallOptions, State) ->
             _ ->
                 fallback
         end
-    end).
+    end),
+    case Result of
+        {inline, Reply, ActionFun, State2} ->
+            {inline, Reply, ActionFun, resolve_version(State2)};
+        Other ->
+            Other
+    end.
 
 handle_consume(Tenant, K, Tuid, State) ->
-    dgen_backend:transactional(Tenant, fun(Td) ->
+    {Watch, ActionFun, State2} = dgen_backend:transactional(Tenant, fun(Td) ->
         case dgen_queue:consume_k(Td, K, Tuid) of
             {[{call, Request, From, CallOptions}], Watch} ->
+                % @todo: check reply key here if not reply_with_effects
                 case invoke_tx_callback(Td, handle_call, [Request, From], State) of
-                    {error, Reason = {function_not_exported, _}} ->
+                    {error, Reason} ->
                         erlang:error(Reason);
                     {ok, {{reply, Reply, State2}, Actions}, ModState} ->
                         case proplists:get_value(reply_with_effects, CallOptions, false) of
@@ -461,7 +515,7 @@ handle_consume(Tenant, K, Tuid, State) ->
                 end;
             {[{cast, Request}], Watch} ->
                 case invoke_tx_callback(Td, handle_cast, [Request], State) of
-                    {error, Reason = {function_not_exported, _}} ->
+                    {error, Reason} ->
                         erlang:error(Reason);
                     {ok, {{noreply, State2}, Actions}, ModState} ->
                         {Watch, fun() -> handle_actions(Actions, [], ModState) end, State2}
@@ -469,7 +523,8 @@ handle_consume(Tenant, K, Tuid, State) ->
             {[], Watch} ->
                 {Watch, fun() -> ok end, State}
         end
-    end).
+    end),
+    {Watch, ActionFun, resolve_version(State2)}.
 
 reply(Tenant, From, Reply) ->
     dgen_backend:transactional(Tenant, fun({Tx, Dir}) ->
@@ -486,14 +541,15 @@ reply(Tenant, From, Reply) ->
     end).
 
 handle_info_callback(Tenant, Info, State) ->
-    dgen_backend:transactional(Tenant, fun(Td) ->
+    {Actions, ModState, State2} = dgen_backend:transactional(Tenant, fun(Td) ->
         case invoke_tx_callback(Td, handle_info, [Info], State) of
-            {error, {function_not_exported, _}} ->
+            {error, _} ->
                 {[], undefined, State};
             {ok, {{noreply, State2}, Actions}, ModState} ->
                 {Actions, ModState, State2}
         end
-    end).
+    end),
+    {Actions, ModState, resolve_version(State2)}.
 
 init_tuid(Mod, Arg) ->
     case Mod:init(Arg) of
@@ -502,3 +558,9 @@ init_tuid(Mod, Arg) ->
         Other ->
             Other
     end.
+
+resolve_version(State = #state{mod_state_cache = {VF, ModStateResult}}) ->
+    B = dgen_config:backend(),
+    State#state{mod_state_cache = {B:wait(VF), ModStateResult}};
+resolve_version(State) ->
+    State.

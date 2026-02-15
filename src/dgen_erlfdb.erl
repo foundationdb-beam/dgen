@@ -11,6 +11,8 @@
     add/3,
     get_next_tx_id/1,
     set_versionstamped_key/3,
+    set_versionstamped_value/3,
+    get_versionstamp/1,
     wait/1,
     wait_for_all/1,
     watch/2,
@@ -57,6 +59,12 @@ get_next_tx_id(Tx) ->
 
 set_versionstamped_key(Tx, Key, Value) ->
     erlfdb:set_versionstamped_key(Tx, Key, Value).
+
+set_versionstamped_value(Tx, Key, Value) ->
+    erlfdb:set_versionstamped_value(Tx, Key, Value).
+
+get_versionstamp(Tx) ->
+    erlfdb:get_versionstamp(Tx).
 
 %% Futures
 

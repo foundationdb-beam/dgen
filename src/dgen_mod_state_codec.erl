@@ -31,11 +31,21 @@ list:  {BaseKey, <<"l">>}                        (marker, holds Id => FracIndex 
 """.
 -endif.
 
--export([get/2, set/3, set/4, clear/2, write_term/3, read_term/2, clear_term/2, term_first_key/2]).
+-export([
+    get/2,
+    set/4, set/5,
+    get_version/2,
+    clear/2,
+    write_term/3,
+    read_term/2,
+    clear_term/2,
+    term_first_key/2
+]).
 
 -type tenant() :: {term(), term()}.
 -type base_key() :: tuple().
 -type mod_state() :: term().
+-type option() :: {versioned, boolean()}.
 
 -define(CHUNK_SIZE, 100000).
 
@@ -43,6 +53,7 @@ list:  {BaseKey, <<"l">>}                        (marker, holds Id => FracIndex 
 -define(TAG_TERM, <<"t">>).
 -define(TAG_MAP, <<"m">>).
 -define(TAG_LIST, <<"l">>).
+-define(TAG_VERSION, <<"v">>).
 
 %%
 %% Public API
@@ -65,27 +76,28 @@ get_tx({Tx, Dir}, BaseKey) ->
             decode_kvs(Dir, BaseKey, KVs)
     end.
 
--if(?DOCATTRS).
--doc "Full write of `ModState` at `BaseKey`. Clears existing data first.".
--endif.
--spec set(tenant(), base_key(), mod_state()) -> ok.
-set(Tenant, BaseKey, ModState) ->
-    dgen_backend:transactional(Tenant, fun(Td) ->
-        clear_tx(Td, BaseKey),
-        write(Td, BaseKey, ModState)
-    end).
+set(Tenant, BaseKey, OldModState, ModState) ->
+    set(Tenant, BaseKey, OldModState, ModState, []).
 
 -if(?DOCATTRS).
 -doc """
 Diff-based partial write. Compares `OldModState` and `NewModState` and
 only writes changed keys. Falls back to a full rewrite when the encoding
 type changes or both values are plain terms.
+
+When `OldModState` is `undefined`, existing data is cleared first.
 """.
 -endif.
--spec set(tenant(), base_key(), mod_state(), mod_state()) -> ok.
-set(_Td, _BaseKey, Same, Same) ->
+-spec set(tenant(), base_key(), mod_state(), mod_state(), list(option())) -> ok.
+set(Tenant, BaseKey, undefined, ModState, Options) ->
+    dgen_backend:transactional(Tenant, fun(Td) ->
+        clear_tx(Td, BaseKey),
+        write(Td, BaseKey, ModState),
+        set_version(Td, BaseKey, Options)
+    end);
+set(_Td, _BaseKey, Same, Same, _Options) ->
     ok;
-set(Tenant, BaseKey, OldModState, NewModState) ->
+set(Tenant, BaseKey, OldModState, NewModState, Options) ->
     dgen_backend:transactional(Tenant, fun(Td) ->
         OldType = classify(OldModState),
         NewType = classify(NewModState),
@@ -103,8 +115,19 @@ set(Tenant, BaseKey, OldModState, NewModState) ->
                     list ->
                         diff_list(Td, BaseKey, OldModState, NewModState)
                 end
-        end
+        end,
+        set_version(Td, BaseKey, Options)
     end).
+
+get_version({Tx, Dir}, BaseKey) ->
+    B = dgen_config:backend(),
+    VersionedBaseKey = extend_key(BaseKey, ?TAG_VERSION),
+    case B:wait(B:get(Tx, B:dir_pack(Dir, VersionedBaseKey))) of
+        not_found ->
+            {error, not_found};
+        Version ->
+            {ok, Version}
+    end.
 
 -if(?DOCATTRS).
 -doc "Clears all state keys under `BaseKey`.".
@@ -567,4 +590,16 @@ binary_chunk_every(Bin, Size, Acc) ->
             binary_chunk_every(Rest, Size, [Chunk | Acc]);
         Chunk ->
             lists:reverse([Chunk | Acc])
+    end.
+
+set_version({Tx, Dir}, BaseKey, Options) ->
+    case proplists:get_value(versioned, Options, false) of
+        true ->
+            B = dgen_config:backend(),
+            VersionedBaseKey = extend_key(BaseKey, ?TAG_VERSION),
+            B:set_versionstamped_value(
+                Tx, B:dir_pack(Dir, VersionedBaseKey), <<0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0>>
+            );
+        false ->
+            ok
     end.

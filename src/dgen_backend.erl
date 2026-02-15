@@ -47,6 +47,20 @@ and only passes them back into backend callbacks.
 
 -export([transactional/2]).
 
+-type db() :: term().
+-type dir() :: term().
+-type tenant() :: {db(), dir()}.
+-type future() :: term().
+-type versionstamp() :: term().
+
+-export_type([
+    db/0,
+    dir/0,
+    tenant/0,
+    future/0,
+    versionstamp/0
+]).
+
 %% Transaction management
 -callback transactional(Db :: term(), Fun :: fun((Tx :: term()) -> Result)) ->
     Result
@@ -66,6 +80,8 @@ when
 %% Versionstamp operations
 -callback get_next_tx_id(Tx :: term()) -> non_neg_integer().
 -callback set_versionstamped_key(Tx :: term(), Key :: binary(), Value :: binary()) -> ok.
+-callback set_versionstamped_value(Tx :: term(), Key :: binary(), Value :: binary()) -> ok.
+-callback get_versionstamp(Tx :: term()) -> Future :: term().
 
 %% Futures
 -callback wait(Future :: term()) -> term().
@@ -87,7 +103,7 @@ when
 -callback dir_remove(Db :: term(), Dir :: term(), Name :: term()) -> ok.
 
 %% Sandbox / test support
--callback sandbox_open(Name :: term(), DirName :: term()) -> {Db :: term(), Dir :: term()}.
+-callback sandbox_open(Name :: term(), DirName :: term()) -> tenant().
 
 -optional_callbacks([sandbox_open/2]).
 
