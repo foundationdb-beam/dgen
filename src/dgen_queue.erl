@@ -30,6 +30,7 @@ Pushes a list of items onto the queue atomically.
 Each item is stored with a versionstamped key to ensure FIFO ordering.
 """.
 -endif.
+-spec push_k(dgen_backend:tenant(), dgen:tuid(), [term()]) -> ok.
 push_k(Tenant, Tuid, Items) ->
     dgen_backend:transactional(Tenant, fun({Tx, Dir}) ->
         B = dgen_config:backend(),
@@ -64,6 +65,8 @@ Returns `{Items, Watch}` where `Watch` is `undefined` if the queue still has
 items, or a future that fires when new items are pushed.
 """.
 -endif.
+-spec consume_k(dgen_backend:tenant(), pos_integer(), dgen:tuid()) ->
+    {[term()], undefined | dgen_backend:future()}.
 consume_k(Tenant, K, Tuid) ->
     dgen_backend:transactional(Tenant, fun(Td) ->
         case pop_k(Td, K, Tuid) of
@@ -77,6 +80,7 @@ consume_k(Tenant, K, Tuid) ->
 -if(?DOCATTRS).
 -doc "Deletes the entire queue for the given `Tuid`, including all items and counters.".
 -endif.
+-spec delete(dgen_backend:tenant(), dgen:tuid()) -> ok.
 delete(Tenant, Tuid) ->
     dgen_backend:transactional(Tenant, fun({Tx, Dir}) ->
         B = dgen_config:backend(),
@@ -88,6 +92,7 @@ delete(Tenant, Tuid) ->
 -if(?DOCATTRS).
 -doc "Returns the number of items currently in the queue (pushes minus pops).".
 -endif.
+-spec length(dgen_backend:tenant(), dgen:tuid()) -> non_neg_integer().
 length(Tenant, Tuid) ->
     dgen_backend:transactional(Tenant, fun({Tx, Dir}) ->
         B = dgen_config:backend(),

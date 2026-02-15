@@ -42,8 +42,8 @@ list:  {BaseKey, <<"l">>}                        (marker, holds Id => FracIndex 
     term_first_key/2
 ]).
 
--type tenant() :: {term(), term()}.
--type base_key() :: tuple().
+-type tenant() :: dgen_backend:tenant().
+-type base_key() :: dgen_backend:tuple_key().
 -type mod_state() :: term().
 -type option() :: {versioned, boolean()}.
 
@@ -76,6 +76,7 @@ get_tx({Tx, Dir}, BaseKey) ->
             decode_kvs(Dir, BaseKey, KVs)
     end.
 
+-spec set(tenant(), base_key(), mod_state(), mod_state()) -> ok.
 set(Tenant, BaseKey, OldModState, ModState) ->
     set(Tenant, BaseKey, OldModState, ModState, []).
 
@@ -119,6 +120,7 @@ set(Tenant, BaseKey, OldModState, NewModState, Options) ->
         set_version(Td, BaseKey, Options)
     end).
 
+-spec get_version(tenant(), base_key()) -> {ok, dgen_backend:versionstamp()} | {error, not_found}.
 get_version({Tx, Dir}, BaseKey) ->
     B = dgen_config:backend(),
     VersionedBaseKey = extend_key(BaseKey, ?TAG_VERSION),
@@ -187,7 +189,7 @@ This is the key that is written first by `write_term/3` and is suitable for
 placing a watch on a term-encoded value.
 """.
 -endif.
--spec term_first_key(term(), base_key()) -> binary().
+-spec term_first_key(dgen_backend:dir(), base_key()) -> dgen_backend:key().
 term_first_key(Dir, BaseKey) ->
     B = dgen_config:backend(),
     B:dir_pack(Dir, extend_key(BaseKey, ?TAG_TERM, 0)).
@@ -261,6 +263,7 @@ write(Td, BaseKey, ModState) ->
         list -> write_list(Td, BaseKey, ModState)
     end.
 
+-spec write_term(tenant(), base_key(), term()) -> ok.
 write_term({Tx, Dir}, BaseKey, ModState) ->
     B = dgen_config:backend(),
     Bin = term_to_binary(ModState),

@@ -64,6 +64,18 @@ argument is the
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
+-type server() :: gen_server:server_ref().
+-type option() ::
+    {tenant, dgen_backend:tenant()}
+    | {consume, boolean()}
+    | {reset, boolean()}
+    | {cache, boolean()}
+    | gen_server:start_opt().
+-type options() :: [option()].
+-type start_ret() :: gen_server:start_ret().
+
+-export_type([server/0, option/0, options/0]).
+
 -define(DefaultTuid(Mod), {<<"dgen_server">>, atom_to_binary(Mod)}).
 -define(TxCallbackTimeout, 5000).
 -define(DefaultCallTimeout, 5000).
@@ -86,6 +98,7 @@ Starts a dgen_server process without linking.
 See `start_link/3` for details on `Mod`, `Arg`, and `Opts`.
 """.
 -endif.
+-spec start(module(), term(), options()) -> start_ret().
 start(Mod, Arg, Opts) ->
     Consume = proplists:get_value(consume, Opts, true),
     Reset = proplists:get_value(reset, Opts, false),
@@ -99,6 +112,7 @@ Starts a dgen_server process without linking, registered as `Reg`.
 See `start_link/3` for details on `Mod`, `Arg`, and `Opts`.
 """.
 -endif.
+-spec start(gen_server:server_name(), module(), term(), options()) -> start_ret().
 start(Reg, Mod, Arg, Opts) ->
     Consume = proplists:get_value(consume, Opts, true),
     Reset = proplists:get_value(reset, Opts, false),
@@ -115,6 +129,7 @@ Starts a dgen_server process linked to the calling process.
   include `consume` and `reset`.
 """.
 -endif.
+-spec start_link(module(), term(), options()) -> start_ret().
 start_link(Mod, Arg, Opts) ->
     Consume = proplists:get_value(consume, Opts, true),
     Reset = proplists:get_value(reset, Opts, false),
@@ -128,6 +143,7 @@ Starts a dgen_server process linked to the calling process, registered as `Reg`.
 See `start_link/3` for details on `Mod`, `Arg`, and `Opts`.
 """.
 -endif.
+-spec start_link(gen_server:server_name(), module(), term(), options()) -> start_ret().
 start_link(Reg, Mod, Arg, Opts) ->
     Consume = proplists:get_value(consume, Opts, true),
     Reset = proplists:get_value(reset, Opts, false),
@@ -137,18 +153,21 @@ start_link(Reg, Mod, Arg, Opts) ->
 -if(?DOCATTRS).
 -doc "Sends an asynchronous cast request to the dgen_server's durable queue.".
 -endif.
+-spec cast(server(), term()) -> ok.
 cast(Server, Request) ->
     cast_k(Server, [Request]).
 
 -if(?DOCATTRS).
 -doc "Sends a batch of cast requests to the dgen_server's durable queue atomically.".
 -endif.
+-spec cast_k(server(), [term()]) -> ok.
 cast_k(Server, Requests) ->
     gen_server:cast(Server, {cast, Requests}).
 
 -if(?DOCATTRS).
 -doc "Sends a synchronous call request via the durable queue. Default timeout 5000ms.".
 -endif.
+-spec call(server(), term()) -> term().
 call(Server, Request) ->
     call(Server, Request, ?DefaultCallTimeout).
 
@@ -176,6 +195,7 @@ processes it and writes the reply, or until `Timeout` milliseconds elapse.
   2-tuple: `{Reply :: term(), Effects :: list()}`.
 """.
 -endif.
+-spec call(server(), term(), timeout() | list()) -> term().
 call(Server, Request, Timeout) when Timeout =:= infinity orelse is_integer(Timeout) ->
     call(Server, Request, [{timeout, Timeout}]);
 call(Server, Request, Options) when is_list(Options) ->
@@ -196,6 +216,7 @@ Use with caution: this breaks ordering guarantees with respect to queued
 messages.
 """.
 -endif.
+-spec priority_cast(server(), term()) -> ok.
 priority_cast(Server, Request) ->
     gen_server:cast(Server, {priority, Request}).
 
@@ -206,12 +227,14 @@ Sends a call that bypasses the durable queue and is handled immediately.
 Use with caution: this breaks ordering guarantees. Useful for snapshot reads.
 """.
 -endif.
+-spec priority_call(server(), term()) -> term().
 priority_call(Server, Request) ->
     gen_server:call(Server, {priority, Request}).
 
 -if(?DOCATTRS).
 -doc "Like `priority_call/2` but with an explicit timeout.".
 -endif.
+-spec priority_call(server(), term(), timeout()) -> term().
 priority_call(Server, Request, Timeout) ->
     gen_server:call(Server, {priority, Request}, Timeout).
 
@@ -221,6 +244,7 @@ Kills the dgen_server, deleting all durable state, queue items, and waiting
 call keys. The process exits with `Reason`.
 """.
 -endif.
+-spec kill(server(), term()) -> ok.
 kill(Server, Reason) ->
     gen_server:cast(Server, {kill, Reason}).
 
@@ -232,6 +256,7 @@ get_tenant(Opts) ->
             Tenant
     end.
 
+-spec init(term()) -> {ok, #state{}} | {error, term()}.
 init({Tenant, Mod, Arg, Consume, Reset, Cache}) ->
     case init_tuid(Mod, Arg) of
         {ok, Tuid, InitialState} ->
@@ -243,6 +268,8 @@ init({Tenant, Mod, Arg, Consume, Reset, Cache}) ->
             Other
     end.
 
+-spec handle_call(term(), gen_server:from(), #state{}) ->
+    {reply, term(), #state{}}.
 handle_call(
     {call, Request, WatchTo, Options},
     _LocalFrom,
@@ -269,6 +296,8 @@ handle_call({priority, Request}, _From, State = #state{tenant = Tenant}) ->
     _ = handle_actions(Actions, [], ModState),
     {reply, Reply, State2}.
 
+-spec handle_cast(term(), #state{}) ->
+    {noreply, #state{}} | {stop, term(), #state{}}.
 handle_cast(consume, State = #state{tenant = Tenant, tuid = Tuid}) ->
     % 1 at a time because we are limited to 5 seconds per transaction
     K = 1,
@@ -292,6 +321,7 @@ handle_cast({kill, Reason}, State = #state{tenant = Tenant, tuid = Tuid}) ->
     delete(Tenant, Tuid),
     {stop, Reason, State#state{mod_state_cache = undefined}}.
 
+-spec handle_info(term(), #state{}) -> {noreply, #state{}}.
 handle_info({Ref, ready}, State = #state{watch = ?FUTURE(Ref)}) ->
     handle_cast(consume, State#state{watch = undefined});
 handle_info(Info, State = #state{tenant = Tenant}) ->
@@ -299,9 +329,11 @@ handle_info(Info, State = #state{tenant = Tenant}) ->
     _ = handle_actions(Actions, [], ModState),
     {noreply, State2}.
 
+-spec terminate(term(), #state{}) -> ok.
 terminate(_Reason, _State) ->
     ok.
 
+-spec code_change(term(), #state{}, term()) -> {ok, #state{}}.
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 

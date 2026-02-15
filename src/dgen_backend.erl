@@ -48,59 +48,65 @@ and only passes them back into backend callbacks.
 -export([transactional/2]).
 
 -type db() :: term().
+-type tx() :: term().
 -type dir() :: term().
--type tenant() :: {db(), dir()}.
+-type tenant() :: {db() | tx(), dir()}.
 -type future() :: term().
 -type versionstamp() :: term().
+-type key() :: binary().
+-type tuple_key() :: tuple().
 
 -export_type([
     db/0,
+    tx/0,
     dir/0,
     tenant/0,
     future/0,
-    versionstamp/0
+    versionstamp/0,
+    key/0,
+    tuple_key/0
 ]).
 
 %% Transaction management
--callback transactional(Db :: term(), Fun :: fun((Tx :: term()) -> Result)) ->
+-callback transactional(Db :: db(), Fun :: fun((Tx :: tx()) -> Result)) ->
     Result
 when
     Result :: term().
 
--callback is_transaction(Handle :: term()) -> boolean().
+-callback is_transaction(Handle :: db() | tx()) -> boolean().
 
 %% Key-value operations
--callback get(Tx :: term(), Key :: binary()) -> Future :: term().
--callback set(Tx :: term(), Key :: binary(), Value :: binary()) -> ok.
--callback clear_range(Tx :: term(), StartKey :: binary(), EndKey :: binary()) -> ok.
--callback get_range(Tx :: term(), StartKey :: binary(), EndKey :: binary(), Opts :: list()) ->
-    [{binary(), binary()}].
--callback add(Tx :: term(), Key :: binary(), Value :: integer()) -> ok.
+-callback get(Tx :: tx(), Key :: key()) -> future().
+-callback set(Tx :: tx(), Key :: key(), Value :: binary()) -> ok.
+-callback clear_range(Tx :: tx(), StartKey :: key(), EndKey :: key()) -> ok.
+-callback get_range(Tx :: tx(), StartKey :: key(), EndKey :: key(), Opts :: list()) ->
+    [{key(), binary()}].
+-callback add(Tx :: tx(), Key :: key(), Value :: integer()) -> ok.
 
 %% Versionstamp operations
--callback get_next_tx_id(Tx :: term()) -> non_neg_integer().
--callback set_versionstamped_key(Tx :: term(), Key :: binary(), Value :: binary()) -> ok.
--callback set_versionstamped_value(Tx :: term(), Key :: binary(), Value :: binary()) -> ok.
--callback get_versionstamp(Tx :: term()) -> Future :: term().
+-callback get_next_tx_id(Tx :: tx()) -> non_neg_integer().
+-callback set_versionstamped_key(Tx :: tx(), Key :: key(), Value :: binary()) -> ok.
+-callback set_versionstamped_value(Tx :: tx(), Key :: key(), Value :: binary()) -> ok.
+-callback get_versionstamp(Tx :: tx()) -> future().
 
 %% Futures
--callback wait(Future :: term()) -> term().
--callback wait_for_all(Futures :: [term()]) -> [term()].
+-callback wait(Future :: future()) -> term().
+-callback wait_for_all(Futures :: [future()]) -> [term()].
 
 %% Watches — must return {dgen_future, Ref, BackendData}
--callback watch(Tx :: term(), Key :: binary()) -> Future :: term().
--callback watch(Tx :: term(), Key :: binary(), Opts :: list()) -> Future :: term().
+-callback watch(Tx :: tx(), Key :: key()) -> future().
+-callback watch(Tx :: tx(), Key :: key(), Opts :: list()) -> future().
 
 %% Directory / keyspace operations
--callback dir_range(Dir :: term(), TupleKey :: tuple()) -> {binary(), binary()}.
--callback dir_pack(Dir :: term(), TupleKey :: tuple()) -> binary().
--callback dir_pack_vs(Dir :: term(), TupleKey :: tuple()) -> binary().
--callback dir_unpack(Dir :: term(), PackedKey :: binary()) -> tuple().
--callback key_strinc(Key :: binary()) -> binary().
+-callback dir_range(Dir :: dir(), TupleKey :: tuple_key()) -> {key(), key()}.
+-callback dir_pack(Dir :: dir(), TupleKey :: tuple_key()) -> key().
+-callback dir_pack_vs(Dir :: dir(), TupleKey :: tuple_key()) -> key().
+-callback dir_unpack(Dir :: dir(), PackedKey :: key()) -> tuple_key().
+-callback key_strinc(Key :: key()) -> key().
 
 %% Directory management
--callback dir_create(Db :: term(), Dir :: term(), Name :: term()) -> Dir :: term().
--callback dir_remove(Db :: term(), Dir :: term(), Name :: term()) -> ok.
+-callback dir_create(Db :: db(), Dir :: dir(), Name :: term()) -> dir().
+-callback dir_remove(Db :: db(), Dir :: dir(), Name :: term()) -> ok.
 
 %% Sandbox / test support
 -callback sandbox_open(Name :: term(), DirName :: term()) -> tenant().
@@ -113,7 +119,7 @@ Runs `Fun` inside a transaction if `Handle` is a database handle,
 or calls `Fun` directly if `Handle` is already a transaction.
 """.
 -endif.
--spec transactional({term(), term()}, fun(({term(), term()}) -> Result)) -> Result when
+-spec transactional(tenant(), fun((tenant()) -> Result)) -> Result when
     Result :: term().
 transactional({Handle, Dir}, Fun) ->
     B = dgen_config:backend(),
