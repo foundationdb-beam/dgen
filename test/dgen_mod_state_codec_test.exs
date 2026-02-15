@@ -1,5 +1,5 @@
 defmodule DGenModStateCodec.Test do
-  use DGen.Case
+  use DGen.Case, async: true
 
   defp base_key, do: {<<"test">>, <<"codec">>, <<"s">>}
 

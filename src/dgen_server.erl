@@ -456,18 +456,18 @@ get_mod_state(Td, State = #state{}) ->
 
 set_mod_state(_Td, ModState, ModState, State) ->
     {ok, State};
-set_mod_state(Td = {Tx, _Dir}, OrigModState, ModState, State = #state{}) ->
-    % @todo: get the version number
+set_mod_state(Td = {Tx, _Dir}, OrigModState, ModState, State = #state{cache = Cache}) ->
     B = dgen_config:backend(),
+    % Always write a versioned ModState, regardless of cache flag
     Result = dgen_mod_state_codec:set(
         Td, get_state_key(State#state.tuid), OrigModState, ModState, [{versioned, true}]
     ),
     State1 =
-        case State of
-            #state{cache = true} ->
+        case Cache of
+            true ->
                 VF = B:get_versionstamp(Tx),
                 State#state{mod_state_cache = {VF, {ok, ModState}}};
-            _ ->
+            false ->
                 State
         end,
     {Result, State1}.

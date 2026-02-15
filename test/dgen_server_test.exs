@@ -1,5 +1,5 @@
 defmodule DGenServer.Test do
-  use DGen.Case
+  use DGen.Case, async: true
   doctest DGenServer
 
   alias DGen.DCounter

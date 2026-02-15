@@ -1,5 +1,5 @@
 defmodule DGenServer.InlineCallTest do
-  use DGen.Case
+  use DGen.Case, async: true
 
   alias DGen.DCounter
   alias DGen.ActionEcho

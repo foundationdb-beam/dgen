@@ -1,5 +1,5 @@
 defmodule DGenServer.ActionsTest do
-  use DGen.Case
+  use DGen.Case, async: true
 
   alias DGen.ActionEcho
 
