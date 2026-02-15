@@ -33,6 +33,11 @@ the first chunk key; the client always reads via `get_range`.
 
 -include("../include/dgen.hrl").
 
+-type tuid() :: tuple().
+-type from() :: tuple().
+
+-export_type([tuid/0, from/0]).
+
 -if(?DOCATTRS).
 -doc """
 Pushes a call request onto the durable queue.
@@ -42,23 +47,24 @@ watch on the first chunk key directed to `WatchTo`, and enqueues the request.
 Returns `{From, Watch}` where `From` is the from-key tuple.
 """.
 -endif.
-push_call(Tenant, Tuid, Request, WatchTo, Options) ->
-    dgen_backend:transactional(Tenant, fun({Tx, Dir}) ->
-        B = dgen_config:backend(),
-        WaitingKey = get_waiting_key(Tuid),
-        From = get_from(WaitingKey, make_ref()),
-        dgen_mod_state_codec:write_term({Tx, Dir}, From, noreply),
-        ReplySentinelKey = dgen_mod_state_codec:term_first_key(Dir, From),
-        Future = B:watch(Tx, ReplySentinelKey, [{to, WatchTo}]),
-        dgen_queue:push_k({Tx, Dir}, Tuid, [{call, Request, From, Options}]),
-        {From, Future}
-    end).
+-spec push_call(term(), tuid(), term(), pid(), list()) ->
+    {from(), dgen_backend:future()}.
+push_call({Tx, Dir}, Tuid, Request, WatchTo, Options) ->
+    B = dgen_config:backend(),
+    WaitingKey = get_waiting_key(Tuid),
+    From = get_from(WaitingKey, make_ref()),
+    dgen_mod_state_codec:write_term({Tx, Dir}, From, noreply),
+    ReplySentinelKey = dgen_mod_state_codec:term_first_key(Dir, From),
+    Future = B:watch(Tx, ReplySentinelKey, [{to, WatchTo}]),
+    dgen_queue:push_k({Tx, Dir}, Tuid, [{call, Request, From, Options}]),
+    {From, Future}.
 
 -if(?DOCATTRS).
 -doc "Appends the `<<\"c\">>` waiting-key tag to a tuid tuple.".
 -endif.
+-spec get_waiting_key(tuid()) -> dgen_backend:tuple_key().
 get_waiting_key(Tuple) ->
-    erlang:insert_element(1 + tuple_size(Tuple), Tuple, <<"c">>).
+    dgen_key:extend(Tuple, <<"c">>).
 
 -if(?DOCATTRS).
 -doc """
@@ -69,11 +75,11 @@ call keys can be garbage-collected using a time-based heuristic.
 Key structure: `{WaitingKey..., Timestamp, term_to_binary(Ref)}`.
 """.
 -endif.
+-spec get_from(dgen_backend:tuple_key(), reference()) -> from().
 get_from(WaitingKey, Ref) ->
     Ts = erlang:system_time(second),
     Bin = term_to_binary(Ref),
-    K1 = erlang:insert_element(1 + tuple_size(WaitingKey), WaitingKey, Ts),
-    erlang:insert_element(1 + tuple_size(K1), K1, Bin).
+    dgen_key:extend(WaitingKey, Ts, Bin).
 
 -if(?DOCATTRS).
 -doc """
@@ -84,6 +90,7 @@ Sends a synchronous call through the durable queue and waits for the reply.
 durable key leaks.
 """.
 -endif.
+-spec call(module(), gen_server:server_ref(), term(), timeout()) -> term().
 call(Module, Server, Request, Timeout) ->
     T1 = erlang:monotonic_time(millisecond),
 

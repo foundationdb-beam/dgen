@@ -31,11 +31,21 @@ list:  {BaseKey, <<"l">>}                        (marker, holds Id => FracIndex 
 """.
 -endif.
 
--export([get/2, set/3, set/4, clear/2, write_term/3, read_term/2, clear_term/2, term_first_key/2]).
+-export([
+    get/2,
+    set/4, set/5,
+    get_version/2,
+    clear/2,
+    write_term/3,
+    read_term/2,
+    clear_term/2,
+    term_first_key/2
+]).
 
--type tenant() :: {term(), term()}.
--type base_key() :: tuple().
+-type tenant() :: dgen_backend:tenant().
+-type base_key() :: dgen_backend:tuple_key().
 -type mod_state() :: term().
+-type option() :: {versioned, boolean()}.
 
 -define(CHUNK_SIZE, 100000).
 
@@ -43,6 +53,7 @@ list:  {BaseKey, <<"l">>}                        (marker, holds Id => FracIndex 
 -define(TAG_TERM, <<"t">>).
 -define(TAG_MAP, <<"m">>).
 -define(TAG_LIST, <<"l">>).
+-define(TAG_VERSION, <<"v">>).
 
 %%
 %% Public API
@@ -65,27 +76,29 @@ get_tx({Tx, Dir}, BaseKey) ->
             decode_kvs(Dir, BaseKey, KVs)
     end.
 
--if(?DOCATTRS).
--doc "Full write of `ModState` at `BaseKey`. Clears existing data first.".
--endif.
--spec set(tenant(), base_key(), mod_state()) -> ok.
-set(Tenant, BaseKey, ModState) ->
-    dgen_backend:transactional(Tenant, fun(Td) ->
-        clear_tx(Td, BaseKey),
-        write(Td, BaseKey, ModState)
-    end).
+-spec set(tenant(), base_key(), mod_state(), mod_state()) -> ok.
+set(Tenant, BaseKey, OldModState, ModState) ->
+    set(Tenant, BaseKey, OldModState, ModState, []).
 
 -if(?DOCATTRS).
 -doc """
 Diff-based partial write. Compares `OldModState` and `NewModState` and
 only writes changed keys. Falls back to a full rewrite when the encoding
 type changes or both values are plain terms.
+
+When `OldModState` is `undefined`, existing data is cleared first.
 """.
 -endif.
--spec set(tenant(), base_key(), mod_state(), mod_state()) -> ok.
-set(_Td, _BaseKey, Same, Same) ->
+-spec set(tenant(), base_key(), mod_state(), mod_state(), list(option())) -> ok.
+set(Tenant, BaseKey, undefined, ModState, Options) ->
+    dgen_backend:transactional(Tenant, fun(Td) ->
+        clear_tx(Td, BaseKey),
+        write(Td, BaseKey, ModState),
+        set_version(Td, BaseKey, Options)
+    end);
+set(_Td, _BaseKey, Same, Same, _Options) ->
     ok;
-set(Tenant, BaseKey, OldModState, NewModState) ->
+set(Tenant, BaseKey, OldModState, NewModState, Options) ->
     dgen_backend:transactional(Tenant, fun(Td) ->
         OldType = classify(OldModState),
         NewType = classify(NewModState),
@@ -103,8 +116,20 @@ set(Tenant, BaseKey, OldModState, NewModState) ->
                     list ->
                         diff_list(Td, BaseKey, OldModState, NewModState)
                 end
-        end
+        end,
+        set_version(Td, BaseKey, Options)
     end).
+
+-spec get_version(tenant(), base_key()) -> {ok, dgen_backend:versionstamp()} | {error, not_found}.
+get_version({Tx, Dir}, BaseKey) ->
+    B = dgen_config:backend(),
+    VersionedBaseKey = dgen_key:extend(BaseKey, ?TAG_VERSION),
+    case B:wait(B:get(Tx, B:dir_pack(Dir, VersionedBaseKey))) of
+        not_found ->
+            {error, not_found};
+        Version ->
+            {ok, Version}
+    end.
 
 -if(?DOCATTRS).
 -doc "Clears all state keys under `BaseKey`.".
@@ -131,7 +156,7 @@ protocol to read chunked reply payloads.
 read_term(Tenant, BaseKey) ->
     dgen_backend:transactional(Tenant, fun({Tx, Dir}) ->
         B = dgen_config:backend(),
-        TermBaseKey = extend_key(BaseKey, ?TAG_TERM),
+        TermBaseKey = dgen_key:extend(BaseKey, ?TAG_TERM),
         {SK, EK} = B:dir_range(Dir, TermBaseKey),
         case B:get_range(Tx, SK, EK, [{wait, true}]) of
             [] -> {error, not_found};
@@ -151,7 +176,7 @@ protocol to clear chunked reply payloads.
 clear_term(Tenant, BaseKey) ->
     dgen_backend:transactional(Tenant, fun({Tx, Dir}) ->
         B = dgen_config:backend(),
-        TermBaseKey = extend_key(BaseKey, ?TAG_TERM),
+        TermBaseKey = dgen_key:extend(BaseKey, ?TAG_TERM),
         {SK, EK} = B:dir_range(Dir, TermBaseKey),
         B:clear_range(Tx, SK, EK)
     end).
@@ -164,10 +189,10 @@ This is the key that is written first by `write_term/3` and is suitable for
 placing a watch on a term-encoded value.
 """.
 -endif.
--spec term_first_key(term(), base_key()) -> binary().
+-spec term_first_key(dgen_backend:dir(), base_key()) -> dgen_backend:key().
 term_first_key(Dir, BaseKey) ->
     B = dgen_config:backend(),
-    B:dir_pack(Dir, extend_key(BaseKey, ?TAG_TERM, 0)).
+    B:dir_pack(Dir, dgen_key:extend(BaseKey, ?TAG_TERM, 0)).
 
 %%
 %% Classification
@@ -238,28 +263,29 @@ write(Td, BaseKey, ModState) ->
         list -> write_list(Td, BaseKey, ModState)
     end.
 
+-spec write_term(tenant(), base_key(), term()) -> ok.
 write_term({Tx, Dir}, BaseKey, ModState) ->
     B = dgen_config:backend(),
     Bin = term_to_binary(ModState),
     Chunks = binary_chunk_every(Bin, ?CHUNK_SIZE, []),
-    TermBaseKey = extend_key(BaseKey, ?TAG_TERM),
+    TermBaseKey = dgen_key:extend(BaseKey, ?TAG_TERM),
     write_chunks(B, Tx, Dir, TermBaseKey, Chunks, 0),
     ok.
 
 write_chunks(_B, _Tx, _Dir, _BaseKey, [], _Idx) ->
     ok;
 write_chunks(B, Tx, Dir, BaseKey, [Chunk | Rest], Idx) ->
-    Key = extend_key(BaseKey, Idx),
+    Key = dgen_key:extend(BaseKey, Idx),
     B:set(Tx, B:dir_pack(Dir, Key), Chunk),
     write_chunks(B, Tx, Dir, BaseKey, Rest, Idx + 1).
 
 write_map({Tx, Dir} = Td, BaseKey, ModState) ->
     B = dgen_config:backend(),
-    MarkerKey = extend_key(BaseKey, ?TAG_MAP),
+    MarkerKey = dgen_key:extend(BaseKey, ?TAG_MAP),
     B:set(Tx, B:dir_pack(Dir, MarkerKey), <<>>),
     maps:foreach(
         fun(AtomKey, Value) ->
-            SubBaseKey = extend_key(BaseKey, ?TAG_MAP, atom_to_binary(AtomKey)),
+            SubBaseKey = dgen_key:extend(BaseKey, ?TAG_MAP, atom_to_binary(AtomKey)),
             write(Td, SubBaseKey, Value)
         end,
         ModState
@@ -268,7 +294,7 @@ write_map({Tx, Dir} = Td, BaseKey, ModState) ->
 
 write_list({Tx, Dir} = Td, BaseKey, ModState) ->
     B = dgen_config:backend(),
-    MarkerKey = extend_key(BaseKey, ?TAG_LIST),
+    MarkerKey = dgen_key:extend(BaseKey, ?TAG_LIST),
     case ModState of
         [] ->
             B:set(Tx, B:dir_pack(Dir, MarkerKey), term_to_binary(#{})),
@@ -281,7 +307,7 @@ write_list({Tx, Dir} = Td, BaseKey, ModState) ->
             B:set(Tx, B:dir_pack(Dir, MarkerKey), term_to_binary(OrderMap)),
             lists:foreach(
                 fun({#{id := Id} = Item, FI}) ->
-                    SubBaseKey = extend_key(BaseKey, ?TAG_LIST, FI, Id),
+                    SubBaseKey = dgen_key:extend(BaseKey, ?TAG_LIST, FI, Id),
                     write(Td, SubBaseKey, Item)
                 end,
                 ItemsWithIndex
@@ -324,7 +350,7 @@ decode_map(B, Dir, BaseKey, KVs) ->
             Map = maps:from_list([
                 begin
                     AtomKey = binary_to_atom(GroupKey),
-                    SubBaseKey = extend_key(BaseKey, ?TAG_MAP, GroupKey),
+                    SubBaseKey = dgen_key:extend(BaseKey, ?TAG_MAP, GroupKey),
                     SubKVs = [{PK, V} || {_T, PK, V} <- GroupKVs],
                     {ok, Value} = decode_kvs(Dir, SubBaseKey, SubKVs),
                     {AtomKey, Value}
@@ -352,7 +378,7 @@ decode_list(B, Dir, BaseKey, KVs) ->
                     {FirstTuple, _FPK, _FV} = hd(GroupKVs),
                     GroupId = element(BaseSize + 3, FirstTuple),
                     FracIndex = element(BaseSize + 2, FirstTuple),
-                    SubBaseKey = extend_key(BaseKey, ?TAG_LIST, FracIndex, GroupId),
+                    SubBaseKey = dgen_key:extend(BaseKey, ?TAG_LIST, FracIndex, GroupId),
                     SubKVs = [{PK, V} || {_T, PK, V} <- GroupKVs],
                     {ok, Item} = decode_kvs(Dir, SubBaseKey, SubKVs),
                     Item
@@ -375,14 +401,14 @@ diff_map(Td, BaseKey, OldMap, NewMap) ->
     Common = NewKeys -- Added,
     lists:foreach(
         fun(AtomKey) ->
-            SubBaseKey = extend_key(BaseKey, ?TAG_MAP, atom_to_binary(AtomKey)),
+            SubBaseKey = dgen_key:extend(BaseKey, ?TAG_MAP, atom_to_binary(AtomKey)),
             clear_tx(Td, SubBaseKey)
         end,
         Removed
     ),
     lists:foreach(
         fun(AtomKey) ->
-            SubBaseKey = extend_key(BaseKey, ?TAG_MAP, atom_to_binary(AtomKey)),
+            SubBaseKey = dgen_key:extend(BaseKey, ?TAG_MAP, atom_to_binary(AtomKey)),
             write(Td, SubBaseKey, maps:get(AtomKey, NewMap))
         end,
         Added
@@ -391,7 +417,7 @@ diff_map(Td, BaseKey, OldMap, NewMap) ->
         fun(AtomKey) ->
             OldVal = maps:get(AtomKey, OldMap),
             NewVal = maps:get(AtomKey, NewMap),
-            SubBaseKey = extend_key(BaseKey, ?TAG_MAP, atom_to_binary(AtomKey)),
+            SubBaseKey = dgen_key:extend(BaseKey, ?TAG_MAP, atom_to_binary(AtomKey)),
             set_tx(Td, SubBaseKey, OldVal, NewVal)
         end,
         Common
@@ -432,7 +458,7 @@ diff_list({Tx, Dir} = Td, BaseKey, OldList, NewList) ->
     CommonIds = NewIds -- AddedIds,
 
     %% Read current order map (Id => FracIndex) from the marker key
-    MarkerKey = extend_key(BaseKey, ?TAG_LIST),
+    MarkerKey = dgen_key:extend(BaseKey, ?TAG_LIST),
     PackedMarker = B:dir_pack(Dir, MarkerKey),
     OldOrderMap =
         case B:wait(B:get(Tx, PackedMarker)) of
@@ -453,7 +479,7 @@ diff_list({Tx, Dir} = Td, BaseKey, OldList, NewList) ->
     lists:foreach(
         fun(Id) ->
             OldFI = maps:get(Id, OldOrderMap),
-            SubBaseKey = extend_key(BaseKey, ?TAG_LIST, OldFI, Id),
+            SubBaseKey = dgen_key:extend(BaseKey, ?TAG_LIST, OldFI, Id),
             clear_tx(Td, SubBaseKey)
         end,
         RemovedIds
@@ -463,7 +489,7 @@ diff_list({Tx, Dir} = Td, BaseKey, OldList, NewList) ->
     lists:foreach(
         fun(Id) ->
             NewFI = maps:get(Id, OrderMap2),
-            SubBaseKey = extend_key(BaseKey, ?TAG_LIST, NewFI, Id),
+            SubBaseKey = dgen_key:extend(BaseKey, ?TAG_LIST, NewFI, Id),
             write(Td, SubBaseKey, maps:get(Id, NewById))
         end,
         AddedIds
@@ -475,7 +501,7 @@ diff_list({Tx, Dir} = Td, BaseKey, OldList, NewList) ->
             OldItem = maps:get(Id, OldById),
             NewItem = maps:get(Id, NewById),
             FI = maps:get(Id, OldOrderMap),
-            SubBaseKey = extend_key(BaseKey, ?TAG_LIST, FI, Id),
+            SubBaseKey = dgen_key:extend(BaseKey, ?TAG_LIST, FI, Id),
             set_tx(Td, SubBaseKey, OldItem, NewItem)
         end,
         CommonIds
@@ -529,18 +555,6 @@ find_next_defined([{_Id, FI} | _Rest]) ->
 %% Helpers
 %%
 
--spec extend_key(tuple(), term()) -> tuple().
-extend_key(BaseKey, Element) ->
-    erlang:insert_element(1 + tuple_size(BaseKey), BaseKey, Element).
-
--spec extend_key(tuple(), term(), term()) -> tuple().
-extend_key(BaseKey, E1, E2) ->
-    extend_key(extend_key(BaseKey, E1), E2).
-
--spec extend_key(tuple(), term(), term(), term()) -> tuple().
-extend_key(BaseKey, E1, E2, E3) ->
-    extend_key(extend_key(BaseKey, E1, E2), E3).
-
 %% Group a sorted list of pre-unpacked KVs by the element at Pos.
 %% Relies on FDB key ordering to keep groups contiguous.
 -spec group_by_pos(pos_integer(), [{tuple(), binary(), binary()}]) ->
@@ -567,4 +581,16 @@ binary_chunk_every(Bin, Size, Acc) ->
             binary_chunk_every(Rest, Size, [Chunk | Acc]);
         Chunk ->
             lists:reverse([Chunk | Acc])
+    end.
+
+set_version({Tx, Dir}, BaseKey, Options) ->
+    case proplists:get_value(versioned, Options, false) of
+        true ->
+            B = dgen_config:backend(),
+            VersionedBaseKey = dgen_key:extend(BaseKey, ?TAG_VERSION),
+            B:set_versionstamped_value(
+                Tx, B:dir_pack(Dir, VersionedBaseKey), <<0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0>>
+            );
+        false ->
+            ok
     end.

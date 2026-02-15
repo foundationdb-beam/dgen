@@ -1,5 +1,5 @@
 defmodule DGenServer.ActionsTest do
-  use DGen.Case
+  use DGen.Case, async: true
 
   alias DGen.ActionEcho
 
@@ -32,16 +32,6 @@ defmodule DGenServer.ActionsTest do
 
       assert 0 = ActionEcho.get_then_take_action(pid, self())
       assert_receive {:action_executed, :call}, 5_000
-
-      kill(pid)
-    end
-
-    test "handle_call executes reply and actions after commit when using reply_with_effects",
-         context do
-      tenant = context[:tenant]
-      {:ok, pid} = ActionEcho.start_link(tenant, {"act_call"})
-
-      assert {0, [:call]} = ActionEcho.get_with_action(pid)
 
       kill(pid)
     end

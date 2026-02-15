@@ -1,5 +1,5 @@
 defmodule DGenModStateCodec.Test do
-  use DGen.Case
+  use DGen.Case, async: true
 
   defp base_key, do: {<<"test">>, <<"codec">>, <<"s">>}
 
@@ -8,33 +8,33 @@ defmodule DGenModStateCodec.Test do
   describe "term encoding" do
     test "round-trips an integer", %{tenant: tenant} do
       key = base_key()
-      :ok = :dgen_mod_state_codec.set(tenant, key, 42)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, 42)
       assert {:ok, 42} = :dgen_mod_state_codec.get(tenant, key)
     end
 
     test "round-trips a binary", %{tenant: tenant} do
       key = base_key()
-      :ok = :dgen_mod_state_codec.set(tenant, key, <<"hello world">>)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, <<"hello world">>)
       assert {:ok, <<"hello world">>} = :dgen_mod_state_codec.get(tenant, key)
     end
 
     test "round-trips a tuple", %{tenant: tenant} do
       key = base_key()
-      :ok = :dgen_mod_state_codec.set(tenant, key, {:ok, [1, 2, 3]})
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, {:ok, [1, 2, 3]})
       assert {:ok, {:ok, [1, 2, 3]}} = :dgen_mod_state_codec.get(tenant, key)
     end
 
     test "round-trips a map with non-atom keys as term", %{tenant: tenant} do
       key = base_key()
       state = %{<<"binary_key">> => 1, 42 => :val}
-      :ok = :dgen_mod_state_codec.set(tenant, key, state)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, state)
       assert {:ok, ^state} = :dgen_mod_state_codec.get(tenant, key)
     end
 
     test "round-trips a list without id keys as term", %{tenant: tenant} do
       key = base_key()
       state = [%{name: "a"}, %{name: "b"}]
-      :ok = :dgen_mod_state_codec.set(tenant, key, state)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, state)
       assert {:ok, ^state} = :dgen_mod_state_codec.get(tenant, key)
     end
 
@@ -42,7 +42,7 @@ defmodule DGenModStateCodec.Test do
       key = base_key()
       # 250KB binary, needs 3 chunks at 100KB each
       large = :crypto.strong_rand_bytes(250_000)
-      :ok = :dgen_mod_state_codec.set(tenant, key, large)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, large)
       assert {:ok, ^large} = :dgen_mod_state_codec.get(tenant, key)
     end
   end
@@ -52,21 +52,21 @@ defmodule DGenModStateCodec.Test do
   describe "assigns map encoding" do
     test "round-trips an empty map", %{tenant: tenant} do
       key = base_key()
-      :ok = :dgen_mod_state_codec.set(tenant, key, %{})
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, %{})
       assert {:ok, %{}} = :dgen_mod_state_codec.get(tenant, key)
     end
 
     test "round-trips a simple assigns map", %{tenant: tenant} do
       key = base_key()
       state = %{count: 5, name: <<"alice">>, active: true}
-      :ok = :dgen_mod_state_codec.set(tenant, key, state)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, state)
       assert {:ok, ^state} = :dgen_mod_state_codec.get(tenant, key)
     end
 
     test "round-trips nested assigns maps", %{tenant: tenant} do
       key = base_key()
       state = %{user: %{name: <<"bob">>, age: 30}, settings: %{theme: :dark}}
-      :ok = :dgen_mod_state_codec.set(tenant, key, state)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, state)
       assert {:ok, ^state} = :dgen_mod_state_codec.get(tenant, key)
     end
 
@@ -74,7 +74,7 @@ defmodule DGenModStateCodec.Test do
       key = base_key()
       large = :crypto.strong_rand_bytes(250_000)
       state = %{data: large, label: <<"test">>}
-      :ok = :dgen_mod_state_codec.set(tenant, key, state)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, state)
       assert {:ok, ^state} = :dgen_mod_state_codec.get(tenant, key)
     end
   end
@@ -84,14 +84,14 @@ defmodule DGenModStateCodec.Test do
   describe "component list encoding" do
     test "round-trips an empty list", %{tenant: tenant} do
       key = base_key()
-      :ok = :dgen_mod_state_codec.set(tenant, key, [])
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, [])
       assert {:ok, []} = :dgen_mod_state_codec.get(tenant, key)
     end
 
     test "round-trips a single-item list", %{tenant: tenant} do
       key = base_key()
       state = [%{id: <<"a">>, value: 1}]
-      :ok = :dgen_mod_state_codec.set(tenant, key, state)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, state)
       assert {:ok, ^state} = :dgen_mod_state_codec.get(tenant, key)
     end
 
@@ -104,7 +104,7 @@ defmodule DGenModStateCodec.Test do
         %{id: <<"m">>, value: 2}
       ]
 
-      :ok = :dgen_mod_state_codec.set(tenant, key, state)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, state)
       assert {:ok, ^state} = :dgen_mod_state_codec.get(tenant, key)
     end
 
@@ -116,7 +116,7 @@ defmodule DGenModStateCodec.Test do
         %{id: <<"footer">>, type: :text, content: <<"Bye">>, visible: false}
       ]
 
-      :ok = :dgen_mod_state_codec.set(tenant, key, state)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, state)
       assert {:ok, ^state} = :dgen_mod_state_codec.get(tenant, key)
     end
   end
@@ -135,7 +135,7 @@ defmodule DGenModStateCodec.Test do
         ]
       }
 
-      :ok = :dgen_mod_state_codec.set(tenant, key, state)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, state)
       assert {:ok, ^state} = :dgen_mod_state_codec.get(tenant, key)
     end
 
@@ -153,7 +153,7 @@ defmodule DGenModStateCodec.Test do
         count: 3
       }
 
-      :ok = :dgen_mod_state_codec.set(tenant, key, state)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, state)
       assert {:ok, ^state} = :dgen_mod_state_codec.get(tenant, key)
     end
 
@@ -167,7 +167,7 @@ defmodule DGenModStateCodec.Test do
         ]
       }
 
-      :ok = :dgen_mod_state_codec.set(tenant, key, state)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, state)
       assert {:ok, ^state} = :dgen_mod_state_codec.get(tenant, key)
     end
   end
@@ -177,7 +177,7 @@ defmodule DGenModStateCodec.Test do
   describe "clear/2" do
     test "clears all state", %{tenant: tenant} do
       key = base_key()
-      :ok = :dgen_mod_state_codec.set(tenant, key, %{a: 1, b: 2})
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, %{a: 1, b: 2})
       assert {:ok, _} = :dgen_mod_state_codec.get(tenant, key)
       :ok = :dgen_mod_state_codec.clear(tenant, key)
       assert {:error, :not_found} = :dgen_mod_state_codec.get(tenant, key)
@@ -194,17 +194,17 @@ defmodule DGenModStateCodec.Test do
   describe "set/3 overwrite" do
     test "overwriting with a different type clears old data", %{tenant: tenant} do
       key = base_key()
-      :ok = :dgen_mod_state_codec.set(tenant, key, %{a: 1, b: 2})
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, %{a: 1, b: 2})
       assert {:ok, %{a: 1, b: 2}} = :dgen_mod_state_codec.get(tenant, key)
 
-      :ok = :dgen_mod_state_codec.set(tenant, key, 42)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, 42)
       assert {:ok, 42} = :dgen_mod_state_codec.get(tenant, key)
     end
 
     test "overwriting map with list", %{tenant: tenant} do
       key = base_key()
-      :ok = :dgen_mod_state_codec.set(tenant, key, %{x: 1})
-      :ok = :dgen_mod_state_codec.set(tenant, key, [%{id: <<"a">>, v: 1}])
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, %{x: 1})
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, [%{id: <<"a">>, v: 1}])
       assert {:ok, [%{id: <<"a">>, v: 1}]} = :dgen_mod_state_codec.get(tenant, key)
     end
   end
@@ -215,7 +215,7 @@ defmodule DGenModStateCodec.Test do
     test "no-op when state is identical", %{tenant: tenant} do
       key = base_key()
       state = %{a: 1, b: 2}
-      :ok = :dgen_mod_state_codec.set(tenant, key, state)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, state)
       :ok = :dgen_mod_state_codec.set(tenant, key, state, state)
       assert {:ok, ^state} = :dgen_mod_state_codec.get(tenant, key)
     end
@@ -224,7 +224,7 @@ defmodule DGenModStateCodec.Test do
       key = base_key()
       old = %{a: 1, b: 2, c: 3}
       new = %{a: 1, b: 99, c: 3}
-      :ok = :dgen_mod_state_codec.set(tenant, key, old)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, old)
       :ok = :dgen_mod_state_codec.set(tenant, key, old, new)
       assert {:ok, ^new} = :dgen_mod_state_codec.get(tenant, key)
     end
@@ -233,7 +233,7 @@ defmodule DGenModStateCodec.Test do
       key = base_key()
       old = %{a: 1}
       new = %{a: 1, b: 2}
-      :ok = :dgen_mod_state_codec.set(tenant, key, old)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, old)
       :ok = :dgen_mod_state_codec.set(tenant, key, old, new)
       assert {:ok, ^new} = :dgen_mod_state_codec.get(tenant, key)
     end
@@ -242,7 +242,7 @@ defmodule DGenModStateCodec.Test do
       key = base_key()
       old = %{a: 1, b: 2}
       new = %{a: 1}
-      :ok = :dgen_mod_state_codec.set(tenant, key, old)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, old)
       :ok = :dgen_mod_state_codec.set(tenant, key, old, new)
       assert {:ok, ^new} = :dgen_mod_state_codec.get(tenant, key)
     end
@@ -251,7 +251,7 @@ defmodule DGenModStateCodec.Test do
       key = base_key()
       old = %{a: 1, b: 2, c: 3}
       new = %{a: 10, c: 3, d: 4}
-      :ok = :dgen_mod_state_codec.set(tenant, key, old)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, old)
       :ok = :dgen_mod_state_codec.set(tenant, key, old, new)
       assert {:ok, ^new} = :dgen_mod_state_codec.get(tenant, key)
     end
@@ -260,7 +260,7 @@ defmodule DGenModStateCodec.Test do
       key = base_key()
       old = %{user: %{name: <<"alice">>, age: 30}, status: :active}
       new = %{user: %{name: <<"alice">>, age: 31}, status: :active}
-      :ok = :dgen_mod_state_codec.set(tenant, key, old)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, old)
       :ok = :dgen_mod_state_codec.set(tenant, key, old, new)
       assert {:ok, ^new} = :dgen_mod_state_codec.get(tenant, key)
     end
@@ -269,7 +269,7 @@ defmodule DGenModStateCodec.Test do
       key = base_key()
       old = %{a: 1}
       new = 42
-      :ok = :dgen_mod_state_codec.set(tenant, key, old)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, old)
       :ok = :dgen_mod_state_codec.set(tenant, key, old, new)
       assert {:ok, 42} = :dgen_mod_state_codec.get(tenant, key)
     end
@@ -279,7 +279,7 @@ defmodule DGenModStateCodec.Test do
     test "no-op when list is identical", %{tenant: tenant} do
       key = base_key()
       state = [%{id: <<"a">>, v: 1}, %{id: <<"b">>, v: 2}]
-      :ok = :dgen_mod_state_codec.set(tenant, key, state)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, state)
       :ok = :dgen_mod_state_codec.set(tenant, key, state, state)
       assert {:ok, ^state} = :dgen_mod_state_codec.get(tenant, key)
     end
@@ -288,7 +288,7 @@ defmodule DGenModStateCodec.Test do
       key = base_key()
       old = [%{id: <<"a">>, v: 1}, %{id: <<"b">>, v: 2}]
       new = [%{id: <<"a">>, v: 99}, %{id: <<"b">>, v: 2}]
-      :ok = :dgen_mod_state_codec.set(tenant, key, old)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, old)
       :ok = :dgen_mod_state_codec.set(tenant, key, old, new)
       assert {:ok, ^new} = :dgen_mod_state_codec.get(tenant, key)
     end
@@ -297,7 +297,7 @@ defmodule DGenModStateCodec.Test do
       key = base_key()
       old = [%{id: <<"a">>, v: 1}, %{id: <<"b">>, v: 2}, %{id: <<"c">>, v: 3}]
       new = [%{id: <<"a">>, v: 1}, %{id: <<"c">>, v: 3}]
-      :ok = :dgen_mod_state_codec.set(tenant, key, old)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, old)
       :ok = :dgen_mod_state_codec.set(tenant, key, old, new)
       assert {:ok, ^new} = :dgen_mod_state_codec.get(tenant, key)
     end
@@ -306,7 +306,7 @@ defmodule DGenModStateCodec.Test do
       key = base_key()
       old = [%{id: <<"a">>, v: 1}]
       new = [%{id: <<"a">>, v: 1}, %{id: <<"b">>, v: 2}]
-      :ok = :dgen_mod_state_codec.set(tenant, key, old)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, old)
       :ok = :dgen_mod_state_codec.set(tenant, key, old, new)
       assert {:ok, ^new} = :dgen_mod_state_codec.get(tenant, key)
     end
@@ -315,7 +315,7 @@ defmodule DGenModStateCodec.Test do
       key = base_key()
       old = [%{id: <<"b">>, v: 2}]
       new = [%{id: <<"a">>, v: 1}, %{id: <<"b">>, v: 2}]
-      :ok = :dgen_mod_state_codec.set(tenant, key, old)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, old)
       :ok = :dgen_mod_state_codec.set(tenant, key, old, new)
       assert {:ok, ^new} = :dgen_mod_state_codec.get(tenant, key)
     end
@@ -324,7 +324,7 @@ defmodule DGenModStateCodec.Test do
       key = base_key()
       old = [%{id: <<"a">>, v: 1}, %{id: <<"c">>, v: 3}]
       new = [%{id: <<"a">>, v: 1}, %{id: <<"b">>, v: 2}, %{id: <<"c">>, v: 3}]
-      :ok = :dgen_mod_state_codec.set(tenant, key, old)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, old)
       :ok = :dgen_mod_state_codec.set(tenant, key, old, new)
       assert {:ok, ^new} = :dgen_mod_state_codec.get(tenant, key)
     end
@@ -332,7 +332,7 @@ defmodule DGenModStateCodec.Test do
     test "preserves order after multiple diffs", %{tenant: tenant} do
       key = base_key()
       v1 = [%{id: <<"a">>, v: 1}, %{id: <<"b">>, v: 2}, %{id: <<"c">>, v: 3}]
-      :ok = :dgen_mod_state_codec.set(tenant, key, v1)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, v1)
 
       # Remove b, add d at end
       v2 = [%{id: <<"a">>, v: 1}, %{id: <<"c">>, v: 3}, %{id: <<"d">>, v: 4}]
@@ -375,7 +375,7 @@ defmodule DGenModStateCodec.Test do
         ]
       }
 
-      :ok = :dgen_mod_state_codec.set(tenant, key, old)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, old)
       :ok = :dgen_mod_state_codec.set(tenant, key, old, new)
       assert {:ok, ^new} = :dgen_mod_state_codec.get(tenant, key)
     end
@@ -393,7 +393,7 @@ defmodule DGenModStateCodec.Test do
         %{id: <<"c2">>, config: %{color: :blue, size: 20}}
       ]
 
-      :ok = :dgen_mod_state_codec.set(tenant, key, old)
+      :ok = :dgen_mod_state_codec.set(tenant, key, :undefined, old)
       :ok = :dgen_mod_state_codec.set(tenant, key, old, new)
       assert {:ok, ^new} = :dgen_mod_state_codec.get(tenant, key)
     end
@@ -410,7 +410,7 @@ defmodule DGenModStateCodec.Test do
       result =
         b.transactional(db, fn tx ->
           td = {tx, dir}
-          :ok = :dgen_mod_state_codec.set(td, key, %{a: 1})
+          :ok = :dgen_mod_state_codec.set(td, key, :undefined, %{a: 1})
           :dgen_mod_state_codec.get(td, key)
         end)
 

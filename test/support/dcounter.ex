@@ -2,6 +2,10 @@ defmodule DGen.DCounter do
   use DGenServer
 
   def start_link(tenant, tuid), do: DGenServer.start_link(__MODULE__, [tuid], tenant: tenant)
+
+  def start_link_opts(tenant, tuid, opts),
+    do: DGenServer.start_link(__MODULE__, [tuid], [{:tenant, tenant} | opts])
+
   def get(pid), do: DGenServer.call(pid, :get)
   def get_blob(pid, size), do: DGenServer.call(pid, {:get_blob, size})
   def incr(pid, n \\ 1), do: DGenServer.cast(pid, {:incr, n})
