@@ -72,7 +72,7 @@ argument is the
 -callback handle_locked(EventType :: event_type(), Msg :: term(), State :: state()) ->
     reply_ret() | noreply_ret() | stop_ret().
 
--optional_callbacks([handle_cast/2, handle_call/3, handle_info/2]).
+-optional_callbacks([handle_cast/2, handle_call/3, handle_info/2, handle_locked/3]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
@@ -324,7 +324,12 @@ handle_call(
                     LocalReply = {reply, Reply},
                     {reply, LocalReply, State3};
                 {{lock, EventType, Msg}, ModState, State2} ->
-                    consume_locked(EventType, Msg, ModState, true, State2);
+                    case consume_locked(EventType, Msg, ModState, true, State2) of
+                        {reply, Reply, State3} ->
+                            {reply, {reply, Reply}, State3};
+                        Other ->
+                            Other
+                    end;
                 {stop, Reason, State2} ->
                     {stop, Reason, State2};
                 {push, From, NewWatch, State1} ->
@@ -430,12 +435,12 @@ invoke_tx_callback(Td, Callback, Args, State = #state{mod = Mod}) ->
     end.
 
 invoke_handle_locked_callback(EventType, Msg, ModState, State = #state{mod = Mod}) ->
-    case erlang:function_exported(Mod, handle_locked, 2) of
+    case erlang:function_exported(Mod, handle_locked, 3) of
         true ->
             CallbackResult = erlang:apply(Mod, handle_locked, [EventType, Msg, ModState]),
             {ok, ModState, CallbackResult, State};
         false ->
-            {error, {function_not_exported, {Mod, handle_locked, 2}}}
+            {error, {function_not_exported, {Mod, handle_locked, 3}}}
     end.
 
 modify_args_for_callback(_, Args, ModState) ->
@@ -535,6 +540,26 @@ handle_callback_result(
 ) ->
     {_, State1} = set_mod_state(Td, OrigModState, ModState, State),
     {{noreply, Actions}, ModState, State1};
+handle_callback_result(
+    Td, handle_locked, _EventType, _Msg, {noreply, ModState}, OrigModState, State
+) ->
+    {_, State1} = set_mod_state(Td, OrigModState, ModState, State),
+    {{noreply, []}, ModState, State1};
+handle_callback_result(
+    Td, handle_locked, _EventType, _Msg, {noreply, ModState, Actions}, OrigModState, State
+) ->
+    {_, State1} = set_mod_state(Td, OrigModState, ModState, State),
+    {{noreply, Actions}, ModState, State1};
+handle_callback_result(
+    Td, handle_locked, _EventType, _Msg, {reply, Reply, ModState}, OrigModState, State
+) ->
+    {_, State1} = set_mod_state(Td, OrigModState, ModState, State),
+    {{reply, Reply, []}, ModState, State1};
+handle_callback_result(
+    Td, handle_locked, _EventType, _Msg, {reply, Reply, ModState, Actions}, OrigModState, State
+) ->
+    {_, State1} = set_mod_state(Td, OrigModState, ModState, State),
+    {{reply, Reply, Actions}, ModState, State1};
 handle_callback_result(Td, _Callback, EventType, Msg, {lock, ModState}, OrigModState, State) ->
     {_, State1} = set_mod_state(Td, OrigModState, ModState, State),
     State2 = set_lock(Td, State1),
@@ -616,64 +641,55 @@ consume_cast(Td, Request, State) ->
     end.
 
 consume_locked(EventType, Msg, ModState, IsLocalReply, State = #state{tenant = Tenant}) ->
-    B = dgen_config:backend(),
-
     Result =
         try invoke_handle_locked_callback(EventType, Msg, ModState, State) of
             {error, Reason} ->
-                B:transactional(Tenant, fun(Td) ->
-                    clear_lock(Td, State)
-                end),
                 erlang:error(Reason);
             {ok, OrigModState, CallbackResult, State1} ->
-                B:transactional(Tenant, fun(Td) ->
-                    try
-                        case
-                            handle_callback_result(
-                                Td,
-                                handle_locked,
-                                EventType,
-                                Msg,
-                                CallbackResult,
-                                OrigModState,
-                                State1
-                            )
-                        of
-                            {{reply, Reply, Actions}, ModState, State1} ->
-                                {call, From} = EventType,
-                                if
-                                    IsLocalReply ->
-                                        {{reply, Reply, Actions}, ModState, State1};
-                                    true ->
-                                        set_reply(Td, From, Reply),
-                                        {{noreply, Actions}, ModState, State1}
-                                end;
-                            {{noreply, Actions}, ModState, State1} ->
-                                {{noreply, Actions}, ModState, State1};
-                            {stop, Reason, State1} ->
-                                {{stop, Reason}, ModState, State1}
-                        end
-                    after
-                        clear_lock(Td, State1)
+                dgen_backend:transactional(Tenant, fun(Td) ->
+                    case
+                        handle_callback_result(
+                            Td,
+                            handle_locked,
+                            EventType,
+                            Msg,
+                            CallbackResult,
+                            OrigModState,
+                            State1
+                        )
+                    of
+                        {{reply, Reply, Actions}, LModState, State2} ->
+                            {call, From} = EventType,
+                            if
+                                IsLocalReply ->
+                                    {{reply, Reply, Actions}, LModState, State2};
+                                true ->
+                                    set_reply(Td, From, Reply),
+                                    {{noreply, Actions}, LModState, State2}
+                            end;
+                        {{noreply, Actions}, LModState, State2} ->
+                            {{noreply, Actions}, LModState, State2};
+                        {stop, Reason, State2} ->
+                            {{stop, Reason}, undefined, State2}
                     end
                 end)
         after
-            B:transactional(Tenant, fun(Td) ->
+            dgen_backend:transactional(Tenant, fun(Td) ->
                 clear_lock(Td, State)
             end)
         end,
 
     case Result of
-        {{reply, Reply, Actions}, ModState, State2} ->
-            State3 = resolve_version(State2),
-            _ = handle_actions(Actions, [], ModState),
-            {reply, Reply, State3};
-        {{noreply, Actions}, ModState, State2} ->
-            State3 = resolve_version(State2),
-            _ = handle_actions(Actions, [], ModState),
-            {noreply, State3};
-        {{stop, Reason1}, _ModState, State2} ->
-            {stop, Reason1, State2}
+        {{reply, Reply, Actions}, LModState, State3} ->
+            State4 = resolve_version(State3),
+            _ = handle_actions(Actions, [], LModState),
+            {reply, Reply, State4};
+        {{noreply, Actions}, LModState, State3} ->
+            State4 = resolve_version(State3),
+            _ = handle_actions(Actions, [], LModState),
+            {noreply, State4};
+        {{stop, Reason1}, _LModState, State3} ->
+            {stop, Reason1, State3}
     end.
 
 consume_info(Td, Info, State) ->
@@ -719,7 +735,8 @@ set_lock({Tx, Dir}, State = #state{tuid = Tuid}) ->
 
 clear_lock(Td = {Tx, Dir}, #state{tuid = Tuid}) ->
     B = dgen_config:backend(),
-    B:clear(Tx, B:dir_pack(Dir, get_lock_key(Tuid))),
+    LockKey = B:dir_pack(Dir, get_lock_key(Tuid)),
+    B:clear_range(Tx, LockKey, B:key_strinc(LockKey)),
     dgen_queue:notify(Td, Tuid).
 
 get_lock_key(Tuid) ->
