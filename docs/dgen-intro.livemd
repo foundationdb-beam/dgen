@@ -7,7 +7,9 @@ Mix.install([
 ])
 ```
 
-## Section
+## Regular GenServer
+
+A simple chat server that stores messages in memory.
 
 ```elixir
 defmodule Message do
@@ -56,6 +58,8 @@ end
 {:ok, pid} = Chat.start()
 ```
 
+Send a message and get a response.
+
 ```elixir
 Chat.new_message(pid, "Alice", "Hello there")
 ```
@@ -64,13 +68,21 @@ Chat.new_message(pid, "Alice", "Hello there")
 Chat.history(pid)
 ```
 
+Now restart the server.
+
 ```elixir
 {:ok, pid} = Chat.restart(pid)
 ```
 
+**The history is lost** — regular GenServers don't persist state.
+
 ```elixir
 Chat.history(pid)
 ```
+
+## Durable GenServer
+
+The same chat server, but using `DGenServer` for automatic persistence.
 
 ```elixir
 defmodule DChat do
@@ -116,6 +128,8 @@ b = :dgen_config.backend()
 tenant = b.sandbox_open("DGen.Livebook", "Intro")
 ```
 
+Create a tenant to isolate this server's data.
+
 ```elixir
 {:ok, pid} = DChat.start(tenant)
 ```
@@ -128,9 +142,13 @@ DChat.new_message(pid, "Bob", "Greetings")
 DChat.history(pid)
 ```
 
+Restart the durable server.
+
 ```elixir
 {:ok, pid} = DChat.restart(pid, tenant)
 ```
+
+**The history persists** — DGenServer automatically saves and restores state.
 
 ```elixir
 DChat.history(pid)
