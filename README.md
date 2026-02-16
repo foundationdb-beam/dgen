@@ -14,7 +14,7 @@ written with only gen_servers.
 
 ## Getting Started
 
-The simplest durable server is just a regular gen_server with `dgen_server` behavior:
+The simplest distributed server is just a regular gen_server with `dgen_server` behavior:
 
 ```erlang
 -module(counter).
@@ -27,10 +27,10 @@ start(Tenant) ->
     dgen_server:start(?MODULE, [], [{tenant, Tenant}]).
 
 increment(Pid) ->
-    gen_server:call(Pid, increment).
+    dgen_server:call(Pid, increment).
 
 value(Pid) ->
-    gen_server:call(Pid, value).
+    dgen_server:call(Pid, value).
 
 init([]) ->
     {ok, 0}.
@@ -41,18 +41,17 @@ handle_call(value, _From, State) ->
     {reply, State, State}.
 ```
 
-Start it with a tenant, and the state persists across restarts:
+Start it inside a FoundationDB directory, and the state persists across restarts:
 
 ```erlang
-B = dgen_config:backend(),
-Tenant = B:sandbox_open(<<"demo">>, <<"counter">>),
+Tenant = dgen_erlfdb:sandbox_open(<<"demo">>, <<"counter">>),
 {ok, Pid} = counter:start(Tenant),
 counter:increment(Pid),
 counter:increment(Pid),
 2 = counter:value(Pid),
 
 %% Restart the process
-gen_server:stop(Pid),
+dgen_server:stop(Pid),
 {ok, Pid2} = counter:start(Tenant),
 2 = counter:value(Pid2).  %% State persisted!
 ```
@@ -61,26 +60,26 @@ gen_server:stop(Pid),
 
 ### Message Processing
 
-DGenServer provides different message paths with different guarantees:
+`dgen_server` provides different message paths with different guarantees:
 
 **Standard messages** (`call`, `cast`):
 - Processed with strict serializability via the durable queue
 - Execute within a database transaction (subject to FDB transaction limits)
-- **Must not include side effects** — callbacks must be pure with respect to external systems
+- Must not include side effects. Callbacks must be pure with respect to external systems
 - Respect the lock (see Locking below)
 
 **Priority messages** (`priority_call`, `priority_cast`, `handle_info`):
 - Skip the durable queue and execute immediately
 - Still execute within a database transaction (subject to FDB transaction limits)
-- **Must not include side effects**
-- Do **not** respect the lock — always execute even when locked
+- Must not include side effects
+- Do not respect the lock. Always execute even when locked
 
 ### Actions
 
 Callbacks may return `{reply, Reply, State, Actions}` or `{noreply, State, Actions}` where `Actions` is a list of 1-arity functions. These functions:
-- Execute **after** the transaction commits
+- Execute after the transaction commits
 - Receive the committed `State` as their argument
-- Are the **correct place for side effects** — logging, telemetry, publishing to external systems
+- Are the correct place for side effects: logging, telemetry, publishing to external systems
 - Can return `halt` to stop processing actions, or any other value to continue
 
 ### Locking
@@ -89,7 +88,7 @@ A callback may return `{lock, State}` to enter locked mode. When locked:
 
 - Standard `call` and `cast` messages are queued but not processed
 - Priority messages and `handle_info` continue to execute
-- The `handle_locked/3` callback is invoked **outside of a transaction**
+- The `handle_locked/3` callback is invoked outside of a transaction
   - Not subject to FDB transaction limits
   - Side effects are permitted
   - Can modify state, which is written back to the database
@@ -102,11 +101,11 @@ Use locking for long-running operations that would exceed transaction time limit
 
 State is persisted to the key-value store using a structured encoding scheme that optimizes for partial updates. Three encoding types are supported:
 
-1. **Assigns map** — Maps with all atom keys are split across separate keys, one per entry. Each key uses `atom_to_binary(Key)` in the storage path. No ordering guarantees.
+1. **Assigns map**: Maps with all atom keys are split across separate keys, one per entry. No ordering guarantees.
 
-2. **Components list** — Lists where every item is a map with an atom `id` key containing a binary value. Each item is stored separately with ordering maintained via fractional indexing in the storage key.
+2. **Components list**: Lists where every item is a map with an atom `id` key containing a binary value. Each item is stored separately with ordering maintained via fractional indexing in the storage key.
 
-3. **Term** (fallback) — All other terms use `term_to_binary` and are chunked into 100KB values.
+3. **Term**: All other terms use `term_to_binary` and are chunked into 100KB values.
 
 The encoder handles nested structures recursively. For example, an assigns map containing a components list will nest both encodings in the key path.
 
