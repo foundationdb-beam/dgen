@@ -292,6 +292,8 @@ handle_call(
                 {push, From, NewWatch, State0}
             end,
 
+            % @todo if the callback throws, we need to push the call to provide the same behavior as
+            % the normal path
             Result = dgen_backend:transactional(Tenant, fun(Td) ->
                 case dgen_queue:length(Td, State#state.tuid) of
                     0 ->

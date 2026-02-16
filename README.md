@@ -122,6 +122,41 @@ A single consumer process maintains an in-memory cache of the mod_state paired w
 
 The cache is invalidated when the process detects that another consumer has modified the state.
 
+### Crashing
+
+DGenServer is designed to survive crashes at any point in message processing. What happens depends on where the crash occurs:
+
+**During `init/1`:**
+- If `init/1` crashes, the gen_server process exits before any state is persisted
+- When restarted (e.g., by a supervisor), `init/1` runs again from scratch
+- No durable state exists yet, so there's nothing to recover
+
+**During transactional callbacks (`handle_call`, `handle_cast`, `handle_info`):**
+- The database transaction is automatically aborted — no state changes are committed
+- For `call` and `cast`: the message remains in the durable queue and will be retried by the next consumer
+- For `priority_call` and `priority_cast`: the message is lost (it never entered the queue)
+- For `handle_info`: the Erlang message is lost (info messages are not durable)
+- State remains unchanged from before the callback was invoked
+
+**During `handle_locked`:**
+- `handle_locked` executes outside a transaction, so previous state changes have already been persisted
+- If the crash is an Erlang/Elixir throw, then the lock is cleared
+- If the crash is a system disruption such as SegFault, OOM, or sudden power loss, the lock is not cleared and the dgen_server is deadlocked
+- The triggering message has been consumed from the queue, so it will not be retried
+
+**During action execution:**
+- Actions run after the transaction commits, so state changes are already persisted
+- If an action crashes, the state update succeeds but remaining actions are not executed
+- The message has been consumed from the queue and will not be retried
+
+**Supervisor restart:**
+- When a dgen_server is restarted by a supervisor, it reads existing state from the database
+- If state exists, `init/1` is called, but the initial state is ignored. The server resumes with the persisted state
+- The process immediately begins consuming any queued messages, if it's configured to do so
+- Multiple processes can safely consume from the same queue; they coordinate via database transactions
+
+**Key guarantee:** Standard `call` and `cast` messages are processed **at-least-once**. If a crash occurs before the transaction commits, the message will be retried. Design your callbacks to be idempotent when possible.
+
 ## Installation
 
 If [available in Hex](https://hex.pm/docs/publish), the package can be installed
