@@ -100,7 +100,8 @@ argument is the
     cache :: boolean(),
     mod_state_cache ::
         undefined
-        | {dgen_backend:versionstamp() | dgen_backend:future(), {ok, term()} | {error, not_found}}
+        | {dgen_backend:versionstamp() | dgen_backend:future(), {ok, term()} | {error, not_found}},
+    cache_misses = 0 :: non_neg_integer()
 }).
 
 -if(?DOCATTRS).
@@ -348,6 +349,9 @@ handle_cast(consume, State = #state{tenant = Tenant, tuid = Tuid}) ->
     K = 1,
     Ret = handle_consume(Tenant, K, Tuid, State),
     case Ret of
+        {noreply, #state{watch = undefined, cache_misses = Misses}} when Misses > 0 ->
+            Delay = min(1 bsl (Misses - 1), 50),
+            erlang:send_after(Delay, self(), consume_after_penalty);
         {noreply, #state{watch = undefined}} ->
             gen_server:cast(self(), consume);
         _ ->
@@ -378,6 +382,8 @@ handle_cast({kill, Reason}, State = #state{tenant = Tenant, tuid = Tuid}) ->
 -spec handle_info(term(), #state{}) -> {noreply, #state{}}.
 handle_info({Ref, ready}, State = #state{watch = ?FUTURE(Ref)}) ->
     handle_cast(consume, State#state{watch = undefined});
+handle_info(consume_after_penalty, State) ->
+    handle_cast(consume, State);
 handle_info(Info, State = #state{tenant = Tenant}) ->
     Result = dgen_backend:transactional(Tenant, fun(Td) ->
         consume_info(Td, Info, State)
@@ -471,11 +477,14 @@ get_mod_state(Td, State = #state{cache = true}) ->
         end,
     case dgen_mod_state_codec:get_version(Td, get_state_key(Tuid)) of
         {ok, Vsn} ->
-            {{ok, ModState}, State};
+            {{ok, ModState}, State#state{cache_misses = 0}};
         {ok, OtherVsn} ->
             ActualModStateResult = dgen_mod_state_codec:get(Td, get_state_key(Tuid)),
             MSCache1 = {OtherVsn, ActualModStateResult},
-            {ActualModStateResult, State#state{mod_state_cache = MSCache1}};
+            Misses = State#state.cache_misses,
+            {ActualModStateResult, State#state{
+                mod_state_cache = MSCache1, cache_misses = Misses + 1
+            }};
         {error, not_found} ->
             ActualModStateResult = dgen_mod_state_codec:get(Td, get_state_key(Tuid)),
             {ActualModStateResult, State#state{mod_state_cache = undefined}}
