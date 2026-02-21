@@ -2,9 +2,8 @@ name: CI
 
 on:
   push:
-    branches: ["*"]
+    branches: ["main"]
   pull_request:
-    branches: ["*"]
 
 jobs:
   lint:
@@ -36,10 +35,20 @@ jobs:
           path: _build/dev/*.plt
           key: ${{ matrix.os }}-otp_${{ matrix.otp }}-elixir_${{ matrix.elixir }}-plt_${{ hashFiles('**/mix.lock') }}
           restore-keys: ${{ matrix.os }}-otp_${{ matrix.otp }}-elixir_${{ matrix.elixir }}-plt_
-      - name: Install FoundationDB
+      - name: Cache FoundationDB packages
+        id: cache-fdb-lint
+        uses: actions/cache@v3
+        with:
+          path: /tmp/fdb-debs
+          key: fdb-clients-${{ matrix.fdb }}
+      - name: Download FoundationDB packages
+        if: steps.cache-fdb-lint.outputs.cache-hit != 'true'
         run: |
-          wget --quiet https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/foundationdb-clients_${FDB_VERSION}-1_amd64.deb
-          sudo dpkg -i foundationdb-clients_${FDB_VERSION}-1_amd64.deb
+          mkdir -p /tmp/fdb-debs
+          wget --quiet -O /tmp/fdb-debs/foundationdb-clients_${FDB_VERSION}-1_amd64.deb \
+            https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/foundationdb-clients_${FDB_VERSION}-1_amd64.deb
+      - name: Install FoundationDB
+        run: sudo dpkg -i /tmp/fdb-debs/foundationdb-clients_${FDB_VERSION}-1_amd64.deb
       - run: mix deps.get
       - run: mix lint
 
@@ -67,12 +76,24 @@ jobs:
           path: deps
           key: ${{ matrix.os }}-otp_${{ matrix.otp }}-elixir_${{ matrix.elixir }}-mix_${{ hashFiles('**/mix.lock') }}
           restore-keys: ${{ matrix.os }}-otp_${{ matrix.otp }}-elixir_${{ matrix.elixir }}-mix_
+      - name: Cache FoundationDB packages
+        id: cache-fdb-test
+        uses: actions/cache@v3
+        with:
+          path: /tmp/fdb-debs
+          key: fdb-${{ matrix.fdb }}
+      - name: Download FoundationDB packages
+        if: steps.cache-fdb-test.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /tmp/fdb-debs
+          wget --quiet -O /tmp/fdb-debs/foundationdb-clients_${FDB_VERSION}-1_amd64.deb \
+            https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/foundationdb-clients_${FDB_VERSION}-1_amd64.deb
+          wget --quiet -O /tmp/fdb-debs/foundationdb-server_${FDB_VERSION}-1_amd64.deb \
+            https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/foundationdb-server_${FDB_VERSION}-1_amd64.deb
       - name: Install FoundationDB
         run: |
-          wget --quiet https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/foundationdb-clients_${FDB_VERSION}-1_amd64.deb
-          wget --quiet https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/foundationdb-server_${FDB_VERSION}-1_amd64.deb
-          sudo dpkg -i foundationdb-clients_${FDB_VERSION}-1_amd64.deb
-          sudo dpkg -i foundationdb-server_${FDB_VERSION}-1_amd64.deb
+          sudo dpkg -i /tmp/fdb-debs/foundationdb-clients_${FDB_VERSION}-1_amd64.deb
+          sudo dpkg -i /tmp/fdb-debs/foundationdb-server_${FDB_VERSION}-1_amd64.deb
       - run: mix deps.get --only test
       - run: mix deps.compile
       - run: mix compile
