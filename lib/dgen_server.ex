@@ -1,6 +1,8 @@
 defmodule DGenServer do
   @callback init(args :: term) ::
-              {:ok, state :: term()} | {:ok, tuid :: tuple()} | {:error, reason :: term()}
+              {:ok, state :: term()}
+              | {:ok, tuid :: tuple(), state :: term()}
+              | {:error, reason :: term()}
 
   @callback handle_cast(msg :: term, state :: term) ::
               {:noreply, new_state :: term}
@@ -73,7 +75,7 @@ defmodule DGenServer do
         :dgen_server.start_link(tuple, module, init_arg, opts)
 
       {:nolink, {{:via, via_module, _term} = tuple, opts}} when is_atom(via_module) ->
-        :dgen_server.start_link(tuple, module, init_arg, opts)
+        :dgen_server.start(tuple, module, init_arg, opts)
 
       {_, {other, _}} ->
         raise ArgumentError, """

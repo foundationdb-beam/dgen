@@ -62,7 +62,7 @@ argument is the
 -type lock_ret() :: {lock, state()}.
 -type reply_ret() :: {reply, term(), state()} | {reply, term(), state(), [action()]}.
 -type noreply_ret() :: {noreply, state()} | {noreply, state(), [action()]}.
--type stop_ret() :: {stop, term(), state()}.
+-type stop_ret() :: {stop, term(), state()} | {stop, term(), state(), [action()]}.
 
 -callback init(Args :: term()) -> init_ret().
 -callback handle_cast(Msg :: term(), State :: state()) -> noreply_ret() | lock_ret() | stop_ret().
@@ -113,10 +113,8 @@ See `start_link/3` for details on `Mod`, `Arg`, and `Opts`.
 -endif.
 -spec start(module(), term(), options()) -> start_ret().
 start(Mod, Arg, Opts) ->
-    Consume = proplists:get_value(consume, Opts, true),
-    Reset = proplists:get_value(reset, Opts, false),
-    Cache = proplists:get_value(cache, Opts, true),
-    gen_server:start(?MODULE, {get_tenant(Opts), Mod, Arg, Consume, Reset, Cache}, Opts).
+    {Tenant, Consume, Reset, Cache} = parse_opts(Opts),
+    gen_server:start(?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache}, Opts).
 
 -if(?DOCATTRS).
 -doc """
@@ -127,10 +125,8 @@ See `start_link/3` for details on `Mod`, `Arg`, and `Opts`.
 -endif.
 -spec start(gen_server:server_name(), module(), term(), options()) -> start_ret().
 start(Reg, Mod, Arg, Opts) ->
-    Consume = proplists:get_value(consume, Opts, true),
-    Reset = proplists:get_value(reset, Opts, false),
-    Cache = proplists:get_value(cache, Opts, true),
-    gen_server:start(Reg, ?MODULE, {get_tenant(Opts), Mod, Arg, Consume, Reset, Cache}, Opts).
+    {Tenant, Consume, Reset, Cache} = parse_opts(Opts),
+    gen_server:start(Reg, ?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache}, Opts).
 
 -if(?DOCATTRS).
 -doc """
@@ -144,10 +140,8 @@ Starts a dgen_server process linked to the calling process.
 -endif.
 -spec start_link(module(), term(), options()) -> start_ret().
 start_link(Mod, Arg, Opts) ->
-    Consume = proplists:get_value(consume, Opts, true),
-    Reset = proplists:get_value(reset, Opts, false),
-    Cache = proplists:get_value(cache, Opts, true),
-    gen_server:start_link(?MODULE, {get_tenant(Opts), Mod, Arg, Consume, Reset, Cache}, Opts).
+    {Tenant, Consume, Reset, Cache} = parse_opts(Opts),
+    gen_server:start_link(?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache}, Opts).
 
 -if(?DOCATTRS).
 -doc """
@@ -158,10 +152,8 @@ See `start_link/3` for details on `Mod`, `Arg`, and `Opts`.
 -endif.
 -spec start_link(gen_server:server_name(), module(), term(), options()) -> start_ret().
 start_link(Reg, Mod, Arg, Opts) ->
-    Consume = proplists:get_value(consume, Opts, true),
-    Reset = proplists:get_value(reset, Opts, false),
-    Cache = proplists:get_value(cache, Opts, true),
-    gen_server:start_link(Reg, ?MODULE, {get_tenant(Opts), Mod, Arg, Consume, Reset, Cache}, Opts).
+    {Tenant, Consume, Reset, Cache} = parse_opts(Opts),
+    gen_server:start_link(Reg, ?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache}, Opts).
 
 -if(?DOCATTRS).
 -doc "Sends an asynchronous cast request to the dgen_server's durable queue.".
@@ -250,13 +242,16 @@ call keys. The process exits with `Reason`.
 kill(Server, Reason) ->
     gen_server:cast(Server, {kill, Reason}).
 
-get_tenant(Opts) ->
-    case proplists:get_value(tenant, Opts) of
-        undefined ->
-            erlang:error({badarg, required, tenant});
-        Tenant ->
-            Tenant
-    end.
+parse_opts(Opts) ->
+    Tenant =
+        case proplists:get_value(tenant, Opts) of
+            undefined -> erlang:error({badarg, required, tenant});
+            T -> T
+        end,
+    Consume = proplists:get_value(consume, Opts, true),
+    Reset = proplists:get_value(reset, Opts, false),
+    Cache = proplists:get_value(cache, Opts, true),
+    {Tenant, Consume, Reset, Cache}.
 
 -spec init(term()) -> {ok, #state{}} | {error, term()}.
 init({Tenant, Mod, Arg, Consume, Reset, Cache}) ->
@@ -270,63 +265,61 @@ init({Tenant, Mod, Arg, Consume, Reset, Cache}) ->
             Other
     end.
 
--spec handle_call(term(), gen_server:from(), #state{}) ->
-    {reply, term(), #state{}}.
-handle_call(
-    {call, Request, WatchTo, Options},
-    _LocalFrom,
-    State = #state{tenant = Tenant, tuid = Tuid, watch = Watch}
-) ->
-    case Watch of
-        undefined ->
-            {From, NewWatch} = dgen_backend:transactional(Tenant, fun(Td) ->
-                dgen:push_call(Td, Tuid, Request, WatchTo, Options)
-            end),
+-spec handle_call(term(), gen_server:from(), #state{}) -> {reply, term(), #state{}}.
+handle_call({call, Request, WatchTo, Options}, _LocalFrom, State = #state{watch = undefined}) ->
+    #state{tenant = Tenant, tuid = Tuid} = State,
+    {From, NewWatch} = dgen_backend:transactional(Tenant, fun(Td) ->
+        dgen:push_call(Td, Tuid, Request, WatchTo, Options)
+    end),
+    LocalReply = {noreply, {Tenant, From, NewWatch}},
+    {reply, LocalReply, State};
+handle_call({call, Request, WatchTo, Options}, _LocalFrom, State = #state{}) ->
+    #state{tenant = Tenant, tuid = Tuid} = State,
+    LocalFrom = make_ref(),
+
+    PushFun = fun(Td, State0) ->
+        {From, NewWatch} = dgen:push_call(Td, Tuid, Request, WatchTo, Options),
+        {push, From, NewWatch, State0}
+    end,
+
+    Result = dgen_backend:transactional(Tenant, fun(Td) ->
+        case dgen_queue:length(Td, State#state.tuid) of
+            0 ->
+                case is_locked(Td, State) of
+                    true ->
+                        PushFun(Td, State);
+                    false ->
+                        try
+                            consume_call(Td, Request, LocalFrom, State)
+                        catch
+                            Class:Reason:Stack ->
+                                _ = PushFun(Td, State),
+                                {throw, Class, Reason, Stack}
+                        end
+                end;
+            _ ->
+                PushFun(Td, State)
+        end
+    end),
+
+    case Result of
+        {{reply, Reply, Actions}, ModState, State2} ->
+            LocalReply = {reply, Reply},
+            finalize({{reply, LocalReply, Actions}, ModState, State2});
+        {{lock, EventType, Msg}, ModState, State2} ->
+            case consume_locked(EventType, Msg, ModState, true, State2) of
+                {reply, Reply, State3} ->
+                    {reply, {reply, Reply}, State3};
+                Other ->
+                    Other
+            end;
+        {{stop, Reason, Actions}, ModState, State2} ->
+            finalize({{stop, Reason, Actions}, ModState, State2});
+        {throw, Class, Reason, Stack} ->
+            erlang:raise(Class, Reason, Stack);
+        {push, From, NewWatch, State1} ->
             LocalReply = {noreply, {Tenant, From, NewWatch}},
-            {reply, LocalReply, State};
-        _ ->
-            LocalFrom = make_ref(),
-
-            PushFun = fun(Td, State0) ->
-                {From, NewWatch} = dgen:push_call(Td, Tuid, Request, WatchTo, Options),
-                {push, From, NewWatch, State0}
-            end,
-
-            % @todo if the callback throws, we need to push the call to provide the same behavior as
-            % the normal path
-            Result = dgen_backend:transactional(Tenant, fun(Td) ->
-                case dgen_queue:length(Td, State#state.tuid) of
-                    0 ->
-                        case is_locked(Td, State) of
-                            true ->
-                                PushFun(Td, State);
-                            false ->
-                                consume_call(Td, Request, LocalFrom, State)
-                        end;
-                    _ ->
-                        PushFun(Td, State)
-                end
-            end),
-
-            case Result of
-                {{reply, Reply, Actions}, ModState, State2} ->
-                    State3 = resolve_version(State2),
-                    _ = handle_actions(Actions, [], ModState),
-                    LocalReply = {reply, Reply},
-                    {reply, LocalReply, State3};
-                {{lock, EventType, Msg}, ModState, State2} ->
-                    case consume_locked(EventType, Msg, ModState, true, State2) of
-                        {reply, Reply, State3} ->
-                            {reply, {reply, Reply}, State3};
-                        Other ->
-                            Other
-                    end;
-                {stop, Reason, State2} ->
-                    {stop, Reason, State2};
-                {push, From, NewWatch, State1} ->
-                    LocalReply = {noreply, {Tenant, From, NewWatch}},
-                    {reply, LocalReply, State1}
-            end
+            {reply, LocalReply, State1}
     end;
 handle_call({priority, Request}, _From, State = #state{tenant = Tenant}) ->
     LocalFrom = make_ref(),
@@ -334,14 +327,10 @@ handle_call({priority, Request}, _From, State = #state{tenant = Tenant}) ->
         consume_call(Td, Request, LocalFrom, State)
     end),
     case Result of
-        {{reply, Reply, Actions}, ModState, State1} ->
-            State2 = resolve_version(State1),
-            _ = handle_actions(Actions, [], ModState),
-            {reply, Reply, State2};
         {{lock, EventType, Msg}, ModState, State1} ->
             consume_locked(EventType, Msg, ModState, true, State1);
-        {stop, Reason, State1} ->
-            {stop, Reason, State1}
+        _ ->
+            finalize(Result)
     end.
 
 -spec handle_cast(term(), #state{}) ->
@@ -368,20 +357,16 @@ handle_cast({priority, Request}, State = #state{tenant = Tenant}) ->
         consume_cast(Td, Request, State)
     end),
     case Result of
-        {{noreply, Actions}, ModState, State1} ->
-            State2 = resolve_version(State1),
-            _ = handle_actions(Actions, [], ModState),
-            {noreply, State2};
         {{lock, EventType, Msg}, ModState, State1} ->
             consume_locked(EventType, Msg, ModState, true, State1);
-        {stop, Reason, State1} ->
-            {stop, Reason, State1}
+        _ ->
+            finalize(Result)
     end;
 handle_cast({kill, Reason}, State = #state{tenant = Tenant, tuid = Tuid}) ->
     delete(Tenant, Tuid),
     {stop, Reason, State#state{mod_state_cache = undefined}}.
 
--spec handle_info(term(), #state{}) -> {noreply, #state{}}.
+-spec handle_info(term(), #state{}) -> {noreply, #state{}} | {stop, term(), #state{}}.
 handle_info({Ref, ready}, State = #state{watch = ?FUTURE(Ref)}) ->
     handle_cast(consume, State#state{watch = undefined});
 handle_info(consume_after_penalty, State) ->
@@ -390,12 +375,7 @@ handle_info(Info, State = #state{tenant = Tenant}) ->
     Result = dgen_backend:transactional(Tenant, fun(Td) ->
         consume_info(Td, Info, State)
     end),
-    case Result of
-        {{noreply, Actions}, ModState, State2} ->
-            State3 = resolve_version(State2),
-            _ = handle_actions(Actions, [], ModState),
-            {noreply, State3}
-    end.
+    finalize(Result).
 
 -spec terminate(term(), #state{}) -> ok.
 terminate(_Reason, _State) ->
@@ -513,60 +493,44 @@ set_mod_state(Td = {Tx, _Dir}, OrigModState, ModState, State = #state{cache = Ca
         end,
     {Result, State1}.
 
-handle_callback_result(Td, handle_cast, _EventType, _Msg, {noreply, ModState}, OrigModState, State) ->
+handle_callback_result(Td, _EventType, _Msg, {noreply, ModState}, OrigModState, State) ->
     {_, State1} = set_mod_state(Td, OrigModState, ModState, State),
     {{noreply, []}, ModState, State1};
-handle_callback_result(
-    Td, handle_cast, _EventType, _Msg, {noreply, ModState, Actions}, OrigModState, State
-) ->
+handle_callback_result(Td, _EventType, _Msg, {noreply, ModState, Actions}, OrigModState, State) ->
     {_, State1} = set_mod_state(Td, OrigModState, ModState, State),
     {{noreply, Actions}, ModState, State1};
-handle_callback_result(
-    Td, handle_call, _EventType, _Msg, {reply, Reply, ModState}, OrigModState, State
-) ->
+handle_callback_result(Td, _EventType, _Msg, {reply, Reply, ModState}, OrigModState, State) ->
     {_, State1} = set_mod_state(Td, OrigModState, ModState, State),
     {{reply, Reply, []}, ModState, State1};
 handle_callback_result(
-    Td, handle_call, _EventType, _Msg, {reply, Reply, ModState, Actions}, OrigModState, State
+    Td, _EventType, _Msg, {reply, Reply, ModState, Actions}, OrigModState, State
 ) ->
     {_, State1} = set_mod_state(Td, OrigModState, ModState, State),
     {{reply, Reply, Actions}, ModState, State1};
-handle_callback_result(Td, handle_info, _EventType, _Msg, {noreply, ModState}, OrigModState, State) ->
-    {_, State1} = set_mod_state(Td, OrigModState, ModState, State),
-    {{noreply, []}, ModState, State1};
-handle_callback_result(
-    Td, handle_info, _EventType, _Msg, {noreply, ModState, Actions}, OrigModState, State
-) ->
-    {_, State1} = set_mod_state(Td, OrigModState, ModState, State),
-    {{noreply, Actions}, ModState, State1};
-handle_callback_result(
-    Td, handle_locked, _EventType, _Msg, {noreply, ModState}, OrigModState, State
-) ->
-    {_, State1} = set_mod_state(Td, OrigModState, ModState, State),
-    {{noreply, []}, ModState, State1};
-handle_callback_result(
-    Td, handle_locked, _EventType, _Msg, {noreply, ModState, Actions}, OrigModState, State
-) ->
-    {_, State1} = set_mod_state(Td, OrigModState, ModState, State),
-    {{noreply, Actions}, ModState, State1};
-handle_callback_result(
-    Td, handle_locked, _EventType, _Msg, {reply, Reply, ModState}, OrigModState, State
-) ->
-    {_, State1} = set_mod_state(Td, OrigModState, ModState, State),
-    {{reply, Reply, []}, ModState, State1};
-handle_callback_result(
-    Td, handle_locked, _EventType, _Msg, {reply, Reply, ModState, Actions}, OrigModState, State
-) ->
-    {_, State1} = set_mod_state(Td, OrigModState, ModState, State),
-    {{reply, Reply, Actions}, ModState, State1};
-handle_callback_result(Td, _Callback, EventType, Msg, {lock, ModState}, OrigModState, State) ->
+handle_callback_result(Td, EventType, Msg, {lock, ModState}, OrigModState, State) ->
     {_, State1} = set_mod_state(Td, OrigModState, ModState, State),
     State2 = set_lock(Td, State1),
     {{lock, EventType, Msg}, ModState, State2};
+handle_callback_result(Td, _EventType, _Msg, {stop, Reason, ModState}, OrigModState, State) ->
+    {_, State1} = set_mod_state(Td, OrigModState, ModState, State),
+    {{stop, Reason, []}, ModState, State1};
 handle_callback_result(
-    Td, _Callback, _EventType, _Msg, {stop, Reason, ModState}, OrigModState, State
+    Td, _EventType, _Msg, {stop, Reason, ModState, Actions}, OrigModState, State
 ) ->
     {_, State1} = set_mod_state(Td, OrigModState, ModState, State),
+    {{stop, Reason, Actions}, ModState, State1}.
+
+finalize({{noreply, Actions}, ModState, State}) ->
+    State1 = resolve_version(State),
+    _ = handle_actions(Actions, [], ModState),
+    {noreply, State1};
+finalize({{reply, Reply, Actions}, ModState, State}) ->
+    State1 = resolve_version(State),
+    _ = handle_actions(Actions, [], ModState),
+    {reply, Reply, State1};
+finalize({{stop, Reason, Actions}, ModState, State}) ->
+    State1 = resolve_version(State),
+    _ = handle_actions(Actions, [], ModState),
     {stop, Reason, State1}.
 
 handle_actions([], Acc, _ModState) ->
@@ -608,15 +572,11 @@ handle_consume(Tenant, K, Tuid, State) ->
         end
     end),
     case Result of
-        {{noreply, Actions}, ModState, State2} ->
-            State3 = resolve_version(State2),
-            _ = handle_actions(Actions, [], ModState),
-            {noreply, State3};
         {{lock, EventType, Msg}, ModState, State2} ->
             State3 = resolve_version(State2),
             consume_locked(EventType, Msg, ModState, false, State3);
-        {{stop, Reason}, _ModState, State2} ->
-            {stop, Reason, State2}
+        _ ->
+            finalize(Result)
     end.
 
 consume_call(Td, Request, From, State) ->
@@ -625,7 +585,7 @@ consume_call(Td, Request, From, State) ->
             erlang:error(Reason);
         {ok, OrigModState, CallbackResult, State1} ->
             handle_callback_result(
-                Td, handle_call, {call, From}, Request, CallbackResult, OrigModState, State1
+                Td, {call, From}, Request, CallbackResult, OrigModState, State1
             )
     end.
 
@@ -635,7 +595,7 @@ consume_cast(Td, Request, State) ->
             erlang:error(Reason);
         {ok, OrigModState, CallbackResult, State1} ->
             handle_callback_result(
-                Td, handle_cast, cast, Request, CallbackResult, OrigModState, State1
+                Td, cast, Request, CallbackResult, OrigModState, State1
             )
     end.
 
@@ -649,7 +609,6 @@ consume_locked(EventType, Msg, ModState, IsLocalReply, State = #state{tenant = T
                     case
                         handle_callback_result(
                             Td,
-                            handle_locked,
                             EventType,
                             Msg,
                             CallbackResult,
@@ -668,8 +627,8 @@ consume_locked(EventType, Msg, ModState, IsLocalReply, State = #state{tenant = T
                             end;
                         {{noreply, Actions}, LModState, State2} ->
                             {{noreply, Actions}, LModState, State2};
-                        {stop, Reason, State2} ->
-                            {{stop, Reason}, undefined, State2}
+                        {{stop, Reason, Actions}, LModState, State2} ->
+                            {{stop, Reason, Actions}, LModState, State2}
                     end
                 end)
         after
@@ -679,16 +638,10 @@ consume_locked(EventType, Msg, ModState, IsLocalReply, State = #state{tenant = T
         end,
 
     case Result of
-        {{reply, Reply, Actions}, LModState, State3} ->
-            State4 = resolve_version(State3),
-            _ = handle_actions(Actions, [], LModState),
-            {reply, Reply, State4};
-        {{noreply, Actions}, LModState, State3} ->
-            State4 = resolve_version(State3),
-            _ = handle_actions(Actions, [], LModState),
-            {noreply, State4};
-        {{stop, Reason1}, _LModState, State3} ->
-            {stop, Reason1, State3}
+        {{reply, _, _}, _, _} ->
+            finalize(Result);
+        _ ->
+            finalize(Result)
     end.
 
 consume_info(Td, Info, State) ->
@@ -697,7 +650,7 @@ consume_info(Td, Info, State) ->
             {{noreply, []}, undefined, State};
         {ok, OrigModState, CallbackResult, State1} ->
             handle_callback_result(
-                Td, handle_info, info, Info, CallbackResult, OrigModState, State1
+                Td, info, Info, CallbackResult, OrigModState, State1
             )
     end.
 
