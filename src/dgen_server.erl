@@ -48,7 +48,8 @@ argument is the
     priority_cast/2,
     priority_call/2, priority_call/3,
     call/2, call/3,
-    kill/2
+    kill/2,
+    get_quid/1
 ]).
 
 -include("../include/dgen.hrl").
@@ -92,6 +93,9 @@ argument is the
 -define(TxCallbackTimeout, 5000).
 -define(DefaultCallTimeout, 5000).
 
+% the state data structure is externally versioned
+-define(CodecVersion, 0).
+
 -record(state, {
     tenant :: dgen_backend:tenant(),
     mod :: atom(),
@@ -103,6 +107,8 @@ argument is the
         | {dgen_backend:versionstamp() | dgen_backend:future(), {ok, term()} | {error, not_found}},
     cache_misses = 0 :: non_neg_integer()
 }).
+
+-type internalstate() :: #state{}.
 
 -if(?DOCATTRS).
 -doc """
@@ -253,7 +259,7 @@ parse_opts(Opts) ->
     Cache = proplists:get_value(cache, Opts, true),
     {Tenant, Consume, Reset, Cache}.
 
--spec init(term()) -> {ok, #state{}} | {error, term()}.
+-spec init(term()) -> {ok, internalstate()} | {error, term()}.
 init({Tenant, Mod, Arg, Consume, Reset, Cache}) ->
     case init_tuid(Mod, Arg) of
         {ok, Tuid, InitialState} ->
@@ -265,11 +271,11 @@ init({Tenant, Mod, Arg, Consume, Reset, Cache}) ->
             Other
     end.
 
--spec handle_call(term(), gen_server:from(), #state{}) -> {reply, term(), #state{}}.
+-spec handle_call(term(), gen_server:from(), internalstate()) -> {reply, term(), internalstate()}.
 handle_call({call, Request, WatchTo, Options}, _LocalFrom, State = #state{watch = undefined}) ->
     #state{tenant = Tenant, tuid = Tuid} = State,
     {From, NewWatch} = dgen_backend:transactional(Tenant, fun(Td) ->
-        dgen:push_call(Td, Tuid, Request, WatchTo, Options)
+        dgen:push_call(Td, Tuid, get_quid(Tuid), Request, WatchTo, Options)
     end),
     LocalReply = {noreply, {Tenant, From, NewWatch}},
     {reply, LocalReply, State};
@@ -278,12 +284,12 @@ handle_call({call, Request, WatchTo, Options}, _LocalFrom, State = #state{}) ->
     LocalFrom = make_ref(),
 
     PushFun = fun(Td, State0) ->
-        {From, NewWatch} = dgen:push_call(Td, Tuid, Request, WatchTo, Options),
+        {From, NewWatch} = dgen:push_call(Td, Tuid, get_quid(Tuid), Request, WatchTo, Options),
         {push, From, NewWatch, State0}
     end,
 
     Result = dgen_backend:transactional(Tenant, fun(Td) ->
-        case dgen_queue:length(Td, State#state.tuid) of
+        case dgen_queue:length(Td, get_quid(State#state.tuid)) of
             0 ->
                 case is_locked(Td, State) of
                     true ->
@@ -333,8 +339,8 @@ handle_call({priority, Request}, _From, State = #state{tenant = Tenant}) ->
             finalize(Result)
     end.
 
--spec handle_cast(term(), #state{}) ->
-    {noreply, #state{}} | {stop, term(), #state{}}.
+-spec handle_cast(term(), internalstate()) ->
+    {noreply, internalstate()} | {stop, term(), internalstate()}.
 handle_cast(consume, State = #state{tenant = Tenant, tuid = Tuid}) ->
     % 1 at a time because we are limited to 5 seconds per transaction
     K = 1,
@@ -350,7 +356,7 @@ handle_cast(consume, State = #state{tenant = Tenant, tuid = Tuid}) ->
     end,
     Ret;
 handle_cast({cast, Requests}, State = #state{tenant = Tenant, tuid = Tuid}) ->
-    dgen_queue:push_k(Tenant, Tuid, [{cast, Request} || Request <- Requests]),
+    dgen_queue:push_k(Tenant, get_quid(Tuid), [{cast, Request} || Request <- Requests]),
     {noreply, State};
 handle_cast({priority, Request}, State = #state{tenant = Tenant}) ->
     Result = dgen_backend:transactional(Tenant, fun(Td) ->
@@ -366,7 +372,8 @@ handle_cast({kill, Reason}, State = #state{tenant = Tenant, tuid = Tuid}) ->
     delete(Tenant, Tuid),
     {stop, Reason, State#state{mod_state_cache = undefined}}.
 
--spec handle_info(term(), #state{}) -> {noreply, #state{}} | {stop, term(), #state{}}.
+-spec handle_info(term(), internalstate()) ->
+    {noreply, internalstate()} | {stop, term(), internalstate()}.
 handle_info({Ref, ready}, State = #state{watch = ?FUTURE(Ref)}) ->
     handle_cast(consume, State#state{watch = undefined});
 handle_info(consume_after_penalty, State) ->
@@ -377,11 +384,11 @@ handle_info(Info, State = #state{tenant = Tenant}) ->
     end),
     finalize(Result).
 
--spec terminate(term(), #state{}) -> ok.
+-spec terminate(term(), internalstate()) -> ok.
 terminate(_Reason, _State) ->
     ok.
 
--spec code_change(term(), #state{}, term()) -> {ok, #state{}}.
+-spec code_change(term(), internalstate(), term()) -> {ok, internalstate()}.
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
@@ -426,7 +433,7 @@ delete(Tenant, Tuid) ->
     dgen_backend:transactional(Tenant, fun(Td = {Tx, Dir}) ->
         B = dgen_config:backend(),
         clear_mod_state(Td, Tuid),
-        dgen_queue:delete(Td, Tuid),
+        dgen_queue:delete(Td, get_quid(Tuid)),
         WaitingKey = dgen:get_waiting_key(Tuid),
         {SK, EK} = B:dir_range(Dir, WaitingKey),
         B:clear_range(Tx, SK, EK)
@@ -546,16 +553,16 @@ handle_actions([Action | Actions], Acc, ModState) ->
     end.
 
 get_state_key(Tuple) ->
-    dgen_key:extend(Tuple, <<"s">>).
+    dgen_key:extend(Tuple, <<"s">>, ?CodecVersion).
 
 handle_consume(Tenant, K, Tuid, State) ->
     Result = dgen_backend:transactional(Tenant, fun(Td) ->
         case is_locked(Td, State) of
             true ->
-                Watch = dgen_queue:watch_push(Td, Tuid),
+                Watch = dgen_queue:watch_push(Td, get_quid(Tuid)),
                 {{noreply, []}, undefined, State#state{watch = Watch}};
             false ->
-                case dgen_queue:consume_k(Td, K, Tuid) of
+                case dgen_queue:consume_k(Td, K, get_quid(Tuid)) of
                     {[{call, Request, From, _CallOptions}], Watch} ->
                         case consume_call(Td, Request, From, State#state{watch = Watch}) of
                             {{reply, Reply, Actions}, ModState, State2} ->
@@ -689,7 +696,7 @@ clear_lock(Td = {Tx, Dir}, #state{tuid = Tuid}) ->
     B = dgen_config:backend(),
     LockKey = B:dir_pack(Dir, get_lock_key(Tuid)),
     B:clear_range(Tx, LockKey, B:key_strinc(LockKey)),
-    dgen_queue:notify(Td, Tuid).
+    dgen_queue:notify(Td, get_quid(Tuid)).
 
 get_lock_key(Tuid) ->
     dgen_key:extend(Tuid, <<"k">>).
@@ -702,3 +709,6 @@ is_locked({Tx, Dir}, #state{tuid = Tuid}) ->
         _ ->
             true
     end.
+
+get_quid(Tuple) ->
+    dgen_key:extend(Tuple, <<"q">>).
