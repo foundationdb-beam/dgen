@@ -1,4 +1,4 @@
-# dgen_server Design
+# Design Details
 
 A dgen_server is an abstract entity that is composed of (i) state and (ii) operations on state. The state is
 stored in a durable fashion in a distributed key-value store, such as FoundationDB. The operations are defined
@@ -43,7 +43,7 @@ strict serializability to guarantee that your operations yield consistent result
   using chunked term encoding (`{From, <<"t">>, 0}`, `{From, <<"t">>, 1}`, ...) so that replies
   can exceed the FDB single-value size limit. The FDB watch is placed on the reply-sentinel-key
   (chunk 0). The client reads the reply via `get_range` and clears it via `clear_range`.
-- **queue-key**: A prefix key-tuple that contains all key-values for the message-queue.
+- **quid**: Unique tuple identifier for the queue. It is a prefix key-tuple that contains all key-values for the message-queue.
 - **item-key**: A key-tuple that identifies an item in the queue (i.e. a call-request or cast-request).
 - **push-key**: A key-tuple that tracks the number of pushes onto the queue.
 - **pop-key**: A key-tuple that tracks the number of pops from the queue.

@@ -1,0 +1,8 @@
+{"1.2.0",
+[{<<"erlfdb">>,{pkg,<<"erlfdb">>,<<"0.3.4">>},0}]}.
+[
+{pkg_hash,[
+ {<<"erlfdb">>, <<"DEB1D48160AB919CC2AEC606B01E5632851F58B13C2BBBDD29A3D4FE08CFEBB3">>}]},
+{pkg_hash_ext,[
+ {<<"erlfdb">>, <<"65F0E59758CC4F7A60D17BC0EF74F77DF2C872D41AF41860A285FD9D20FA04AD">>}]}
+].

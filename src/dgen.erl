@@ -29,7 +29,7 @@ the first chunk key; the client always reads via `get_range`.
 """.
 -endif.
 
--export([get_waiting_key/1, get_from/2, call/4, push_call/5]).
+-export([get_waiting_key/1, get_from/2, call/4, push_call/6]).
 
 -include("../include/dgen.hrl").
 
@@ -47,16 +47,16 @@ watch on the first chunk key directed to `WatchTo`, and enqueues the request.
 Returns `{From, Watch}` where `From` is the from-key tuple.
 """.
 -endif.
--spec push_call(term(), tuid(), term(), pid(), list()) ->
+-spec push_call(term(), tuid(), dgen_queue:quid(), term(), pid(), list()) ->
     {from(), dgen_backend:future()}.
-push_call({Tx, Dir}, Tuid, Request, WatchTo, Options) ->
+push_call({Tx, Dir}, Tuid, Quid, Request, WatchTo, Options) ->
     B = dgen_config:backend(),
     WaitingKey = get_waiting_key(Tuid),
     From = get_from(WaitingKey, make_ref()),
     dgen_mod_state_codec:write_term({Tx, Dir}, From, noreply),
     ReplySentinelKey = dgen_mod_state_codec:term_first_key(Dir, From),
     Future = B:watch(Tx, ReplySentinelKey, [{to, WatchTo}]),
-    dgen_queue:push_k({Tx, Dir}, Tuid, [{call, Request, From, Options}]),
+    dgen_queue:push_k({Tx, Dir}, Quid, [{call, Request, From, Options}]),
     {From, Future}.
 
 -if(?DOCATTRS).

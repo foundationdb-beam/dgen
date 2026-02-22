@@ -1,5 +1,6 @@
 defmodule DGenServer.InlineThrowTest do
   use DGen.Case, async: true
+  import ExUnit.CaptureLog
 
   alias DGen.DStopper
 
@@ -19,16 +20,19 @@ defmodule DGenServer.InlineThrowTest do
       # The inline call will invoke handle_call(:throw_me, ...) which throws.
       # The try/catch inside the transaction pushes the call to the queue,
       # then re-throws outside the transaction, crashing the gen_server.
-      try do
-        DGenServer.call(pid, :throw_me, 10_000)
-      catch
-        :exit, _ -> :ok
-      end
+      # Capture the expected OTP crash log to avoid alarming test output.
+      capture_log(fn ->
+        try do
+          DGenServer.call(pid, :throw_me, 10_000)
+        catch
+          :exit, _ -> :ok
+        end
 
-      assert_receive {:DOWN, ^mref, :process, ^pid, _reason}, 5_000
+        assert_receive {:DOWN, ^mref, :process, ^pid, _reason}, 5_000
+      end)
 
       # The call should now be in the queue
-      assert 1 = :dgen_queue.length(tenant, tuid)
+      assert 1 = :dgen_queue.length(tenant, :dgen_server.get_quid(tuid))
     end
   end
 end

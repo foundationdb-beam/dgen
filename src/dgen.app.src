@@ -1,0 +1,11 @@
+{application, dgen, [
+    {description, "Distributed gen_server"},
+    {vsn, {file, "VERSION"}},
+    {registered, []},
+    {applications, [
+        kernel,
+        stdlib
+    ]},
+    {optional_applications, [erlfdb]},
+    {env, []}
+]}.

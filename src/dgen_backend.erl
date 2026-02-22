@@ -17,6 +17,8 @@ A backend must implement all required callbacks to provide:
 The default backend is `dgen_erlfdb`, which delegates to FoundationDB via the
 `erlfdb` library.
 
+We look forward to changing the backend interface to support other systems.
+
 ## Configuring the backend
 
 Set the `backend` application env before starting dgen:
