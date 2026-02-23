@@ -39,7 +39,7 @@ defmodule Dgen.MixProject do
 
   defp docs do
     [
-      main: "README",
+      main: "readme",
       source_url: "https://github.com/foundationdb-beam/dgen",
       extras: [
         "README.md",
