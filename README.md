@@ -1,6 +1,6 @@
 # DGen
 
-dgen provides a distributed gen_server.
+`dgen_server` brings the gen_server programming model to a distributed system. It uses the same callback interface — `init/1`, `handle_call/3`, `handle_cast/2` — but unlike a gen_server, it is not a single Erlang process. A `dgen_server` is a virtual entity that exists as long as its state does in FoundationDB, independent of any running process. What makes it *distributed* rather than merely durable is its message queue: multiple consumers on any number of nodes can consume from the same queue simultaneously, with serialization and exactly-once delivery guaranteed by the backend.
 
 ## Motivation
 
@@ -205,7 +205,7 @@ The cache is invalidated when the process detects that another consumer has modi
 
 DGenServer has well-defined behavior during crashes.
 
-**Key guarantee:** Standard `call` and `cast` messages are processed **at-least-once**. If a crash occurs before the transaction commits, the message will be retried. Design your callbacks to be idempotent when possible.
+**Key guarantee:** Standard `call` and `cast` messages are processed **exactly-once** under normal operation. In the event of a crash before the transaction commits, the message will be retried — so in crash scenarios, delivery is **at-least-once**. Design your callbacks to be idempotent when possible.
 
 **During `init/1`:**
 - If the first `init/1` crashes, the gen_server process exits before any state is persisted

@@ -3,7 +3,7 @@
 A dgen_server is an abstract entity that is composed of (i) state and (ii) operations on state. The state is
 stored in a durable fashion in a distributed key-value store, such as FoundationDB. The operations are defined
 in code by a module that implements the dgen_server behaviour. With this recipe, dgen_server
-acts as if it were an Erlang gen_server, but can live beyond the lifetime of any Erlang process, node, or cluster.
+provides the same programming model as a gen_server, but can live beyond the lifetime of any Erlang process, node, or cluster.
 
 As such, the dgen_server itself does not have a singular representation on the Erlang VM. Instead, zero or more
 "dgen_server processes" may exist at a given moment; these are Erlang processes that are responsible for executing
