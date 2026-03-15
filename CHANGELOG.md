@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## v0.1.1 (TBD)
 
-### Added
+### Enhancements
 
 - `dgen_server:feed_cast/1,2` — returns a `fun((Tx, Message) -> ok)` closure for
   enqueuing a cast message atomically within the caller's own FDB transaction.
