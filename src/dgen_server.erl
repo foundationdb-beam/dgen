@@ -252,7 +252,7 @@ kill(Server, Reason) ->
 -if(?DOCATTRS).
 -doc """
 Returns a closure for atomically casting a message from within the caller's
-own FDB transaction.
+own backend transaction.
 
 Call this before opening the transaction as a preparatory step. Bind the
 result to `Cast` and call `Cast(Tx, Message)` inside the transaction to
@@ -260,15 +260,15 @@ enqueue the message without going through the dgen_server process. The queue
 directory and identifier are captured internally and not exposed to the
 caller.
 
-## FDB coupling
+## Backend coupling
 
 This function is intended for callers that are already operating directly
-with a FoundationDB transaction — for example, when a message must be
-enqueued atomically alongside other FDB writes in the same transaction. Using
-it means intentionally stepping outside the gen_server abstraction: the
-caller takes responsibility for managing the transaction lifetime and is
-coupled to the FDB backend. If you do not need to compose the enqueue with
-other FDB writes, prefer `cast/2` instead.
+with a backend transaction — for example, when a message must be enqueued
+atomically alongside other writes in the same transaction. Using it means
+intentionally stepping outside the gen_server abstraction: the caller takes
+responsibility for managing the transaction lifetime and is coupled to the
+configured backend. If you do not need to compose the enqueue with other
+backend writes, prefer `cast/2` instead.
 """.
 -endif.
 -spec outbox_cast(server()) -> fun((dgen_backend:tx(), term()) -> ok).
