@@ -50,7 +50,7 @@ argument is the
     call/2, call/3,
     kill/2,
     get_quid/1,
-    get_outbox/1, get_outbox/2
+    outbox_cast/1, outbox_cast/2
 ]).
 
 -include("../include/dgen.hrl").
@@ -251,22 +251,33 @@ kill(Server, Reason) ->
 
 -if(?DOCATTRS).
 -doc """
-Returns a cast outbox closure for use within the caller's FDB transaction.
+Returns a closure for atomically casting a message from within the caller's
+own FDB transaction.
 
-Call this before opening the transaction as a preparatory step. The returned
-`Cast = fun((Tx, Message) -> ok)` must be called inside the caller's
-transaction; it enqueues the message atomically without going through the
-dgen_server process. The queue directory and identifier are captured
-internally and not exposed to the caller.
+Call this before opening the transaction as a preparatory step. Bind the
+result to `Cast` and call `Cast(Tx, Message)` inside the transaction to
+enqueue the message without going through the dgen_server process. The queue
+directory and identifier are captured internally and not exposed to the
+caller.
+
+## FDB coupling
+
+This function is intended for callers that are already operating directly
+with a FoundationDB transaction — for example, when a message must be
+enqueued atomically alongside other FDB writes in the same transaction. Using
+it means intentionally stepping outside the gen_server abstraction: the
+caller takes responsibility for managing the transaction lifetime and is
+coupled to the FDB backend. If you do not need to compose the enqueue with
+other FDB writes, prefer `cast/2` instead.
 """.
 -endif.
--spec get_outbox(server()) -> fun((dgen_backend:tx(), term()) -> ok).
-get_outbox(Server) ->
-    get_outbox(Server, ?DefaultCallTimeout).
+-spec outbox_cast(server()) -> fun((dgen_backend:tx(), term()) -> ok).
+outbox_cast(Server) ->
+    outbox_cast(Server, ?DefaultCallTimeout).
 
--spec get_outbox(server(), timeout()) -> fun((dgen_backend:tx(), term()) -> ok).
-get_outbox(Server, Timeout) ->
-    gen_server:call(Server, get_outbox, Timeout).
+-spec outbox_cast(server(), timeout()) -> fun((dgen_backend:tx(), term()) -> ok).
+outbox_cast(Server, Timeout) ->
+    gen_server:call(Server, outbox_cast, Timeout).
 
 parse_opts(Opts) ->
     Tenant =
@@ -347,7 +358,7 @@ handle_call({call, Request, WatchTo, Options}, _LocalFrom, State = #state{}) ->
             LocalReply = {noreply, {Tenant, From, NewWatch}},
             {reply, LocalReply, State1}
     end;
-handle_call(get_outbox, _From, State = #state{tenant = {_Db, Dir}, tuid = Tuid}) ->
+handle_call(outbox_cast, _From, State = #state{tenant = {_Db, Dir}, tuid = Tuid}) ->
     Quid = get_quid(Tuid),
     Closure = fun(Tx, Message) ->
         dgen_queue:push_k({Tx, Dir}, Quid, [{cast, Message}])

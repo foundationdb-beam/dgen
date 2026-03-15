@@ -76,13 +76,13 @@ defmodule DGenServer.Test do
       kill(pid)
     end
 
-    test "get_outbox enqueues within caller's transaction", context do
+    test "outbox_cast enqueues within caller's transaction", context do
       tenant = context[:tenant]
       {db, _dir} = tenant
       {:ok, pid} = DCounter.start_link(tenant, {"a"})
       assert 0 = DCounter.get(pid)
 
-      cast = DGenServer.get_outbox(pid)
+      cast = DGenServer.outbox_cast(pid)
 
       :erlfdb.transactional(db, fn tx ->
         cast.(tx, {:incr, 5})
