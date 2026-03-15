@@ -49,7 +49,8 @@ argument is the
     priority_call/2, priority_call/3,
     call/2, call/3,
     kill/2,
-    get_quid/1
+    get_quid/1,
+    get_push_closure/1
 ]).
 
 -include("../include/dgen.hrl").
@@ -248,6 +249,23 @@ call keys. The process exits with `Reason`.
 kill(Server, Reason) ->
     gen_server:cast(Server, {kill, Reason}).
 
+-if(?DOCATTRS).
+-doc """
+Returns a closure that pushes a cast message directly within the caller's own
+FDB transaction.
+
+The closure has signature `fun((Tx, Message) -> ok)`. It captures the queue
+directory and identifier internally so neither is exposed to the caller.
+
+Use this when the caller already holds an FDB transaction and wants to enqueue
+a message atomically as part of that transaction, without going through the
+dgen_server process.
+""".
+-endif.
+-spec get_push_closure(server()) -> fun((dgen_backend:tx(), term()) -> ok).
+get_push_closure(Server) ->
+    gen_server:call(Server, get_push_closure).
+
 parse_opts(Opts) ->
     Tenant =
         case proplists:get_value(tenant, Opts) of
@@ -327,6 +345,12 @@ handle_call({call, Request, WatchTo, Options}, _LocalFrom, State = #state{}) ->
             LocalReply = {noreply, {Tenant, From, NewWatch}},
             {reply, LocalReply, State1}
     end;
+handle_call(get_push_closure, _From, State = #state{tenant = {_Db, Dir}, tuid = Tuid}) ->
+    Quid = get_quid(Tuid),
+    Closure = fun(Tx, Message) ->
+        dgen_queue:push_k({Tx, Dir}, Quid, [{cast, Message}])
+    end,
+    {reply, Closure, State};
 handle_call({priority, Request}, _From, State = #state{tenant = Tenant}) ->
     LocalFrom = make_ref(),
     Result = dgen_backend:transactional(Tenant, fun(Td) ->
