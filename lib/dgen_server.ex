@@ -99,6 +99,6 @@ defmodule DGenServer do
   defdelegate call(server, msg), to: :dgen_server
   defdelegate call(server, msg, timeout), to: :dgen_server
   defdelegate kill(server, reason), to: :dgen_server
-  defdelegate feed_cast(server), to: :dgen_server
-  defdelegate feed_cast(server, timeout), to: :dgen_server
+  defdelegate get_outbox(server), to: :dgen_server
+  defdelegate get_outbox(server, timeout), to: :dgen_server
 end
