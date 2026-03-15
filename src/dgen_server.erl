@@ -49,7 +49,8 @@ argument is the
     priority_call/2, priority_call/3,
     call/2, call/3,
     kill/2,
-    get_quid/1
+    get_quid/1,
+    outbox_cast/1, outbox_cast/2
 ]).
 
 -include("../include/dgen.hrl").
@@ -248,6 +249,36 @@ call keys. The process exits with `Reason`.
 kill(Server, Reason) ->
     gen_server:cast(Server, {kill, Reason}).
 
+-if(?DOCATTRS).
+-doc """
+Returns a closure for atomically casting a message from within the caller's
+own backend transaction.
+
+Call this before opening the transaction as a preparatory step. Bind the
+result to `Cast` and call `Cast(Tx, Message)` inside the transaction to
+enqueue the message without going through the dgen_server process. The queue
+directory and identifier are captured internally and not exposed to the
+caller.
+
+## Backend coupling
+
+This function is intended for callers that are already operating directly
+with a backend transaction — for example, when a message must be enqueued
+atomically alongside other writes in the same transaction. Using it means
+intentionally stepping outside the gen_server abstraction: the caller takes
+responsibility for managing the transaction lifetime and is coupled to the
+configured backend. If you do not need to compose the enqueue with other
+backend writes, prefer `cast/2` instead.
+""".
+-endif.
+-spec outbox_cast(server()) -> fun((dgen_backend:tx(), term()) -> ok).
+outbox_cast(Server) ->
+    outbox_cast(Server, ?DefaultCallTimeout).
+
+-spec outbox_cast(server(), timeout()) -> fun((dgen_backend:tx(), term()) -> ok).
+outbox_cast(Server, Timeout) ->
+    gen_server:call(Server, outbox_cast, Timeout).
+
 parse_opts(Opts) ->
     Tenant =
         case proplists:get_value(tenant, Opts) of
@@ -327,6 +358,12 @@ handle_call({call, Request, WatchTo, Options}, _LocalFrom, State = #state{}) ->
             LocalReply = {noreply, {Tenant, From, NewWatch}},
             {reply, LocalReply, State1}
     end;
+handle_call(outbox_cast, _From, State = #state{tenant = {_Db, Dir}, tuid = Tuid}) ->
+    Quid = get_quid(Tuid),
+    Closure = fun(Tx, Message) ->
+        dgen_queue:push_k({Tx, Dir}, Quid, [{cast, Message}])
+    end,
+    {reply, Closure, State};
 handle_call({priority, Request}, _From, State = #state{tenant = Tenant}) ->
     LocalFrom = make_ref(),
     Result = dgen_backend:transactional(Tenant, fun(Td) ->
