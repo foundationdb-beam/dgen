@@ -90,38 +90,36 @@ defmodule DGenServer.DeadLetterTest do
 
       Process.flag(:trap_exit, true)
 
-      # Start the consumer and issue the call from a spawned task so the test
-      # process is free to restart consumers.
-      {:ok, pid1} = start(tenant, tuid, threshold)
+      # Start a non-consuming server so the call goes straight to the durable
+      # queue.  If a consuming server handled it inline it would crash before
+      # returning the gen_server reply, causing the caller to receive an :exit
+      # rather than waiting on the FDB reply key.
+      {:ok, push_pid} =
+        DGenServer.start_link(DCrasher, [tuid],
+          tenant: tenant,
+          consume: false,
+          dead_letter_threshold: threshold
+        )
 
-      caller =
-        Task.async(fn ->
-          try do
-            DGenServer.call(pid1, :crash_me, 30_000)
-          catch
-            :exit, _ -> {:error, :exit}
-          end
+      caller = Task.async(fn -> DGenServer.call(push_pid, :crash_me, 30_000) end)
+
+      # threshold consumers crash; each failure increments the in-envelope count
+      for _ <- 1..threshold do
+        capture_log(fn ->
+          {:ok, pid} = start(tenant, tuid, threshold)
+          wait_for_down(pid)
         end)
+      end
 
-      # Attempt 1: N=0 < 2, crashes
-      capture_log(fn -> wait_for_down(pid1) end)
+      # After threshold crashes the next consumer dead-letters the message and
+      # writes {error, {dead_letter, N}} to the reply key in FDB.
+      {:ok, pid_final} = start(tenant, tuid, threshold)
 
-      # Attempt 2: N=1 < 2, crashes
-      capture_log(fn ->
-        {:ok, pid2} = start(tenant, tuid, threshold)
-        wait_for_down(pid2)
-      end)
+      assert {:error, {:dead_letter, ^threshold}} = Task.await(caller, 10_000)
+      assert Process.alive?(pid_final)
 
-      # Attempt 3: N=2 >= 2 → dead-letter, error reply written to FDB
-      {:ok, pid3} = start(tenant, tuid, threshold)
-
-      # Caller should receive the dead-letter error (not a timeout)
-      result = Task.await(caller, 10_000)
-      assert {:error, {:dead_letter, 2}} = result
-
-      assert Process.alive?(pid3)
-
-      DGenServer.kill(pid3, :normal)
+      DGenServer.kill(pid_final, :normal)
+      DGenServer.kill(push_pid, :normal)
     end
   end
 

@@ -86,7 +86,9 @@ argument is the
 
 -callback handle_dead_letter(Msg :: term(), AttemptCount :: non_neg_integer()) -> any().
 
--optional_callbacks([handle_cast/2, handle_call/3, handle_info/2, handle_locked/3, handle_dead_letter/2]).
+-optional_callbacks([
+    handle_cast/2, handle_call/3, handle_info/2, handle_locked/3, handle_dead_letter/2
+]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
@@ -690,7 +692,9 @@ is_dead_letter(N, Threshold) -> N >= Threshold.
 increment_envelope({cast, R, N}) -> {cast, R, N + 1};
 increment_envelope({call, R, F, O, N}) -> {call, R, F, O, N + 1}.
 
-handle_dead_letter_internal(Td, MsgEnvelope, AttemptCount, State = #state{mod = Mod, tuid = Tuid}) ->
+handle_dead_letter_internal(
+    Td, MsgEnvelope, AttemptCount, State = #state{mod = Mod, tuid = Tuid}
+) ->
     dgen_queue:push_dlq(Td, get_quid(Tuid), MsgEnvelope, AttemptCount),
     case MsgEnvelope of
         {call, _Request, From} ->

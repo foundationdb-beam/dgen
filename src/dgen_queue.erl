@@ -12,7 +12,17 @@ Push and pop counts are tracked with atomic `add` operations for O(1) length.
 """.
 -endif.
 
--export([push_k/3, consume_k/3, consume_k_ext/3, push_dlq/4, update_message/3, delete/2, length/2, watch_push/2, notify/2]).
+-export([
+    push_k/3,
+    consume_k/3,
+    consume_k_ext/3,
+    push_dlq/4,
+    update_message/3,
+    delete/2,
+    length/2,
+    watch_push/2,
+    notify/2
+]).
 
 -include("../include/dgen.hrl").
 
