@@ -647,12 +647,16 @@ handle_consume(Tenant, K, Tuid, State = #state{dead_letter_threshold = Threshold
                                     case is_dead_letter(N, Threshold) of
                                         true ->
                                             handle_dead_letter_internal(
-                                                Td, {call, Request, From}, N, State#state{watch = Watch}
+                                                Td, {call, Request, From}, N, State#state{
+                                                    watch = Watch
+                                                }
                                             );
                                         false ->
-                                            case consume_call(
-                                                Td, Request, From, State#state{watch = Watch}
-                                            ) of
+                                            case
+                                                consume_call(
+                                                    Td, Request, From, State#state{watch = Watch}
+                                                )
+                                            of
                                                 {{reply, Reply, Actions}, ModState, State2} ->
                                                     set_reply(Td, From, Reply),
                                                     {{noreply, Actions}, ModState, State2};
