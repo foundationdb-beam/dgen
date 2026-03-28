@@ -134,6 +134,7 @@ defmodule DGenServer.DeadLetterTest do
       for _ <- 1..4 do
         capture_log(fn ->
           {:ok, pid} = start(tenant, tuid, :infinity)
+
           if :dgen_queue.length(tenant, :dgen_server.get_quid(tuid)) == 0 do
             DGenServer.cast(pid, :crash_me)
           end
