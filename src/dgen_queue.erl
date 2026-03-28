@@ -12,7 +12,7 @@ Push and pop counts are tracked with atomic `add` operations for O(1) length.
 """.
 -endif.
 
--export([push_k/3, consume_k/3, delete/2, length/2, watch_push/2, notify/2]).
+-export([push_k/3, consume_k/3, consume_k_ext/3, push_dlq/4, update_message/3, delete/2, length/2, watch_push/2, notify/2]).
 
 -include("../include/dgen.hrl").
 
@@ -83,12 +83,73 @@ items, or a future that fires when new items are pushed.
 consume_k(Tenant, K, Quid) ->
     dgen_backend:transactional(Tenant, fun(Td) ->
         case pop_k(Td, K, Quid) of
-            {ok, Vals} ->
-                {Vals, undefined};
-            {{error, empty}, Vals} ->
-                {Vals, watch_push(Td, Quid)}
+            {ok, KVs} ->
+                {[V || {_, V} <- KVs], undefined};
+            {{error, empty}, KVs} ->
+                {[V || {_, V} <- KVs], watch_push(Td, Quid)}
         end
     end).
+
+-if(?DOCATTRS).
+-doc """
+Like `consume_k/3` but also returns the raw FDB key for each item.
+
+Returns `{[{RawKey, Value}], Watch}` where `RawKey` is the packed FDB key of
+the message. The key can be used to update the message in-place via
+`update_message/3`.
+""".
+-endif.
+-spec consume_k_ext(dgen_backend:tenant(), pos_integer(), quid()) ->
+    {[{dgen_backend:key(), term()}], undefined | dgen_backend:future()}.
+consume_k_ext(Tenant, K, Quid) ->
+    dgen_backend:transactional(Tenant, fun(Td) ->
+        case pop_k(Td, K, Quid) of
+            {ok, KVs} ->
+                {KVs, undefined};
+            {{error, empty}, KVs} ->
+                {KVs, watch_push(Td, Quid)}
+        end
+    end).
+
+-if(?DOCATTRS).
+-doc """
+Writes an updated value to an existing message's FDB key in-place.
+
+Used to increment the attempt count embedded in a message envelope after a
+failed processing attempt. No-ops if the key no longer exists (meaning
+the message was successfully consumed by another consumer).
+""".
+-endif.
+-spec update_message(dgen_backend:tenant(), dgen_backend:key(), term()) -> ok.
+update_message(Tenant, RawKey, NewEnvelope) ->
+    dgen_backend:transactional(Tenant, fun({Tx, _Dir}) ->
+        B = dgen_config:backend(),
+        case B:wait(B:get(Tx, RawKey)) of
+            not_found -> ok;
+            _ -> B:set(Tx, RawKey, term_to_binary(NewEnvelope))
+        end
+    end).
+
+-if(?DOCATTRS).
+-doc """
+Appends an entry to the dead-letter queue for `Quid`.
+
+Called when a message exceeds its dead-letter threshold. Stores the original
+envelope, attempt count, and a millisecond timestamp as a versionstamped entry
+under the DLQ subspace for the queue.
+""".
+-endif.
+-spec push_dlq(dgen_backend:tenant(), quid(), term(), non_neg_integer()) -> ok.
+push_dlq({Tx, Dir}, Quid, Envelope, AttemptCount) ->
+    B = dgen_config:backend(),
+    DlqKey = get_dlq_key(Quid),
+    DlqKey2 = dgen_key:extend(DlqKey, undefined),
+    Key = B:dir_pack_vs(
+        Dir,
+        erlang:setelement(tuple_size(DlqKey2), DlqKey2, ?VS(Tx, B))
+    ),
+    Payload = term_to_binary({Envelope, AttemptCount, erlang:system_time(millisecond)}),
+    B:set_versionstamped_key(Tx, Key, Payload).
 
 -if(?DOCATTRS).
 -doc "Deletes the entire queue for the given `Quid`, including all items and counters.".
@@ -142,11 +203,14 @@ pop_k({Tx, Dir}, K, Quid) ->
                     N == K -> ok;
                     true -> {error, empty}
                 end,
-            {Status, [binary_to_term(V) || {_, V} <- KVs]}
+            {Status, [{S, binary_to_term(V)} || {S, V} <- KVs]}
     end.
 
 get_item_key(Quid) ->
     dgen_key:extend(Quid, ?QueueVersion, <<"i">>).
+
+get_dlq_key(Quid) ->
+    dgen_key:extend(Quid, ?QueueVersion, <<"d">>).
 
 get_push_key(Quid) ->
     dgen_key:extend(Quid, ?QueueVersion, <<"n">>).
