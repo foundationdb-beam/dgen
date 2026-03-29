@@ -31,8 +31,7 @@ The following options may be passed via the `Opts` proplist:
   failed this many times its attempt count (stored in the message envelope) is
   checked and the message is moved to the dead-letter queue, the caller is
   notified (for `call` messages), and the optional `handle_dead_letter/2`
-  callback is invoked. Set to `infinity` to disable dead-lettering and revert
-  to the original crash-loop behaviour.
+  callback is invoked. Set to `infinity` to disable dead-lettering.
 
 ## Callbacks
 
