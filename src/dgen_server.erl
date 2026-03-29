@@ -78,7 +78,7 @@ argument is the
 -callback init(Args :: term()) -> init_ret().
 -callback handle_cast(Msg :: term(), State :: state()) -> noreply_ret() | lock_ret() | stop_ret().
 -callback handle_call(Request :: term(), From :: from(), State :: state()) ->
-    reply_ret() | noreply_ret() | lock_ret() | stop_ret().
+    reply_ret() | lock_ret() | stop_ret().
 -callback handle_info(Info :: term(), State :: state()) -> noreply_ret() | stop_ret().
 -callback handle_locked(EventType :: event_type(), Msg :: term(), State :: state()) ->
     reply_ret() | noreply_ret() | stop_ret().
@@ -388,8 +388,6 @@ finalize_inline_call(Result, GsFrom, Tenant) ->
     case Result of
         {{reply, Reply, Actions}, ModState, State} ->
             finalize({{reply, {reply, Reply}, Actions}, ModState, State});
-        {{noreply, Actions}, ModState, State} ->
-            finalize({{noreply, Actions}, ModState, State});
         {{lock, EventType, Msg}, ModState, State} ->
             case consume_locked(EventType, Msg, ModState, true, State) of
                 {reply, Reply, State2} -> {reply, {reply, Reply}, State2};
@@ -798,19 +796,14 @@ consume_info(Td, Info, State) ->
             )
     end.
 
-set_reply({Tx, Dir}, From, Reply) ->
-    B = dgen_config:backend(),
-    ReplySentinelKey = dgen_mod_state_codec:term_first_key(Dir, From),
-    % Skip writing the reply if the caller timed out and cleared the reply keys
-    case B:wait(B:get(Tx, ReplySentinelKey)) of
-        not_found ->
-            ok;
-        _ ->
-            dgen_mod_state_codec:clear_term({Tx, Dir}, From),
-            dgen_mod_state_codec:write_term({Tx, Dir}, From, {reply, Reply})
-    end.
+set_reply(Td, From, Reply) ->
+    write_reply_slot(Td, From, {reply, Reply}).
 
-set_raise({Tx, Dir}, From, Class, Reason) ->
+set_raise(Td, From, Class, Reason) ->
+    write_reply_slot(Td, From, {raise, Class, Reason}).
+
+% Skip writing if the caller timed out and cleared the reply keys.
+write_reply_slot({Tx, Dir}, From, Value) ->
     B = dgen_config:backend(),
     ReplySentinelKey = dgen_mod_state_codec:term_first_key(Dir, From),
     case B:wait(B:get(Tx, ReplySentinelKey)) of
@@ -818,7 +811,7 @@ set_raise({Tx, Dir}, From, Class, Reason) ->
             ok;
         _ ->
             dgen_mod_state_codec:clear_term({Tx, Dir}, From),
-            dgen_mod_state_codec:write_term({Tx, Dir}, From, {raise, Class, Reason})
+            dgen_mod_state_codec:write_term({Tx, Dir}, From, Value)
     end.
 
 init_tuid(Mod, Arg) ->

@@ -129,8 +129,8 @@ call(Module, Server, Request, Timeout) ->
                 {error, timeout} ->
                     cleanup_call(Tenant, From),
                     erlang:error(timeout);
-                {raise, Class, Reason} ->
-                    erlang:raise(Class, Reason, []);
+                {raise, error, Reason} ->
+                    erlang:error(Reason);
                 Reply ->
                     Reply
             end
