@@ -205,7 +205,7 @@ The cache is invalidated when the process detects that another consumer has modi
 
 DGenServer has well-defined behavior during crashes.
 
-**Key guarantee:** Standard `call` and `cast` messages are processed **exactly-once** under normal operation. In the event of a crash before the transaction commits, the message will be retried — so in crash scenarios, delivery is **at-least-once**. Design your callbacks to be idempotent when possible.
+**Key guarantee:** Standard `call` and `cast` messages are processed **exactly-once** under normal operation. In the event of a crash before the transaction commits, the message will be retried — so in crash scenarios, delivery is **at-least-once**, bounded by the dead-letter threshold described below. Design your callbacks to be idempotent when possible.
 
 **During `init/1`:**
 - If the first `init/1` crashes, the gen_server process exits before any state is persisted
@@ -214,10 +214,40 @@ DGenServer has well-defined behavior during crashes.
 
 **During transactional callbacks (`handle_call`, `handle_cast`, `handle_info`):**
 - The database transaction is automatically aborted — no state changes are committed
-- For `call` and `cast`: the message remains in the durable queue and will be retried by the next consumer
+- For `call` and `cast`: the message remains in the durable queue and will be retried by the next consumer. Each failed attempt increments a counter embedded in the message envelope. Once the counter reaches `dead_letter_threshold` (default `3`), the message is moved to the dead-letter queue instead of being retried (see below).
 - For `priority_call` and `priority_cast`: the message is lost (it never entered the queue)
 - For `handle_info`: the Erlang message is lost (info messages are not durable)
 - State remains unchanged from before the callback was invoked
+
+**Dead-letter queue:**
+
+A *poison message* is a queue message that consistently crashes consumers. To prevent an infinite retry loop, each message envelope carries an attempt counter. When the counter reaches `dead_letter_threshold` (default `3`), the message is moved to the dead-letter queue (DLQ) in FoundationDB rather than being retried:
+
+- For `call` messages, the blocked caller receives `{error, {dead_letter, N}}` where `N` is the attempt count.
+- The optional `handle_dead_letter/2` callback is invoked with the original message and attempt count, if defined.
+- A warning is logged.
+
+Configure with the `dead_letter_threshold` start option:
+
+<!-- tabs-open -->
+
+### Erlang
+
+```erlang
+% Raise the threshold, or set to 'infinity' to disable dead-lettering:
+dgen_server:start(MyMod, [], [{tenant, Tenant}, {dead_letter_threshold, infinity}])
+```
+
+### Elixir
+
+```elixir
+# Lower the threshold for faster isolation of bad messages:
+DGenServer.start_link(MyMod, [], tenant: tenant, dead_letter_threshold: 2)
+```
+
+<!-- tabs-close -->
+
+Note that when the bug is in the *consumer* rather than the message, dead-lettering after a few attempts is still desirable: it stops the crash loop while a fix is deployed. The dead-lettered message can be re-queued or discarded once the consumer is corrected.
 
 **During `handle_locked`:**
 - `handle_locked` executes outside a transaction, so previous state changes have already been persisted
