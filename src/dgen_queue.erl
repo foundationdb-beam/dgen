@@ -14,9 +14,10 @@ Push and pop counts are tracked with atomic `add` operations for O(1) length.
 
 -export([
     push_k/3,
-    consume_k/3,
+    peek_k/3,
+    commit_k/3,
+    write_k/3,
     push_dlq/4,
-    update_message/3,
     delete/2,
     length/2,
     watch_push/2,
@@ -81,44 +82,59 @@ notify({Tx, Dir}, Quid) ->
 
 -if(?DOCATTRS).
 -doc """
-Pops up to `K` items from the queue.
+Reads up to `K` items from the queue without removing them.
 
-Returns `{[{RawKey, Value}], Watch}` where `RawKey` is the packed FDB key of
-the item and `Watch` is `undefined` if the queue still has items, or a future
-that fires when new items are pushed. The raw key can be passed to
-`update_message/3` to update the item in-place.
+Returns `{ok, [{RawKey, RawBin}]}` where `RawBin` is the raw encoded value,
+or `{error, empty}` when the queue is empty. The items remain in the queue
+until `commit_k/3` is called. On failure `write_k/3` can overwrite a key
+in-place within the same transaction to update the embedded attempt counter.
+
+All three operations must be called within the same transaction so that the
+read, the callback invocation, and the delete-or-update are atomic.
 """.
 -endif.
--spec consume_k(dgen_backend:tenant(), pos_integer(), quid()) ->
-    {[{dgen_backend:key(), term()}], undefined | dgen_backend:future()}.
-consume_k(Tenant, K, Quid) ->
-    dgen_backend:transactional(Tenant, fun(Td) ->
-        case pop_k(Td, K, Quid) of
-            {ok, KVs} ->
-                {KVs, undefined};
-            {{error, empty}, KVs} ->
-                {KVs, watch_push(Td, Quid)}
-        end
-    end).
+-spec peek_k(dgen_backend:tenant(), pos_integer(), quid()) ->
+    {ok, [{dgen_backend:key(), binary()}]} | {error, empty}.
+peek_k({Tx, Dir}, K, Quid) ->
+    B = dgen_config:backend(),
+    ItemKey = get_item_key(Quid),
+    {QS, QE} = B:dir_range(Dir, ItemKey),
+    case B:get_range(Tx, QS, QE, [{limit, K}, {wait, true}]) of
+        [] -> {error, empty};
+        KVs -> {ok, KVs}
+    end.
 
 -if(?DOCATTRS).
 -doc """
-Writes an updated value to an existing message's FDB key in-place.
+Deletes the items returned by `peek_k/3` and increments the pop counter.
 
-Used to increment the attempt count embedded in a message envelope after a
-failed processing attempt. No-ops if the key no longer exists (meaning
-the message was successfully consumed by another consumer).
+Call this within the same transaction as `peek_k/3` after the callback
+succeeds to commit the consume.
 """.
 -endif.
--spec update_message(dgen_backend:tenant(), dgen_backend:key(), term()) -> ok.
-update_message(Tenant, RawKey, NewEnvelope) ->
-    dgen_backend:transactional(Tenant, fun({Tx, _Dir}) ->
-        B = dgen_config:backend(),
-        case B:wait(B:get(Tx, RawKey)) of
-            not_found -> ok;
-            _ -> B:set(Tx, RawKey, term_to_binary(NewEnvelope))
-        end
-    end).
+-spec commit_k(dgen_backend:tenant(), [{dgen_backend:key(), binary()}], quid()) -> ok.
+commit_k({Tx, Dir}, KVs, Quid) ->
+    B = dgen_config:backend(),
+    N = length(KVs),
+    [{FirstKey, _} | _] = KVs,
+    {LastKey, _} = lists:last(KVs),
+    B:clear_range(Tx, FirstKey, B:key_strinc(LastKey)),
+    PopKey = get_pop_key(Quid),
+    B:add(Tx, B:dir_pack(Dir, PopKey), N).
+
+-if(?DOCATTRS).
+-doc """
+Overwrites the value at `Key` within an existing transaction.
+
+Call this within the same transaction as `peek_k/3` when the callback fails,
+to update the embedded attempt counter before the transaction commits. The
+updated message will be visible to the next consumer.
+""".
+-endif.
+-spec write_k(dgen_backend:tenant(), dgen_backend:key(), term()) -> ok.
+write_k({Tx, _Dir}, Key, Envelope) ->
+    B = dgen_config:backend(),
+    B:set(Tx, Key, term_to_binary(Envelope)).
 
 -if(?DOCATTRS).
 -doc """
@@ -174,27 +190,6 @@ watch_push({Tx, Dir}, Quid) ->
     PushKey = get_push_key(Quid),
     B:watch(Tx, B:dir_pack(Dir, PushKey)).
 
-pop_k({Tx, Dir}, K, Quid) ->
-    B = dgen_config:backend(),
-    ItemKey = get_item_key(Quid),
-    {QS, QE} = B:dir_range(Dir, ItemKey),
-    case B:get_range(Tx, QS, QE, [{limit, K}, {wait, true}]) of
-        [] ->
-            {{error, empty}, []};
-        KVs = [{FirstKey, _} | _] ->
-            N = length(KVs),
-            {LastKey, _} = lists:last(KVs),
-            B:clear_range(Tx, FirstKey, B:key_strinc(LastKey)),
-            PopKey = get_pop_key(Quid),
-            B:add(Tx, B:dir_pack(Dir, PopKey), N),
-
-            Status =
-                if
-                    N == K -> ok;
-                    true -> {error, empty}
-                end,
-            {Status, [{Key, binary_to_term(V)} || {Key, V} <- KVs]}
-    end.
 
 get_item_key(Quid) ->
     dgen_key:extend(Quid, ?QueueVersion, <<"i">>).

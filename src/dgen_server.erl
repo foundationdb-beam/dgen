@@ -339,54 +339,10 @@ handle_call({call, Request, WatchTo, Options}, _LocalFrom, State = #state{watch 
 handle_call({call, Request, WatchTo, Options}, GsFrom, State = #state{}) ->
     #state{tenant = Tenant, tuid = Tuid} = State,
     LocalFrom = make_ref(),
-
-    PushFun = fun(Td, State0, Attempts) ->
-        {From, NewWatch} = dgen:push_call(
-            Td, Tuid, get_quid(Tuid), Request, WatchTo, Options, Attempts
-        ),
-        {push, From, NewWatch, State0}
-    end,
-
     Result = dgen_backend:transactional(Tenant, fun(Td) ->
-        case dgen_queue:length(Td, get_quid(State#state.tuid)) of
-            0 ->
-                case is_locked(Td, State) of
-                    true ->
-                        PushFun(Td, State, 0);
-                    false ->
-                        try
-                            consume_call(Td, Request, LocalFrom, State)
-                        catch
-                            Class:Reason:Stack ->
-                                PushResult = PushFun(Td, State, 1),
-                                {throw, Class, Reason, Stack, PushResult}
-                        end
-                end;
-            _ ->
-                PushFun(Td, State, 0)
-        end
+        inline_or_push(Td, Request, LocalFrom, WatchTo, Options, Tuid, State)
     end),
-
-    case Result of
-        {{reply, Reply, Actions}, ModState, State2} ->
-            LocalReply = {reply, Reply},
-            finalize({{reply, LocalReply, Actions}, ModState, State2});
-        {{lock, EventType, Msg}, ModState, State2} ->
-            case consume_locked(EventType, Msg, ModState, true, State2) of
-                {reply, Reply, State3} ->
-                    {reply, {reply, Reply}, State3};
-                Other ->
-                    Other
-            end;
-        {{stop, Reason, Actions}, ModState, State2} ->
-            finalize({{stop, Reason, Actions}, ModState, State2});
-        {throw, Class, Reason, Stack, {push, From, NewWatch, _State1}} ->
-            gen_server:reply(GsFrom, {noreply, {Tenant, From, NewWatch}}),
-            erlang:raise(Class, Reason, Stack);
-        {push, From, NewWatch, State1} ->
-            LocalReply = {noreply, {Tenant, From, NewWatch}},
-            {reply, LocalReply, State1}
-    end;
+    finalize_inline_call(Result, GsFrom, Tenant);
 handle_call(outbox_cast, _From, State = #state{tenant = {_Db, Dir}, tuid = Tuid}) ->
     Quid = get_quid(Tuid),
     Closure = fun(Tx, Message) ->
@@ -403,6 +359,49 @@ handle_call({priority, Request}, _From, State = #state{tenant = Tenant}) ->
             consume_locked(EventType, Msg, ModState, true, State1);
         _ ->
             finalize(Result)
+    end.
+
+inline_or_push(Td, Request, LocalFrom, WatchTo, Options, Tuid, State) ->
+    Push = fun(Attempts) ->
+        dgen:push_call(Td, Tuid, get_quid(Tuid), Request, WatchTo, Options, Attempts)
+    end,
+    case dgen_queue:length(Td, get_quid(Tuid)) of
+        0 ->
+            case is_locked(Td, State) of
+                true ->
+                    {From, NewWatch} = Push(0),
+                    {push, From, NewWatch, State};
+                false ->
+                    try consume_call(Td, Request, LocalFrom, State)
+                    catch
+                        Class:Reason:Stack ->
+                            {From, NewWatch} = Push(1),
+                            {push_after_fail, From, NewWatch, State, Class, Reason, Stack}
+                    end
+            end;
+        _ ->
+            {From, NewWatch} = Push(0),
+            {push, From, NewWatch, State}
+    end.
+
+finalize_inline_call(Result, GsFrom, Tenant) ->
+    case Result of
+        {{reply, Reply, Actions}, ModState, State} ->
+            finalize({{reply, {reply, Reply}, Actions}, ModState, State});
+        {{noreply, Actions}, ModState, State} ->
+            finalize({{noreply, Actions}, ModState, State});
+        {{lock, EventType, Msg}, ModState, State} ->
+            case consume_locked(EventType, Msg, ModState, true, State) of
+                {reply, Reply, State2} -> {reply, {reply, Reply}, State2};
+                Other -> Other
+            end;
+        {{stop, Reason, Actions}, ModState, State} ->
+            finalize({{stop, Reason, Actions}, ModState, State});
+        {push_after_fail, From, NewWatch, State, Class, Reason, Stack} ->
+            gen_server:reply(GsFrom, {noreply, {Tenant, From, NewWatch}}),
+            erlang:raise(Class, Reason, Stack);
+        {push, From, NewWatch, State} ->
+            {reply, {noreply, {Tenant, From, NewWatch}}, State}
     end.
 
 -spec handle_cast(term(), internalstate()) ->
@@ -622,74 +621,69 @@ get_state_key(Tuple) ->
     dgen_key:extend(Tuple, <<"s">>, ?CodecVersion).
 
 handle_consume(Tenant, K, Tuid, State = #state{dead_letter_threshold = Threshold}) ->
-    SlotKey = {?MODULE, last_msg},
-    erase(SlotKey),
-    try
-        Result = dgen_backend:transactional(Tenant, fun(Td) ->
-            case is_locked(Td, State) of
+    Quid = get_quid(Tuid),
+    Result = dgen_backend:transactional(Tenant, fun(Td) ->
+        case is_locked(Td, State) of
+            true ->
+                Watch = dgen_queue:watch_push(Td, Quid),
+                {{noreply, []}, undefined, State#state{watch = Watch}};
+            false ->
+                consume_queued(Td, K, Quid, Threshold, State)
+        end
+    end),
+    case Result of
+        {reraise, Class, Reason, Stack} ->
+            erlang:raise(Class, Reason, Stack);
+        {{lock, EventType, Msg}, ModState, State2} ->
+            State3 = resolve_version(State2),
+            consume_locked(EventType, Msg, ModState, false, State3);
+        _ ->
+            finalize(Result)
+    end.
+
+consume_queued(Td, K, Quid, Threshold, State) ->
+    case dgen_queue:peek_k(Td, K, Quid) of
+        {error, empty} ->
+            Watch = dgen_queue:watch_push(Td, Quid),
+            {{noreply, []}, undefined, State#state{watch = Watch}};
+        {ok, KVs} ->
+            [{RawKey, RawBin}] = KVs,
+            Envelope = normalize_message(binary_to_term(RawBin)),
+            N = envelope_attempts(Envelope),
+            State1 = State#state{watch = undefined},
+            case is_dead_letter(N, Threshold) of
                 true ->
-                    Watch = dgen_queue:watch_push(Td, get_quid(Tuid)),
-                    {{noreply, []}, undefined, State#state{watch = Watch}};
+                    dgen_queue:commit_k(Td, KVs, Quid),
+                    handle_dead_letter_internal(Td, to_dl_envelope(Envelope), N, State1);
                 false ->
-                    case dgen_queue:consume_k(Td, K, get_quid(Tuid)) of
-                        {[{RawKey, RawMsg}], Watch} ->
-                            Envelope = normalize_message(RawMsg),
-                            put(SlotKey, {RawKey, Envelope}),
-                            case Envelope of
-                                {cast, Request, N} ->
-                                    case is_dead_letter(N, Threshold) of
-                                        true ->
-                                            handle_dead_letter_internal(
-                                                Td, {cast, Request}, N, State#state{watch = Watch}
-                                            );
-                                        false ->
-                                            consume_cast(Td, Request, State#state{watch = Watch})
-                                    end;
-                                {call, Request, From, _Opts, N} ->
-                                    case is_dead_letter(N, Threshold) of
-                                        true ->
-                                            handle_dead_letter_internal(
-                                                Td, {call, Request, From}, N, State#state{
-                                                    watch = Watch
-                                                }
-                                            );
-                                        false ->
-                                            case
-                                                consume_call(
-                                                    Td, Request, From, State#state{watch = Watch}
-                                                )
-                                            of
-                                                {{reply, Reply, Actions}, ModState, State2} ->
-                                                    set_reply(Td, From, Reply),
-                                                    {{noreply, Actions}, ModState, State2};
-                                                R ->
-                                                    R
-                                            end
-                                    end
-                            end;
-                        {[], Watch} ->
-                            {{noreply, []}, undefined, State#state{watch = Watch}}
+                    try
+                        R = invoke_queued_msg(Td, Envelope, State1),
+                        dgen_queue:commit_k(Td, KVs, Quid),
+                        R
+                    catch
+                        Class:Reason:Stack ->
+                            dgen_queue:write_k(Td, RawKey, increment_envelope(Envelope)),
+                            {reraise, Class, Reason, Stack}
                     end
             end
-        end),
-        erase(SlotKey),
-        case Result of
-            {{lock, EventType, Msg}, ModState, State2} ->
-                State3 = resolve_version(State2),
-                consume_locked(EventType, Msg, ModState, false, State3);
-            _ ->
-                finalize(Result)
-        end
-    catch
-        Class:Reason:Stack ->
-            case erase(SlotKey) of
-                undefined ->
-                    ok;
-                {RawKey, Envelope} ->
-                    dgen_queue:update_message(Tenant, RawKey, increment_envelope(Envelope))
-            end,
-            erlang:raise(Class, Reason, Stack)
     end.
+
+invoke_queued_msg(Td, {cast, Request, _N}, State) ->
+    consume_cast(Td, Request, State);
+invoke_queued_msg(Td, {call, Request, From, _Opts, _N}, State) ->
+    case consume_call(Td, Request, From, State) of
+        {{reply, Reply, Actions}, ModState, State2} ->
+            set_reply(Td, From, Reply),
+            {{noreply, Actions}, ModState, State2};
+        Other ->
+            Other
+    end.
+
+envelope_attempts({cast, _R, N}) -> N;
+envelope_attempts({call, _R, _F, _O, N}) -> N.
+
+to_dl_envelope({cast, R, _N}) -> {cast, R};
+to_dl_envelope({call, R, F, _O, _N}) -> {call, R, F}.
 
 normalize_message({cast, R}) -> {cast, R, 0};
 normalize_message({cast, R, N}) -> {cast, R, N};
