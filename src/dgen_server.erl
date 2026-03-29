@@ -356,8 +356,8 @@ handle_call({call, Request, WatchTo, Options}, _LocalFrom, State = #state{}) ->
                             consume_call(Td, Request, LocalFrom, State)
                         catch
                             Class:Reason:Stack ->
-                                _ = PushFun(Td, State),
-                                {throw, Class, Reason, Stack}
+                                PushResult = PushFun(Td, State),
+                                {throw, Class, Reason, Stack, PushResult}
                         end
                 end;
             _ ->
@@ -378,8 +378,9 @@ handle_call({call, Request, WatchTo, Options}, _LocalFrom, State = #state{}) ->
             end;
         {{stop, Reason, Actions}, ModState, State2} ->
             finalize({{stop, Reason, Actions}, ModState, State2});
-        {throw, Class, Reason, Stack} ->
-            erlang:raise(Class, Reason, Stack);
+        {throw, Class, Reason, Stack, {push, From, NewWatch, State1}} ->
+            LocalReply = {noreply, {Tenant, From, NewWatch}},
+            {stop, {Class, Reason, Stack}, LocalReply, State1};
         {push, From, NewWatch, State1} ->
             LocalReply = {noreply, {Tenant, From, NewWatch}},
             {reply, LocalReply, State1}

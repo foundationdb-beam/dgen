@@ -5,7 +5,7 @@ defmodule DGenServer.InlineThrowTest do
   alias DGen.DStopper
 
   describe "inline call callback throw" do
-    test "throw pushes call to queue and re-throws", context do
+    test "throw pushes call to queue and stops server cleanly", context do
       tenant = context[:tenant]
       tuid = {"inline_throw"}
 
@@ -17,15 +17,15 @@ defmodule DGenServer.InlineThrowTest do
       # Queue should be empty before the call
       assert 0 = :dgen_queue.length(tenant, tuid)
 
-      # The inline call will invoke handle_call(:throw_me, ...) which throws.
-      # The try/catch inside the transaction pushes the call to the queue,
-      # then re-throws outside the transaction, crashing the gen_server.
-      # Capture the expected OTP crash log to avoid alarming test output.
+      # The inline call invokes handle_call(:throw_me, …) which throws.
+      # The server pushes the call to the durable queue, replies with
+      # {noreply, …} so the caller enters await_call_reply, then stops.
+      # No consumer is running, so the caller times out.
       capture_log(fn ->
         try do
-          DGenServer.call(pid, :throw_me, 10_000)
+          DGenServer.call(pid, :throw_me, 200)
         catch
-          :exit, _ -> :ok
+          :error, :timeout -> :ok
         end
 
         assert_receive {:DOWN, ^mref, :process, ^pid, _reason}, 5_000

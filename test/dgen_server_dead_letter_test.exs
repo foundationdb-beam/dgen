@@ -90,10 +90,7 @@ defmodule DGenServer.DeadLetterTest do
 
       Process.flag(:trap_exit, true)
 
-      # Start a non-consuming server so the call goes straight to the durable
-      # queue.  If a consuming server handled it inline it would crash before
-      # returning the gen_server reply, causing the caller to receive an :exit
-      # rather than waiting on the FDB reply key.
+      # Non-consuming push server: the call goes straight to the durable queue.
       {:ok, push_pid} =
         DGenServer.start_link(DCrasher, [tuid],
           tenant: tenant,
