@@ -372,7 +372,8 @@ inline_or_push(Td, Request, LocalFrom, WatchTo, Options, Tuid, State) ->
                     {From, NewWatch} = Push(0),
                     {push, From, NewWatch, State};
                 false ->
-                    try consume_call(Td, Request, LocalFrom, State)
+                    try
+                        consume_call(Td, Request, LocalFrom, State)
                     catch
                         Class:Reason:Stack ->
                             {From, NewWatch} = Push(1),

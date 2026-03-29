@@ -190,7 +190,6 @@ watch_push({Tx, Dir}, Quid) ->
     PushKey = get_push_key(Quid),
     B:watch(Tx, B:dir_pack(Dir, PushKey)).
 
-
 get_item_key(Quid) ->
     dgen_key:extend(Quid, ?QueueVersion, <<"i">>).
 
