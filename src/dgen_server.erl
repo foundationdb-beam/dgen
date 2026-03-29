@@ -341,7 +341,9 @@ handle_call({call, Request, WatchTo, Options}, GsFrom, State = #state{}) ->
     LocalFrom = make_ref(),
 
     PushFun = fun(Td, State0, Attempts) ->
-        {From, NewWatch} = dgen:push_call(Td, Tuid, get_quid(Tuid), Request, WatchTo, Options, Attempts),
+        {From, NewWatch} = dgen:push_call(
+            Td, Tuid, get_quid(Tuid), Request, WatchTo, Options, Attempts
+        ),
         {push, From, NewWatch, State0}
     end,
 
