@@ -129,6 +129,8 @@ call(Module, Server, Request, Timeout) ->
                 {error, timeout} ->
                     cleanup_call(Tenant, From),
                     erlang:error(timeout);
+                {raise, Class, Reason} ->
+                    erlang:raise(Class, Reason, []);
                 Reply ->
                     Reply
             end
@@ -155,6 +157,8 @@ await_call_reply(Tenant, From, ?FUTURE(WatchRef), Timeout) ->
             Reply;
         {watch, Watch} ->
             await_call_reply(Tenant, From, Watch, Timeout - (T2 - T1));
+        {raise, _, _} = Raise ->
+            Raise;
         {error, timeout} ->
             {error, timeout}
     end.
@@ -174,6 +178,9 @@ handle_call_ready(Tenant, From) ->
                 {watch, B:watch(Tx, dgen_mod_state_codec:term_first_key(Dir, From))};
             {ok, {reply, Reply}} ->
                 dgen_mod_state_codec:clear_term({Tx, Dir}, From),
-                {reply, Reply}
+                {reply, Reply};
+            {ok, {raise, Class, Reason}} ->
+                dgen_mod_state_codec:clear_term({Tx, Dir}, From),
+                {raise, Class, Reason}
         end
     end).

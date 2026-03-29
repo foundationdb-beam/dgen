@@ -26,12 +26,12 @@ The following options may be passed via the `Opts` proplist:
   the queue.
 - `reset` (default `false`) - when `true`, re-initialise the durable state
   even if it already exists.
-- `dead_letter_threshold` (default `3`) - number of consecutive processing
-  failures before a message is treated as a dead letter. When a message has
-  failed this many times its attempt count (stored in the message envelope) is
-  checked and the message is moved to the dead-letter queue, the caller is
-  notified (for `call` messages), and the optional `handle_dead_letter/2`
-  callback is invoked. Set to `infinity` to disable dead-lettering.
+- `dead_letter_threshold` (default `infinity`) - number of consecutive
+  processing failures before a message is treated as a dead letter. When a
+  message has failed this many times it is moved to the dead-letter queue, the
+  caller raises `{dead_letter, N}` (for `call` messages), and the optional
+  `handle_dead_letter/2` callback is invoked. `infinity` (the default) disables
+  dead-lettering entirely.
 
 ## Callbacks
 
@@ -125,7 +125,7 @@ argument is the
         undefined
         | {dgen_backend:versionstamp() | dgen_backend:future(), {ok, term()} | {error, not_found}},
     cache_misses = 0 :: non_neg_integer(),
-    dead_letter_threshold = 3 :: pos_integer() | infinity
+    dead_letter_threshold = infinity :: pos_integer() | infinity
 }).
 
 -type internalstate() :: #state{}.
@@ -307,7 +307,7 @@ parse_opts(Opts) ->
     Consume = proplists:get_value(consume, Opts, true),
     Reset = proplists:get_value(reset, Opts, false),
     Cache = proplists:get_value(cache, Opts, true),
-    DeadLetterThreshold = proplists:get_value(dead_letter_threshold, Opts, 3),
+    DeadLetterThreshold = proplists:get_value(dead_letter_threshold, Opts, infinity),
     {Tenant, Consume, Reset, Cache, DeadLetterThreshold}.
 
 -spec init(term()) -> {ok, internalstate()} | {error, term()}.
@@ -706,7 +706,7 @@ handle_dead_letter_internal(
     dgen_queue:push_dlq(Td, get_quid(Tuid), MsgEnvelope, AttemptCount),
     case MsgEnvelope of
         {call, _Request, From} ->
-            set_reply(Td, From, {error, {dead_letter, AttemptCount}});
+            set_raise(Td, From, error, {dead_letter, AttemptCount});
         _ ->
             ok
     end,
@@ -812,6 +812,17 @@ set_reply({Tx, Dir}, From, Reply) ->
         _ ->
             dgen_mod_state_codec:clear_term({Tx, Dir}, From),
             dgen_mod_state_codec:write_term({Tx, Dir}, From, {reply, Reply})
+    end.
+
+set_raise({Tx, Dir}, From, Class, Reason) ->
+    B = dgen_config:backend(),
+    ReplySentinelKey = dgen_mod_state_codec:term_first_key(Dir, From),
+    case B:wait(B:get(Tx, ReplySentinelKey)) of
+        not_found ->
+            ok;
+        _ ->
+            dgen_mod_state_codec:clear_term({Tx, Dir}, From),
+            dgen_mod_state_codec:write_term({Tx, Dir}, From, {raise, Class, Reason})
     end.
 
 init_tuid(Mod, Arg) ->

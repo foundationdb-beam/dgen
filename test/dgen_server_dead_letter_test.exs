@@ -83,7 +83,7 @@ defmodule DGenServer.DeadLetterTest do
   end
 
   describe "call dead-letter" do
-    test "caller receives dead_letter error instead of timing out", context do
+    test "caller raises dead_letter instead of timing out", context do
       tenant = context[:tenant]
       tuid = {"dead_letter_call"}
       threshold = 2
@@ -98,7 +98,14 @@ defmodule DGenServer.DeadLetterTest do
           dead_letter_threshold: threshold
         )
 
-      caller = Task.async(fn -> DGenServer.call(push_pid, :crash_me, 30_000) end)
+      caller =
+        Task.async(fn ->
+          try do
+            DGenServer.call(push_pid, :crash_me, 30_000)
+          catch
+            :error, {:dead_letter, n} -> {:dead_letter, n}
+          end
+        end)
 
       # threshold consumers crash; each failure increments the in-envelope count
       for _ <- 1..threshold do
@@ -109,10 +116,10 @@ defmodule DGenServer.DeadLetterTest do
       end
 
       # After threshold crashes the next consumer dead-letters the message and
-      # writes {error, {dead_letter, N}} to the reply key in FDB.
+      # writes a raise sentinel to the reply key in FDB; the caller raises.
       {:ok, pid_final} = start(tenant, tuid, threshold)
 
-      assert {:error, {:dead_letter, ^threshold}} = Task.await(caller, 10_000)
+      assert {:dead_letter, ^threshold} = Task.await(caller, 10_000)
       assert Process.alive?(pid_final)
 
       DGenServer.kill(pid_final, :normal)
@@ -120,17 +127,17 @@ defmodule DGenServer.DeadLetterTest do
     end
   end
 
-  describe "infinity threshold" do
-    test "crash loop continues when threshold is infinity", context do
+  describe "default (no dead-lettering)" do
+    test "crash loop continues indefinitely with default threshold", context do
       tenant = context[:tenant]
       tuid = {"dead_letter_infinity"}
 
       Process.flag(:trap_exit, true)
 
-      # With infinity, every consumer should crash repeatedly
+      # No dead_letter_threshold option — infinity is the default
       for _ <- 1..4 do
         capture_log(fn ->
-          {:ok, pid} = start(tenant, tuid, :infinity)
+          {:ok, pid} = DCrasher.start_link(tenant, tuid)
 
           if :dgen_queue.length(tenant, :dgen_server.get_quid(tuid)) == 0 do
             DGenServer.cast(pid, :crash_me)
