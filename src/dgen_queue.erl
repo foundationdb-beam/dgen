@@ -181,10 +181,10 @@ pop_k({Tx, Dir}, K, Quid) ->
     case B:get_range(Tx, QS, QE, [{limit, K}, {wait, true}]) of
         [] ->
             {{error, empty}, []};
-        KVs = [{S, _} | _] ->
+        KVs = [{FirstKey, _} | _] ->
             N = length(KVs),
-            {E, _} = lists:last(KVs),
-            B:clear_range(Tx, S, B:key_strinc(E)),
+            {LastKey, _} = lists:last(KVs),
+            B:clear_range(Tx, FirstKey, B:key_strinc(LastKey)),
             PopKey = get_pop_key(Quid),
             B:add(Tx, B:dir_pack(Dir, PopKey), N),
 
@@ -193,7 +193,7 @@ pop_k({Tx, Dir}, K, Quid) ->
                     N == K -> ok;
                     true -> {error, empty}
                 end,
-            {Status, [{S, binary_to_term(V)} || {S, V} <- KVs]}
+            {Status, [{Key, binary_to_term(V)} || {Key, V} <- KVs]}
     end.
 
 get_item_key(Quid) ->
