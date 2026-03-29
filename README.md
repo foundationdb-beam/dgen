@@ -245,6 +245,39 @@ DGenServer.start_link(MyMod, [], tenant: tenant, dead_letter_threshold: 3)
 
 <!-- tabs-close -->
 
+**Coordinating with the supervisor's restart intensity:**
+
+Each consumer crash counts as one restart from the supervisor's perspective. OTP supervisors enforce a *restart intensity* — a maximum number of restarts allowed within a sliding time window (`max_restarts` / `max_seconds` in Erlang; `max_restarts` / `max_seconds` in Elixir, defaulting to `3` restarts in `5` seconds). If the supervisor reaches this limit before `dead_letter_threshold` is hit, the supervisor itself terminates rather than the message being dead-lettered.
+
+To ensure dead-lettering takes effect, configure the supervisor so that it tolerates at least `dead_letter_threshold` restarts within the window. A practical approach is to set `max_restarts >= dead_letter_threshold` with a `max_seconds` value long enough to cover the expected crash-restart cycle time:
+
+<!-- tabs-open -->
+
+### Erlang
+
+```erlang
+%% Allow up to 5 restarts in 60 seconds — enough headroom for a threshold of 3.
+{ok, _} = supervisor:start_link({local, my_sup}, my_sup, []),
+
+%% In the supervisor's init/1:
+SupFlags = #{strategy => one_for_one, intensity => 5, period => 60},
+```
+
+### Elixir
+
+```elixir
+# Allow up to 5 restarts in 60 seconds — enough headroom for a threshold of 3.
+Supervisor.start_link(children,
+  strategy: :one_for_one,
+  max_restarts: 5,
+  max_seconds: 60
+)
+```
+
+<!-- tabs-close -->
+
+With `dead_letter_threshold: infinity` (the default), poison messages produce an unbounded crash loop. The supervisor will eventually exhaust its restart intensity and terminate, which is standard OTP crash-loop behavior. Set a finite threshold to bound the loop and keep the supervisor alive.
+
 **During `handle_locked`:**
 - `handle_locked` executes outside a transaction, so previous state changes have already been persisted
 - If the crash is an Erlang/Elixir throw, then the lock is cleared before the process exits
