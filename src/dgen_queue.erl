@@ -15,7 +15,6 @@ Push and pop counts are tracked with atomic `add` operations for O(1) length.
 -export([
     push_k/3,
     consume_k/3,
-    consume_k_ext/3,
     push_dlq/4,
     update_message/3,
     delete/2,
@@ -84,34 +83,15 @@ notify({Tx, Dir}, Quid) ->
 -doc """
 Pops up to `K` items from the queue.
 
-Returns `{Items, Watch}` where `Watch` is `undefined` if the queue still has
-items, or a future that fires when new items are pushed.
+Returns `{[{RawKey, Value}], Watch}` where `RawKey` is the packed FDB key of
+the item and `Watch` is `undefined` if the queue still has items, or a future
+that fires when new items are pushed. The raw key can be passed to
+`update_message/3` to update the item in-place.
 """.
 -endif.
 -spec consume_k(dgen_backend:tenant(), pos_integer(), quid()) ->
-    {[term()], undefined | dgen_backend:future()}.
-consume_k(Tenant, K, Quid) ->
-    dgen_backend:transactional(Tenant, fun(Td) ->
-        case pop_k(Td, K, Quid) of
-            {ok, KVs} ->
-                {[V || {_, V} <- KVs], undefined};
-            {{error, empty}, KVs} ->
-                {[V || {_, V} <- KVs], watch_push(Td, Quid)}
-        end
-    end).
-
--if(?DOCATTRS).
--doc """
-Like `consume_k/3` but also returns the raw FDB key for each item.
-
-Returns `{[{RawKey, Value}], Watch}` where `RawKey` is the packed FDB key of
-the message. The key can be used to update the message in-place via
-`update_message/3`.
-""".
--endif.
--spec consume_k_ext(dgen_backend:tenant(), pos_integer(), quid()) ->
     {[{dgen_backend:key(), term()}], undefined | dgen_backend:future()}.
-consume_k_ext(Tenant, K, Quid) ->
+consume_k(Tenant, K, Quid) ->
     dgen_backend:transactional(Tenant, fun(Td) ->
         case pop_k(Td, K, Quid) of
             {ok, KVs} ->

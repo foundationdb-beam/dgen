@@ -629,7 +629,7 @@ handle_consume(Tenant, K, Tuid, State = #state{dead_letter_threshold = Threshold
                     Watch = dgen_queue:watch_push(Td, get_quid(Tuid)),
                     {{noreply, []}, undefined, State#state{watch = Watch}};
                 false ->
-                    case dgen_queue:consume_k_ext(Td, K, get_quid(Tuid)) of
+                    case dgen_queue:consume_k(Td, K, get_quid(Tuid)) of
                         {[{RawKey, RawMsg}], Watch} ->
                             Envelope = normalize_message(RawMsg),
                             put(SlotKey, {RawKey, Envelope}),
