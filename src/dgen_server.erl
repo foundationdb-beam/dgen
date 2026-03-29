@@ -336,7 +336,7 @@ handle_call({call, Request, WatchTo, Options}, _LocalFrom, State = #state{watch 
     end),
     LocalReply = {noreply, {Tenant, From, NewWatch}},
     {reply, LocalReply, State};
-handle_call({call, Request, WatchTo, Options}, _LocalFrom, State = #state{}) ->
+handle_call({call, Request, WatchTo, Options}, GsFrom, State = #state{}) ->
     #state{tenant = Tenant, tuid = Tuid} = State,
     LocalFrom = make_ref(),
 
@@ -378,9 +378,9 @@ handle_call({call, Request, WatchTo, Options}, _LocalFrom, State = #state{}) ->
             end;
         {{stop, Reason, Actions}, ModState, State2} ->
             finalize({{stop, Reason, Actions}, ModState, State2});
-        {throw, Class, Reason, Stack, {push, From, NewWatch, State1}} ->
-            LocalReply = {noreply, {Tenant, From, NewWatch}},
-            {stop, {Class, Reason, Stack}, LocalReply, State1};
+        {throw, Class, Reason, Stack, {push, From, NewWatch, _State1}} ->
+            gen_server:reply(GsFrom, {noreply, {Tenant, From, NewWatch}}),
+            erlang:raise(Class, Reason, Stack);
         {push, From, NewWatch, State1} ->
             LocalReply = {noreply, {Tenant, From, NewWatch}},
             {reply, LocalReply, State1}
