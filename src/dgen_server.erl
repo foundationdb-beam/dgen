@@ -340,8 +340,8 @@ handle_call({call, Request, WatchTo, Options}, GsFrom, State = #state{}) ->
     #state{tenant = Tenant, tuid = Tuid} = State,
     LocalFrom = make_ref(),
 
-    PushFun = fun(Td, State0) ->
-        {From, NewWatch} = dgen:push_call(Td, Tuid, get_quid(Tuid), Request, WatchTo, Options),
+    PushFun = fun(Td, State0, Attempts) ->
+        {From, NewWatch} = dgen:push_call(Td, Tuid, get_quid(Tuid), Request, WatchTo, Options, Attempts),
         {push, From, NewWatch, State0}
     end,
 
@@ -350,18 +350,18 @@ handle_call({call, Request, WatchTo, Options}, GsFrom, State = #state{}) ->
             0 ->
                 case is_locked(Td, State) of
                     true ->
-                        PushFun(Td, State);
+                        PushFun(Td, State, 0);
                     false ->
                         try
                             consume_call(Td, Request, LocalFrom, State)
                         catch
                             Class:Reason:Stack ->
-                                PushResult = PushFun(Td, State),
+                                PushResult = PushFun(Td, State, 1),
                                 {throw, Class, Reason, Stack, PushResult}
                         end
                 end;
             _ ->
-                PushFun(Td, State)
+                PushFun(Td, State, 0)
         end
     end),
 
