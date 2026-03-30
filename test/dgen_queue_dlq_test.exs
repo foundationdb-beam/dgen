@@ -33,9 +33,10 @@ defmodule DGen.QueueDLQTest do
 
     # N=1 >= @threshold → dead-lettered; consumer does NOT crash
     {:ok, pid} = DCrasher.start_link(tenant, tuid, dead_letter_threshold: @threshold)
-    # Priority call returns once the consumer is idle (message has been processed)
+    # Priority call returns once the consumer is idle (dead-letter has been committed)
     DCrasher.get(pid)
-    DGenServer.kill(pid, :normal)
+    # Stop without deleting FDB state (DGenServer.kill would wipe the queue/DLQ)
+    GenServer.stop(pid)
 
     quid
   end
