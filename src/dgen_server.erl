@@ -652,16 +652,16 @@ consume_queued(Td, K, Quid, Threshold, State) ->
             State1 = State#state{watch = undefined},
             case is_dead_letter(N, Threshold) of
                 true ->
-                    dgen_queue:commit_k(Td, KVs, Quid),
+                    dgen_queue:consume_peeked(Td, KVs, Quid),
                     handle_dead_letter_internal(Td, to_dl_envelope(Envelope), N, State1);
                 false ->
                     try
                         R = invoke_queued_msg(Td, Envelope, State1),
-                        dgen_queue:commit_k(Td, KVs, Quid),
+                        dgen_queue:consume_peeked(Td, KVs, Quid),
                         R
                     catch
                         Class:Reason:Stack ->
-                            dgen_queue:write_k(Td, RawKey, increment_envelope(Envelope)),
+                            dgen_queue:update_peeked(Td, RawKey, increment_envelope(Envelope)),
                             {reraise, Class, Reason, Stack}
                     end
             end

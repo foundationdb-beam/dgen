@@ -15,8 +15,8 @@ Push and pop counts are tracked with atomic `add` operations for O(1) length.
 -export([
     push_k/3,
     peek_k/3,
-    commit_k/3,
-    write_k/3,
+    consume_peeked/3,
+    update_peeked/3,
     push_dlq/4,
     delete/2,
     length/2,
@@ -86,7 +86,7 @@ Reads up to `K` items from the queue without removing them.
 
 Returns `{ok, [{RawKey, RawBin}]}` where `RawBin` is the raw encoded value,
 or `{error, empty}` when the queue is empty. The items remain in the queue
-until `commit_k/3` is called. On failure `write_k/3` can overwrite a key
+until `consume_peeked/3` is called. On failure `update_peeked/3` can overwrite a key
 in-place within the same transaction to update the embedded attempt counter.
 
 All three operations must be called within the same transaction so that the
@@ -112,8 +112,8 @@ Call this within the same transaction as `peek_k/3` after the callback
 succeeds to commit the consume.
 """.
 -endif.
--spec commit_k(dgen_backend:tenant(), [{dgen_backend:key(), binary()}], quid()) -> ok.
-commit_k({Tx, Dir}, KVs, Quid) ->
+-spec consume_peeked(dgen_backend:tenant(), [{dgen_backend:key(), binary()}], quid()) -> ok.
+consume_peeked({Tx, Dir}, KVs, Quid) ->
     B = dgen_config:backend(),
     N = length(KVs),
     [{FirstKey, _} | _] = KVs,
@@ -131,8 +131,8 @@ to update the embedded attempt counter before the transaction commits. The
 updated message will be visible to the next consumer.
 """.
 -endif.
--spec write_k(dgen_backend:tenant(), dgen_backend:key(), term()) -> ok.
-write_k({Tx, _Dir}, Key, Envelope) ->
+-spec update_peeked(dgen_backend:tenant(), dgen_backend:key(), term()) -> ok.
+update_peeked({Tx, _Dir}, Key, Envelope) ->
     B = dgen_config:backend(),
     B:set(Tx, Key, term_to_binary(Envelope)).
 
