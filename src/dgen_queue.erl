@@ -241,12 +241,10 @@ queue with attempt count 0, and deletes the DLQ entry. Returns
 requeue_dlq_entry(Tenant, Quid, DlqKey) ->
     dgen_backend:transactional(Tenant, fun({Tx, Dir}) ->
         B = dgen_config:backend(),
-        {DS, DE} = B:dir_range(Dir, get_dlq_key(Quid)),
-        KVs = B:get_range(Tx, DS, DE, [{wait, true}]),
-        case lists:keyfind(DlqKey, 1, KVs) of
-            false ->
+        case B:wait(B:get(Tx, DlqKey)) of
+            not_found ->
                 {error, not_found};
-            {_K, Bin} ->
+            Bin ->
                 {Envelope, _AttemptCount, _Ts} = binary_to_term(Bin),
                 ItemKey = get_item_key(Quid),
                 ItemKey2 = dgen_key:extend(ItemKey, undefined),
