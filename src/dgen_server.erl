@@ -26,6 +26,12 @@ The following options may be passed via the `Opts` proplist:
   the queue.
 - `reset` (default `false`) - when `true`, re-initialise the durable state
   even if it already exists.
+- `dead_letter_threshold` (default `infinity`) - number of consecutive
+  processing failures before a message is treated as a dead letter. When a
+  message has failed this many times it is moved to the dead-letter queue, the
+  caller raises `{dead_letter, N}` (for `call` messages), and the optional
+  `handle_dead_letter/2` callback is invoked. `infinity` (the default) disables
+  dead-lettering entirely.
 
 ## Callbacks
 
@@ -34,6 +40,9 @@ The following options may be passed via the `Opts` proplist:
   `{reply, Reply, State, Actions}`.
 - `handle_cast/2` - return `{noreply, State}` or `{noreply, State, Actions}`.
 - `handle_info/2` - return `{noreply, State}` or `{noreply, State, Actions}`.
+- `handle_dead_letter/2` (optional) - called after a message is dead-lettered.
+  Receives `(Msg, AttemptCount)`. Return value is ignored. Useful for custom
+  alerting or metrics.
 
 `Actions` is a list of 1-arity funs executed after the transaction commits. The
 argument is the
@@ -69,12 +78,20 @@ argument is the
 -callback init(Args :: term()) -> init_ret().
 -callback handle_cast(Msg :: term(), State :: state()) -> noreply_ret() | lock_ret() | stop_ret().
 -callback handle_call(Request :: term(), From :: from(), State :: state()) ->
-    reply_ret() | noreply_ret() | lock_ret() | stop_ret().
+    reply_ret() | lock_ret() | stop_ret().
 -callback handle_info(Info :: term(), State :: state()) -> noreply_ret() | stop_ret().
 -callback handle_locked(EventType :: event_type(), Msg :: term(), State :: state()) ->
     reply_ret() | noreply_ret() | stop_ret().
 
--optional_callbacks([handle_cast/2, handle_call/3, handle_info/2, handle_locked/3]).
+-callback handle_dead_letter(Msg :: term(), AttemptCount :: non_neg_integer()) -> any().
+
+-optional_callbacks([
+    handle_cast/2,
+    handle_call/3,
+    handle_info/2,
+    handle_locked/3,
+    handle_dead_letter/2
+]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
@@ -84,6 +101,7 @@ argument is the
     | {consume, boolean()}
     | {reset, boolean()}
     | {cache, boolean()}
+    | {dead_letter_threshold, pos_integer() | infinity}
     | gen_server:start_opt().
 -type options() :: [option()].
 -type start_ret() :: gen_server:start_ret().
@@ -106,7 +124,8 @@ argument is the
     mod_state_cache ::
         undefined
         | {dgen_backend:versionstamp() | dgen_backend:future(), {ok, term()} | {error, not_found}},
-    cache_misses = 0 :: non_neg_integer()
+    cache_misses = 0 :: non_neg_integer(),
+    dead_letter_threshold = infinity :: pos_integer() | infinity
 }).
 
 -type internalstate() :: #state{}.
@@ -120,8 +139,8 @@ See `start_link/3` for details on `Mod`, `Arg`, and `Opts`.
 -endif.
 -spec start(module(), term(), options()) -> start_ret().
 start(Mod, Arg, Opts) ->
-    {Tenant, Consume, Reset, Cache} = parse_opts(Opts),
-    gen_server:start(?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache}, Opts).
+    {Tenant, Consume, Reset, Cache, DLT} = parse_opts(Opts),
+    gen_server:start(?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT}, Opts).
 
 -if(?DOCATTRS).
 -doc """
@@ -132,8 +151,8 @@ See `start_link/3` for details on `Mod`, `Arg`, and `Opts`.
 -endif.
 -spec start(gen_server:server_name(), module(), term(), options()) -> start_ret().
 start(Reg, Mod, Arg, Opts) ->
-    {Tenant, Consume, Reset, Cache} = parse_opts(Opts),
-    gen_server:start(Reg, ?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache}, Opts).
+    {Tenant, Consume, Reset, Cache, DLT} = parse_opts(Opts),
+    gen_server:start(Reg, ?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT}, Opts).
 
 -if(?DOCATTRS).
 -doc """
@@ -147,8 +166,8 @@ Starts a dgen_server process linked to the calling process.
 -endif.
 -spec start_link(module(), term(), options()) -> start_ret().
 start_link(Mod, Arg, Opts) ->
-    {Tenant, Consume, Reset, Cache} = parse_opts(Opts),
-    gen_server:start_link(?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache}, Opts).
+    {Tenant, Consume, Reset, Cache, DLT} = parse_opts(Opts),
+    gen_server:start_link(?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT}, Opts).
 
 -if(?DOCATTRS).
 -doc """
@@ -159,8 +178,8 @@ See `start_link/3` for details on `Mod`, `Arg`, and `Opts`.
 -endif.
 -spec start_link(gen_server:server_name(), module(), term(), options()) -> start_ret().
 start_link(Reg, Mod, Arg, Opts) ->
-    {Tenant, Consume, Reset, Cache} = parse_opts(Opts),
-    gen_server:start_link(Reg, ?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache}, Opts).
+    {Tenant, Consume, Reset, Cache, DLT} = parse_opts(Opts),
+    gen_server:start_link(Reg, ?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT}, Opts).
 
 -if(?DOCATTRS).
 -doc "Sends an asynchronous cast request to the dgen_server's durable queue.".
@@ -288,13 +307,20 @@ parse_opts(Opts) ->
     Consume = proplists:get_value(consume, Opts, true),
     Reset = proplists:get_value(reset, Opts, false),
     Cache = proplists:get_value(cache, Opts, true),
-    {Tenant, Consume, Reset, Cache}.
+    DeadLetterThreshold = proplists:get_value(dead_letter_threshold, Opts, infinity),
+    {Tenant, Consume, Reset, Cache, DeadLetterThreshold}.
 
 -spec init(term()) -> {ok, internalstate()} | {error, term()}.
-init({Tenant, Mod, Arg, Consume, Reset, Cache}) ->
+init({Tenant, Mod, Arg, Consume, Reset, Cache, DeadLetterThreshold}) ->
     case init_tuid(Mod, Arg) of
         {ok, Tuid, InitialState} ->
-            State = #state{tenant = Tenant, mod = Mod, tuid = Tuid, cache = Cache},
+            State = #state{
+                tenant = Tenant,
+                mod = Mod,
+                tuid = Tuid,
+                cache = Cache,
+                dead_letter_threshold = DeadLetterThreshold
+            },
             {_, State1} = init_mod_state(Tenant, InitialState, Reset, State),
             [gen_server:cast(self(), consume) || Consume],
             {ok, State1};
@@ -310,54 +336,13 @@ handle_call({call, Request, WatchTo, Options}, _LocalFrom, State = #state{watch 
     end),
     LocalReply = {noreply, {Tenant, From, NewWatch}},
     {reply, LocalReply, State};
-handle_call({call, Request, WatchTo, Options}, _LocalFrom, State = #state{}) ->
+handle_call({call, Request, WatchTo, Options}, GsFrom, State = #state{}) ->
     #state{tenant = Tenant, tuid = Tuid} = State,
     LocalFrom = make_ref(),
-
-    PushFun = fun(Td, State0) ->
-        {From, NewWatch} = dgen:push_call(Td, Tuid, get_quid(Tuid), Request, WatchTo, Options),
-        {push, From, NewWatch, State0}
-    end,
-
     Result = dgen_backend:transactional(Tenant, fun(Td) ->
-        case dgen_queue:length(Td, get_quid(State#state.tuid)) of
-            0 ->
-                case is_locked(Td, State) of
-                    true ->
-                        PushFun(Td, State);
-                    false ->
-                        try
-                            consume_call(Td, Request, LocalFrom, State)
-                        catch
-                            Class:Reason:Stack ->
-                                _ = PushFun(Td, State),
-                                {throw, Class, Reason, Stack}
-                        end
-                end;
-            _ ->
-                PushFun(Td, State)
-        end
+        inline_or_push(Td, Request, LocalFrom, WatchTo, Options, Tuid, State)
     end),
-
-    case Result of
-        {{reply, Reply, Actions}, ModState, State2} ->
-            LocalReply = {reply, Reply},
-            finalize({{reply, LocalReply, Actions}, ModState, State2});
-        {{lock, EventType, Msg}, ModState, State2} ->
-            case consume_locked(EventType, Msg, ModState, true, State2) of
-                {reply, Reply, State3} ->
-                    {reply, {reply, Reply}, State3};
-                Other ->
-                    Other
-            end;
-        {{stop, Reason, Actions}, ModState, State2} ->
-            finalize({{stop, Reason, Actions}, ModState, State2});
-        {throw, Class, Reason, Stack} ->
-            erlang:raise(Class, Reason, Stack);
-        {push, From, NewWatch, State1} ->
-            LocalReply = {noreply, {Tenant, From, NewWatch}},
-            {reply, LocalReply, State1}
-    end;
+    finalize_inline_call(Result, GsFrom, Tenant);
 handle_call(outbox_cast, _From, State = #state{tenant = {_Db, Dir}, tuid = Tuid}) ->
     Quid = get_quid(Tuid),
     Closure = fun(Tx, Message) ->
@@ -374,6 +359,48 @@ handle_call({priority, Request}, _From, State = #state{tenant = Tenant}) ->
             consume_locked(EventType, Msg, ModState, true, State1);
         _ ->
             finalize(Result)
+    end.
+
+inline_or_push(Td, Request, LocalFrom, WatchTo, Options, Tuid, State) ->
+    Push = fun(Attempts) ->
+        dgen:push_call(Td, Tuid, get_quid(Tuid), Request, WatchTo, Options, Attempts)
+    end,
+    case dgen_queue:length(Td, get_quid(Tuid)) of
+        0 ->
+            case is_locked(Td, State) of
+                true ->
+                    {From, NewWatch} = Push(0),
+                    {push, From, NewWatch, State};
+                false ->
+                    try
+                        consume_call(Td, Request, LocalFrom, State)
+                    catch
+                        Class:Reason:Stack ->
+                            {From, NewWatch} = Push(1),
+                            {push_after_fail, From, NewWatch, State, Class, Reason, Stack}
+                    end
+            end;
+        _ ->
+            {From, NewWatch} = Push(0),
+            {push, From, NewWatch, State}
+    end.
+
+finalize_inline_call(Result, GsFrom, Tenant) ->
+    case Result of
+        {{reply, Reply, Actions}, ModState, State} ->
+            finalize({{reply, {reply, Reply}, Actions}, ModState, State});
+        {{lock, EventType, Msg}, ModState, State} ->
+            case consume_locked(EventType, Msg, ModState, true, State) of
+                {reply, Reply, State2} -> {reply, {reply, Reply}, State2};
+                Other -> Other
+            end;
+        {{stop, Reason, Actions}, ModState, State} ->
+            finalize({{stop, Reason, Actions}, ModState, State});
+        {push_after_fail, From, NewWatch, _State, Class, Reason, Stack} ->
+            gen_server:reply(GsFrom, {noreply, {Tenant, From, NewWatch}}),
+            erlang:raise(Class, Reason, Stack);
+        {push, From, NewWatch, State} ->
+            {reply, {noreply, {Tenant, From, NewWatch}}, State}
     end.
 
 -spec handle_cast(term(), internalstate()) ->
@@ -592,36 +619,108 @@ handle_actions([Action | Actions], Acc, ModState) ->
 get_state_key(Tuple) ->
     dgen_key:extend(Tuple, <<"s">>, ?CodecVersion).
 
-handle_consume(Tenant, K, Tuid, State) ->
+handle_consume(Tenant, K, Tuid, State = #state{dead_letter_threshold = Threshold}) ->
+    Quid = get_quid(Tuid),
     Result = dgen_backend:transactional(Tenant, fun(Td) ->
         case is_locked(Td, State) of
             true ->
-                Watch = dgen_queue:watch_push(Td, get_quid(Tuid)),
+                Watch = dgen_queue:watch_push(Td, Quid),
                 {{noreply, []}, undefined, State#state{watch = Watch}};
             false ->
-                case dgen_queue:consume_k(Td, K, get_quid(Tuid)) of
-                    {[{call, Request, From, _CallOptions}], Watch} ->
-                        case consume_call(Td, Request, From, State#state{watch = Watch}) of
-                            {{reply, Reply, Actions}, ModState, State2} ->
-                                set_reply(Td, From, Reply),
-                                {{noreply, Actions}, ModState, State2};
-                            Result ->
-                                Result
-                        end;
-                    {[{cast, Request}], Watch} ->
-                        consume_cast(Td, Request, State#state{watch = Watch});
-                    {[], Watch} ->
-                        {{noreply, []}, undefined, State#state{watch = Watch}}
-                end
+                consume_queued(Td, K, Quid, Threshold, State)
         end
     end),
     case Result of
+        {reraise, Class, Reason, Stack} ->
+            erlang:raise(Class, Reason, Stack);
         {{lock, EventType, Msg}, ModState, State2} ->
             State3 = resolve_version(State2),
             consume_locked(EventType, Msg, ModState, false, State3);
         _ ->
             finalize(Result)
     end.
+
+consume_queued(Td, K, Quid, Threshold, State) ->
+    case dgen_queue:peek_k(Td, K, Quid) of
+        {error, empty} ->
+            Watch = dgen_queue:watch_push(Td, Quid),
+            {{noreply, []}, undefined, State#state{watch = Watch}};
+        {ok, KVs} ->
+            [{RawKey, RawBin}] = KVs,
+            Envelope = normalize_message(binary_to_term(RawBin)),
+            N = envelope_attempts(Envelope),
+            State1 = State#state{watch = undefined},
+            case is_dead_letter(N, Threshold) of
+                true ->
+                    dgen_queue:consume_peeked(Td, KVs, Quid),
+                    handle_dead_letter_internal(Td, to_dl_envelope(Envelope), N, State1);
+                false ->
+                    try
+                        R = invoke_queued_msg(Td, Envelope, State1),
+                        dgen_queue:consume_peeked(Td, KVs, Quid),
+                        R
+                    catch
+                        Class:Reason:Stack ->
+                            dgen_queue:update_peeked(Td, RawKey, increment_envelope(Envelope)),
+                            {reraise, Class, Reason, Stack}
+                    end
+            end
+    end.
+
+invoke_queued_msg(Td, {cast, Request, _N}, State) ->
+    consume_cast(Td, Request, State);
+invoke_queued_msg(Td, {call, Request, From, _Opts, _N}, State) ->
+    case consume_call(Td, Request, From, State) of
+        {{reply, Reply, Actions}, ModState, State2} ->
+            set_reply(Td, From, Reply),
+            {{noreply, Actions}, ModState, State2};
+        Other ->
+            Other
+    end.
+
+envelope_attempts({cast, _R, N}) -> N;
+envelope_attempts({call, _R, _F, _O, N}) -> N.
+
+to_dl_envelope({cast, R, _N}) -> {cast, R};
+to_dl_envelope({call, R, F, _O, _N}) -> {call, R, F}.
+
+normalize_message({cast, R}) -> {cast, R, 0};
+normalize_message({cast, R, N}) -> {cast, R, N};
+normalize_message({call, R, F, O}) -> {call, R, F, O, 0};
+normalize_message({call, R, F, O, N}) -> {call, R, F, O, N}.
+
+is_dead_letter(_N, infinity) -> false;
+is_dead_letter(N, Threshold) -> N >= Threshold.
+
+increment_envelope({cast, R, N}) -> {cast, R, N + 1};
+increment_envelope({call, R, F, O, N}) -> {call, R, F, O, N + 1}.
+
+handle_dead_letter_internal(
+    Td, MsgEnvelope, AttemptCount, State = #state{mod = Mod, tuid = Tuid}
+) ->
+    dgen_queue:push_dlq(Td, get_quid(Tuid), MsgEnvelope, AttemptCount),
+    case MsgEnvelope of
+        {call, _Request, From} ->
+            set_raise(Td, From, error, {dead_letter, AttemptCount});
+        _ ->
+            ok
+    end,
+    Actions =
+        case erlang:function_exported(Mod, handle_dead_letter, 2) of
+            true ->
+                Msg =
+                    case MsgEnvelope of
+                        {call, R, _} -> R;
+                        {cast, R} -> R
+                    end,
+                [fun(_) -> Mod:handle_dead_letter(Msg, AttemptCount) end];
+            false ->
+                []
+        end,
+    logger:warning("dgen_server: message dead-lettered after ~b attempts: ~p", [
+        AttemptCount, MsgEnvelope
+    ]),
+    {{noreply, Actions}, undefined, State}.
 
 consume_call(Td, Request, From, State) ->
     case invoke_tx_callback(Td, handle_call, [Request, From], State) of
@@ -698,16 +797,22 @@ consume_info(Td, Info, State) ->
             )
     end.
 
-set_reply({Tx, Dir}, From, Reply) ->
+set_reply(Td, From, Reply) ->
+    write_reply_slot(Td, From, {reply, Reply}).
+
+set_raise(Td, From, Class, Reason) ->
+    write_reply_slot(Td, From, {raise, Class, Reason}).
+
+% Skip writing if the caller timed out and cleared the reply keys.
+write_reply_slot({Tx, Dir}, From, Value) ->
     B = dgen_config:backend(),
     ReplySentinelKey = dgen_mod_state_codec:term_first_key(Dir, From),
-    % Skip writing the reply if the caller timed out and cleared the reply keys
     case B:wait(B:get(Tx, ReplySentinelKey)) of
         not_found ->
             ok;
         _ ->
             dgen_mod_state_codec:clear_term({Tx, Dir}, From),
-            dgen_mod_state_codec:write_term({Tx, Dir}, From, {reply, Reply})
+            dgen_mod_state_codec:write_term({Tx, Dir}, From, Value)
     end.
 
 init_tuid(Mod, Arg) ->

@@ -50,7 +50,13 @@ jobs:
       - name: Install FoundationDB
         run: sudo dpkg -i /tmp/fdb-debs/foundationdb-clients_${FDB_VERSION}-1_amd64.deb
       - run: mix deps.get
-      - run: mix lint
+      - run: mix format --check-formatted
+      - name: Check Erlang formatting
+        run: |
+          mix cmd rebar3 fmt
+          git diff --exit-code src/ || (echo "^^^ erlfmt would make the above changes ^^^" && exit 1)
+      - run: mix deps.unlock --check-unused
+      - run: mix dialyzer
 
   test:
     runs-on: ${{ matrix.os }}
@@ -96,5 +102,5 @@ jobs:
           sudo dpkg -i /tmp/fdb-debs/foundationdb-server_${FDB_VERSION}-1_amd64.deb
       - run: mix deps.get --only test
       - run: mix deps.compile
-      - run: mix compile
+      - run: mix compile --warnings-as-errors
       - run: mix test

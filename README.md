@@ -205,7 +205,7 @@ The cache is invalidated when the process detects that another consumer has modi
 
 DGenServer has well-defined behavior during crashes.
 
-**Key guarantee:** Standard `call` and `cast` messages are processed **exactly-once** under normal operation. In the event of a crash before the transaction commits, the message will be retried — so in crash scenarios, delivery is **at-least-once**. Design your callbacks to be idempotent when possible.
+**Key guarantee:** Standard `call` and `cast` messages are processed **exactly-once** under normal operation. In the event of a crash before the transaction commits, the message will be retried — so in crash scenarios, delivery is **at-least-once**. When `dead_letter_threshold` is set, retries are bounded by that limit. Design your callbacks to be idempotent when possible.
 
 **During `init/1`:**
 - If the first `init/1` crashes, the gen_server process exits before any state is persisted
@@ -214,10 +214,123 @@ DGenServer has well-defined behavior during crashes.
 
 **During transactional callbacks (`handle_call`, `handle_cast`, `handle_info`):**
 - The database transaction is automatically aborted — no state changes are committed
-- For `call` and `cast`: the message remains in the durable queue and will be retried by the next consumer
+- For `call` and `cast`: the message remains in the durable queue and will be retried by the next consumer. If `dead_letter_threshold` is set, each failed attempt increments a counter embedded in the message envelope; once the counter reaches the threshold, the message is moved to the dead-letter queue instead of being retried (see below).
 - For `priority_call` and `priority_cast`: the message is lost (it never entered the queue)
 - For `handle_info`: the Erlang message is lost (info messages are not durable)
 - State remains unchanged from before the callback was invoked
+
+**Dead-letter queue:**
+
+A *poison message* is a queue message that consistently crashes consumers. To enable bounded retries, set `dead_letter_threshold` to a positive integer. Each message envelope carries an attempt counter; when the counter reaches the threshold, the message is moved to the dead-letter queue (DLQ) in FoundationDB rather than being retried:
+
+- For `call` messages, the blocked caller raises `{dead_letter, N}` where `N` is the attempt count.
+- The optional `handle_dead_letter/2` callback is invoked with the original message and attempt count, if defined.
+- A warning is logged.
+
+Dead-lettering is **disabled by default** (`dead_letter_threshold: infinity`). Enable it with the start option:
+
+<!-- tabs-open -->
+
+### Erlang
+
+```erlang
+dgen_server:start(MyMod, [], [{tenant, Tenant}, {dead_letter_threshold, 3}])
+```
+
+### Elixir
+
+```elixir
+DGenServer.start_link(MyMod, [], tenant: tenant, dead_letter_threshold: 3)
+```
+
+<!-- tabs-close -->
+
+**Coordinating with the supervisor's restart intensity:**
+
+Each consumer crash counts as one restart from the supervisor's perspective. OTP supervisors enforce a *restart intensity* — a maximum number of restarts allowed within a sliding time window (`max_restarts` / `max_seconds` in Erlang; `max_restarts` / `max_seconds` in Elixir, defaulting to `3` restarts in `5` seconds). If the supervisor reaches this limit before `dead_letter_threshold` is hit, the supervisor itself terminates rather than the message being dead-lettered.
+
+To ensure dead-lettering takes effect, configure the supervisor so that it tolerates at least `dead_letter_threshold` restarts within the window. A practical approach is to set `max_restarts >= dead_letter_threshold` with a `max_seconds` value long enough to cover the expected crash-restart cycle time:
+
+<!-- tabs-open -->
+
+### Erlang
+
+```erlang
+%% Allow up to 5 restarts in 60 seconds — enough headroom for a threshold of 3.
+{ok, _} = supervisor:start_link({local, my_sup}, my_sup, []),
+
+%% In the supervisor's init/1:
+SupFlags = #{strategy => one_for_one, intensity => 5, period => 60},
+```
+
+### Elixir
+
+```elixir
+# Allow up to 5 restarts in 60 seconds — enough headroom for a threshold of 3.
+Supervisor.start_link(children,
+  strategy: :one_for_one,
+  max_restarts: 5,
+  max_seconds: 60
+)
+```
+
+<!-- tabs-close -->
+
+With `dead_letter_threshold: infinity` (the default), poison messages produce an unbounded crash loop. The supervisor will eventually exhaust its restart intensity and terminate, which is standard OTP crash-loop behavior. Set a finite threshold to bound the loop and keep the supervisor alive.
+
+**Inspecting and managing the dead-letter queue:**
+
+Dead-lettered messages accumulate in FoundationDB and are not automatically cleared. An operator can inspect and manage them from a remote shell using functions in `dgen_queue`. The `Quid` for a server is obtained with `dgen_server:get_quid/1` (Erlang) or `:dgen_server.get_quid/1` (Elixir), passing the `tuid` the server was started with.
+
+<!-- tabs-open -->
+
+### Erlang
+
+```erlang
+Quid = dgen_server:get_quid(Tuid),
+
+%% Inspect — returns [{Key, Envelope, AttemptCount, TimestampMs}]
+Entries = dgen_queue:peek_dlq(Tenant, Quid),
+
+%% Count without decoding
+dgen_queue:dlq_length(Tenant, Quid),
+
+%% Requeue one entry (resets attempt count to 0, atomic with DLQ delete)
+{Key, _Envelope, _N, _Ts} = hd(Entries),
+dgen_queue:requeue_dlq_entry(Tenant, Quid, Key),  %% ok | {error, not_found}
+
+%% Discard one entry permanently
+dgen_queue:delete_dlq_entry(Tenant, Key),
+
+%% Discard all entries for the queue
+dgen_queue:purge_dlq(Tenant, Quid).
+```
+
+### Elixir
+
+```elixir
+quid = :dgen_server.get_quid(tuid)
+
+# Inspect — returns [{key, envelope, attempt_count, timestamp_ms}]
+entries = :dgen_queue.peek_dlq(tenant, quid)
+
+# Count without decoding
+:dgen_queue.dlq_length(tenant, quid)
+
+# Requeue one entry (resets attempt count to 0, atomic with DLQ delete)
+{key, _envelope, _n, _ts} = hd(entries)
+:dgen_queue.requeue_dlq_entry(tenant, quid, key)  # :ok | {:error, :not_found}
+
+# Discard one entry permanently
+:dgen_queue.delete_dlq_entry(tenant, key)
+
+# Discard all entries for the queue
+:dgen_queue.purge_dlq(tenant, quid)
+```
+
+<!-- tabs-close -->
+
+`requeue_dlq_entry/3` is atomic: it pushes the envelope back onto the main queue with the attempt count reset to zero and deletes the DLQ entry in a single FDB transaction. If the root cause of the crashes has been fixed and the server has been redeployed, requeueing allows the message to be retried from a clean state.
 
 **During `handle_locked`:**
 - `handle_locked` executes outside a transaction, so previous state changes have already been persisted

@@ -29,7 +29,7 @@ the first chunk key; the client always reads via `get_range`.
 """.
 -endif.
 
--export([get_waiting_key/1, get_from/2, call/4, push_call/6]).
+-export([get_waiting_key/1, get_from/2, call/4, push_call/6, push_call/7]).
 
 -include("../include/dgen.hrl").
 
@@ -49,14 +49,27 @@ Returns `{From, Watch}` where `From` is the from-key tuple.
 -endif.
 -spec push_call(term(), tuid(), dgen_queue:quid(), term(), pid(), list()) ->
     {from(), dgen_backend:future()}.
-push_call({Tx, Dir}, Tuid, Quid, Request, WatchTo, Options) ->
+push_call(Td, Tuid, Quid, Request, WatchTo, Options) ->
+    push_call(Td, Tuid, Quid, Request, WatchTo, Options, 0).
+
+-if(?DOCATTRS).
+-doc """
+Like `push_call/6` but records `Attempts` as the initial attempt count in the
+message envelope. Pass a non-zero value when the call has already failed at
+least once (e.g. after an inline execution attempt) so the dead-letter
+threshold accounts for all failures.
+""".
+-endif.
+-spec push_call(term(), tuid(), dgen_queue:quid(), term(), pid(), list(), non_neg_integer()) ->
+    {from(), dgen_backend:future()}.
+push_call({Tx, Dir}, Tuid, Quid, Request, WatchTo, Options, Attempts) ->
     B = dgen_config:backend(),
     WaitingKey = get_waiting_key(Tuid),
     From = get_from(WaitingKey, make_ref()),
     dgen_mod_state_codec:write_term({Tx, Dir}, From, noreply),
     ReplySentinelKey = dgen_mod_state_codec:term_first_key(Dir, From),
     Future = B:watch(Tx, ReplySentinelKey, [{to, WatchTo}]),
-    dgen_queue:push_k({Tx, Dir}, Quid, [{call, Request, From, Options}]),
+    dgen_queue:push_k({Tx, Dir}, Quid, [{call, Request, From, Options, Attempts}]),
     {From, Future}.
 
 -if(?DOCATTRS).
@@ -116,6 +129,8 @@ call(Module, Server, Request, Timeout) ->
                 {error, timeout} ->
                     cleanup_call(Tenant, From),
                     erlang:error(timeout);
+                {raise, error, Reason} ->
+                    erlang:error(Reason);
                 Reply ->
                     Reply
             end
@@ -142,6 +157,8 @@ await_call_reply(Tenant, From, ?FUTURE(WatchRef), Timeout) ->
             Reply;
         {watch, Watch} ->
             await_call_reply(Tenant, From, Watch, Timeout - (T2 - T1));
+        {raise, _, _} = Raise ->
+            Raise;
         {error, timeout} ->
             {error, timeout}
     end.
@@ -161,6 +178,9 @@ handle_call_ready(Tenant, From) ->
                 {watch, B:watch(Tx, dgen_mod_state_codec:term_first_key(Dir, From))};
             {ok, {reply, Reply}} ->
                 dgen_mod_state_codec:clear_term({Tx, Dir}, From),
-                {reply, Reply}
+                {reply, Reply};
+            {ok, {raise, Class, Reason}} ->
+                dgen_mod_state_codec:clear_term({Tx, Dir}, From),
+                {raise, Class, Reason}
         end
     end).
