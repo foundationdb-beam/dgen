@@ -278,6 +278,60 @@ Supervisor.start_link(children,
 
 With `dead_letter_threshold: infinity` (the default), poison messages produce an unbounded crash loop. The supervisor will eventually exhaust its restart intensity and terminate, which is standard OTP crash-loop behavior. Set a finite threshold to bound the loop and keep the supervisor alive.
 
+**Inspecting and managing the dead-letter queue:**
+
+Dead-lettered messages accumulate in FoundationDB and are not automatically cleared. An operator can inspect and manage them from a remote shell using functions in `dgen_queue`. The `Quid` for a server is obtained with `dgen_server:get_quid/1` (Erlang) or `:dgen_server.get_quid/1` (Elixir), passing the `tuid` the server was started with.
+
+<!-- tabs-open -->
+
+### Erlang
+
+```erlang
+Quid = dgen_server:get_quid(Tuid),
+
+%% Inspect — returns [{Key, Envelope, AttemptCount, TimestampMs}]
+Entries = dgen_queue:peek_dlq(Tenant, Quid),
+
+%% Count without decoding
+dgen_queue:dlq_length(Tenant, Quid),
+
+%% Requeue one entry (resets attempt count to 0, atomic with DLQ delete)
+{Key, _Envelope, _N, _Ts} = hd(Entries),
+dgen_queue:requeue_dlq_entry(Tenant, Quid, Key),  %% ok | {error, not_found}
+
+%% Discard one entry permanently
+dgen_queue:delete_dlq_entry(Tenant, Key),
+
+%% Discard all entries for the queue
+dgen_queue:purge_dlq(Tenant, Quid).
+```
+
+### Elixir
+
+```elixir
+quid = :dgen_server.get_quid(tuid)
+
+# Inspect — returns [{key, envelope, attempt_count, timestamp_ms}]
+entries = :dgen_queue.peek_dlq(tenant, quid)
+
+# Count without decoding
+:dgen_queue.dlq_length(tenant, quid)
+
+# Requeue one entry (resets attempt count to 0, atomic with DLQ delete)
+{key, _envelope, _n, _ts} = hd(entries)
+:dgen_queue.requeue_dlq_entry(tenant, quid, key)  # :ok | {:error, :not_found}
+
+# Discard one entry permanently
+:dgen_queue.delete_dlq_entry(tenant, key)
+
+# Discard all entries for the queue
+:dgen_queue.purge_dlq(tenant, quid)
+```
+
+<!-- tabs-close -->
+
+`requeue_dlq_entry/3` is atomic: it pushes the envelope back onto the main queue with the attempt count reset to zero and deletes the DLQ entry in a single FDB transaction. If the root cause of the crashes has been fixed and the server has been redeployed, requeueing allows the message to be retried from a clean state.
+
 **During `handle_locked`:**
 - `handle_locked` executes outside a transaction, so previous state changes have already been persisted
 - If the crash is an Erlang/Elixir throw, then the lock is cleared before the process exits
