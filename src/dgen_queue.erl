@@ -18,6 +18,11 @@ Push and pop counts are tracked with atomic `add` operations for O(1) length.
     consume_peeked/3,
     update_peeked/3,
     push_dlq/4,
+    peek_dlq/2,
+    dlq_length/2,
+    delete_dlq_entry/2,
+    purge_dlq/2,
+    requeue_dlq_entry/3,
     delete/2,
     length/2,
     watch_push/2,
@@ -158,6 +163,105 @@ push_dlq({Tx, Dir}, Quid, Envelope, AttemptCount) ->
     B:set_versionstamped_key(Tx, Key, Payload).
 
 -if(?DOCATTRS).
+-doc """
+Returns all entries in the dead-letter queue for `Quid`.
+
+Each entry is `{Key, Envelope, AttemptCount, TimestampMs}` where `Key` can be
+passed to `delete_dlq_entry/2` or `requeue_dlq_entry/3`.
+""".
+-endif.
+-spec peek_dlq(dgen_backend:tenant(), quid()) ->
+    [{dgen_backend:key(), term(), non_neg_integer(), integer()}].
+peek_dlq(Tenant, Quid) ->
+    dgen_backend:transactional(Tenant, fun({Tx, Dir}) ->
+        B = dgen_config:backend(),
+        DlqKey = get_dlq_key(Quid),
+        {DS, DE} = B:dir_range(Dir, DlqKey),
+        KVs = B:get_range(Tx, DS, DE, [{wait, true}]),
+        [
+            begin
+                {Envelope, AttemptCount, TimestampMs} = binary_to_term(V),
+                {K, Envelope, AttemptCount, TimestampMs}
+            end
+         || {K, V} <- KVs
+        ]
+    end).
+
+-if(?DOCATTRS).
+-doc "Returns the number of entries currently in the dead-letter queue for `Quid`.".
+-endif.
+-spec dlq_length(dgen_backend:tenant(), quid()) -> non_neg_integer().
+dlq_length(Tenant, Quid) ->
+    dgen_backend:transactional(Tenant, fun({Tx, Dir}) ->
+        B = dgen_config:backend(),
+        DlqKey = get_dlq_key(Quid),
+        {DS, DE} = B:dir_range(Dir, DlqKey),
+        erlang:length(B:get_range(Tx, DS, DE, [{wait, true}]))
+    end).
+
+-if(?DOCATTRS).
+-doc """
+Deletes a single dead-letter entry by its key.
+
+`Key` is the first element of a tuple returned by `peek_dlq/2`.
+""".
+-endif.
+-spec delete_dlq_entry(dgen_backend:tenant(), dgen_backend:key()) -> ok.
+delete_dlq_entry(Tenant, Key) ->
+    dgen_backend:transactional(Tenant, fun({Tx, _Dir}) ->
+        B = dgen_config:backend(),
+        B:clear_range(Tx, Key, B:key_strinc(Key))
+    end).
+
+-if(?DOCATTRS).
+-doc "Deletes all entries in the dead-letter queue for `Quid`.".
+-endif.
+-spec purge_dlq(dgen_backend:tenant(), quid()) -> ok.
+purge_dlq(Tenant, Quid) ->
+    dgen_backend:transactional(Tenant, fun({Tx, Dir}) ->
+        B = dgen_config:backend(),
+        DlqKey = get_dlq_key(Quid),
+        {DS, DE} = B:dir_range(Dir, DlqKey),
+        B:clear_range(Tx, DS, DE)
+    end).
+
+-if(?DOCATTRS).
+-doc """
+Moves a dead-letter entry back onto the main queue, resetting the attempt count to 0.
+
+Atomically reads the entry at `Key`, pushes its envelope back onto the main
+queue with attempt count 0, and deletes the DLQ entry. Returns
+`{error, not_found}` if the key no longer exists.
+
+`Key` is the first element of a tuple returned by `peek_dlq/2`.
+""".
+-endif.
+-spec requeue_dlq_entry(dgen_backend:tenant(), quid(), dgen_backend:key()) ->
+    ok | {error, not_found}.
+requeue_dlq_entry(Tenant, Quid, DlqKey) ->
+    dgen_backend:transactional(Tenant, fun({Tx, Dir}) ->
+        B = dgen_config:backend(),
+        case B:wait(B:get(Tx, DlqKey)) of
+            not_found ->
+                {error, not_found};
+            Bin ->
+                {Envelope, _AttemptCount, _Ts} = binary_to_term(Bin),
+                ItemKey = get_item_key(Quid),
+                ItemKey2 = dgen_key:extend(ItemKey, undefined),
+                NewKey = B:dir_pack_vs(
+                    Dir,
+                    erlang:setelement(tuple_size(ItemKey2), ItemKey2, ?VS(Tx, B))
+                ),
+                B:set_versionstamped_key(
+                    Tx, NewKey, term_to_binary(reset_envelope(Envelope))
+                ),
+                PushKey = get_push_key(Quid),
+                B:add(Tx, B:dir_pack(Dir, PushKey), 1),
+                B:clear_range(Tx, DlqKey, B:key_strinc(DlqKey))
+        end
+    end).
+
+-if(?DOCATTRS).
 -doc "Deletes the entire queue for the given `Quid`, including all items and counters.".
 -endif.
 -spec delete(dgen_backend:tenant(), quid()) -> ok.
@@ -204,3 +308,6 @@ get_pop_key(Quid) ->
 
 decode_as_int(not_found, Default) -> Default;
 decode_as_int(Val, _Default) -> binary:decode_unsigned(Val, little).
+
+reset_envelope({cast, R}) -> {cast, R, 0};
+reset_envelope({call, R, F}) -> {call, R, F, [], 0}.
