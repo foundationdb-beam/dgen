@@ -396,7 +396,7 @@ finalize_inline_call(Result, GsFrom, Tenant) ->
             end;
         {{stop, Reason, Actions}, ModState, State} ->
             finalize({{stop, Reason, Actions}, ModState, State});
-        {push_after_fail, From, NewWatch, State, Class, Reason, Stack} ->
+        {push_after_fail, From, NewWatch, _State, Class, Reason, Stack} ->
             gen_server:reply(GsFrom, {noreply, {Tenant, From, NewWatch}}),
             erlang:raise(Class, Reason, Stack);
         {push, From, NewWatch, State} ->

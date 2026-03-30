@@ -102,5 +102,5 @@ jobs:
           sudo dpkg -i /tmp/fdb-debs/foundationdb-server_${FDB_VERSION}-1_amd64.deb
       - run: mix deps.get --only test
       - run: mix deps.compile
-      - run: mix compile
+      - run: mix compile --warnings-as-errors
       - run: mix test
