@@ -78,3 +78,125 @@ reply key is eliminated.
 6. The consumer updates the state.
 7. The consumer commits the transaction.
 8. The consumer executes the side-effects.
+
+## Lock Flow
+
+A callback may return `{lock, NewState}` instead of `{noreply, NewState}` or `{reply, …}`.
+This is useful when a state change requires synchronous post-commit coordination before
+the next queue message can be safely processed.
+
+1. The callback returns `{lock, NewState}`.
+2. The consumer commits `NewState` to FDB **and** writes a lock key (`{Tuid, <<"k">>}`) in
+   the same transaction.
+3. Any other elector consumer that tries to consume from the queue reads `is_locked = true`
+   and parks itself on a FDB watch instead of processing.
+4. The consumer that set the lock calls `handle_locked/3` with the **same** event type and
+   message that triggered the lock, plus the committed `NewState`.  This is the synchronous
+   coordination window.
+5. After `handle_locked/3` returns (regardless of its return value), the lock key is cleared
+   and the queue watch is notified in an `after` block — always, even on exception.
+6. Parked consumers wake up, see `is_locked = false`, and resume normal queue consumption.
+
+The lock therefore guarantees that between committing a state change and resuming queue
+consumption, one designated node performs a synchronous coordination step with no risk of
+another node racing ahead.
+
+---
+
+## Process Registry (`dgen_registry`)
+
+`dgen_registry` is an OTP-compatible process registry built on top of `dgen_server`.
+It implements the four-function `{via, dgen_registry, {RegistryName, LogicalName}}` contract
+so that standard OTP processes (`gen_server`, `gen_statem`, etc.) can be registered and
+addressed by name across a cluster.
+
+### Components
+
+| Module | Role |
+|--------|------|
+| `dgen_registry` | Supervisor + OTP `via`-tuple contract entry points |
+| `dgen_registry_elector` | `dgen_server` callback — tracks membership and elects leaders |
+| `dgen_registry_member` | `gen_server` — local name cache, consistent read/write proxy |
+
+Each node that calls `dgen_registry:start_link/2` starts both an elector consumer and a
+member process under a local supervisor.
+
+### Leader election via FDB consensus
+
+The leader is the member process on whichever Erlang node commits the current elector FDB
+transaction — i.e. `node()` inside the callback.  Because FDB serialises transaction commits,
+there is always exactly one leader at any point in time.  No external lease, heartbeat, or
+tiebreaker ordering (`lists:min`) is needed, except as a one-time fallback when the local
+node's member has not yet sent its `{join}` message (a transient startup window).
+
+This means leadership is an emergent property of FDB consensus: whoever wins the write wins
+the leader role.
+
+### Leadership transitions and the lock
+
+When the committed leader changes, `handle_cast_tx` returns `{lock, NewState}` instead of
+`{noreply, …, Actions}`.  This triggers the lock flow described above.  `handle_locked/3`
+uses the coordination window to fan out replication-topology casts to every member:
+
+- New member receives `{members, AllIds}` and `{leader_changed, Leader}`.
+- Existing members receive `{new_member, Id}` and `{leader_changed, Leader}`.
+
+The new leader member receives `{leader_changed, Self}`, which triggers `assume_leadership`:
+a synchronous FDB range scan over the names sub-space to load the authoritative snapshot,
+followed by a `{names_snapshot, …}` broadcast to all followers.  This happens
+asynchronously in the member's gen_server, after the elector lock has cleared.
+
+When leadership does not change (e.g. a new member joins on the same node), no lock is
+taken; a plain `{noreply, NewState, Actions}` handles the notifications.
+
+### Single-writer consistency for names
+
+The leader member is the **sole writer** for the name table.  All consistent writes
+(`register_name`, `unregister_name`) and consistent reads (`whereis_name_consistent`) route
+through the leader, either directly (if the caller's node is the leader) or by forwarding
+via `gen_server:call/cast`.
+
+The leader's gen_server mailbox provides process-level serialisation: registrations are
+linearisable without any additional FDB conflict detection on the names sub-space.
+
+### One-way replication to followers
+
+After every write the leader broadcasts `{name_registered, …}` or `{name_unregistered, …}`
+to all follower members.  Followers apply these to their local `names` map.  This is a
+fire-and-forget push; followers never pull from the leader except at leadership assumption
+time (the snapshot).
+
+### Snapshot reads
+
+`whereis_name/1` (used by OTP routing internally) is a snapshot read served from the local
+member's in-memory `names` map — a plain `maps:get` inside a `gen_server:call`, no network
+hop.  This map may lag behind the leader by one replication round-trip after a remote
+registration.
+
+`whereis_name_consistent/1` routes to the leader and always returns the authoritative value.
+
+### Follower optimistic updates
+
+Because Erlang distribution does not guarantee that a replication cast arrives before the
+call reply that triggered it, a follower that forwards `{register, …}` to the leader also
+updates its own `names` map immediately on receiving `yes`.  Similarly, `{unregister, …}`
+removes the entry from the local map before forwarding.  Both are idempotent when the
+replication cast arrives shortly after.
+
+### FDB key layout
+
+```
+{<<"dgen_registry">>, RegistryName, <<"leader">>}         → term_to_binary(MemberId | undefined)
+{<<"dgen_registry">>, RegistryName, <<"names">>, NameBin} → term_to_binary(Pid)
+```
+
+where `NameBin = term_to_binary(LogicalName)` and `RegistryName = atom_to_binary(Name)`.
+The leader key is written atomically with every membership state change.  Name keys are
+written and deleted by the leader member directly (outside the elector's dgen_server queue),
+using `dgen_backend:transactional/2`.
+
+### Auto-unregistration
+
+The leader monitors every registered Pid with `erlang:monitor/2`.  On `{'DOWN', …}` the
+leader deletes the name from FDB and broadcasts `{name_unregistered, …}` to all followers.
+No explicit `unregister_name` call is needed when a registered process exits.
