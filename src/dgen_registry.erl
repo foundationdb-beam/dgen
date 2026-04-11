@@ -90,15 +90,42 @@ start_link(SupName, Name, Tenant) ->
 %% ---------------------------------------------------------------------------
 
 %% Registers `Pid` under `{RegistryName, LogicalName}`.
-%% Runs through an FDB priority_call so that concurrent registrations on
-%% different nodes are serialised by FDB conflict detection.
 %% Returns `yes` on success, `no` if the name is already taken.
+%%
+%% Consistency notes
+%% -----------------
+%% We route through the durable queue (`dgen_server:call`) rather than
+%% `priority_call` for two reasons:
+%%
+%% 1. Queue ordering vs. zombie registrations.
+%%    When a monitored process dies, the member casts `{unregister, Name}` to
+%%    the elector queue.  A `priority_call` bypasses the queue and can
+%%    therefore see the FDB state *before* that unregister is processed —
+%%    returning `no` for a name that belongs to a dead process.  Using the
+%%    durable queue ensures the `register` is ordered after any preceding
+%%    `unregister` for the same name.
+%%
+%% 2. ETS lag on the registering node.
+%%    The `yes/no` reply arrives from FDB before the elector's post-commit
+%%    action (the `name_registered` cast) has been processed by the local
+%%    member gen_server.  We therefore update the local ETS table
+%%    synchronously here, immediately before returning `yes`, so that a
+%%    `whereis_name` call on this node is consistent right away.
+%%
+%%    Remote nodes still receive the update via the elector's action cast
+%%    (eventual consistency), and the ets:insert in the member is idempotent.
 -spec register_name({atom(), term()}, pid()) -> yes | no.
 register_name({RegistryName, LogicalName}, Pid) ->
-    dgen_server:priority_call(
-        elector_name(RegistryName),
-        {register, LogicalName, Pid}
-    ).
+    case dgen_server:call(elector_name(RegistryName), {register, LogicalName, Pid}) of
+        yes ->
+            Table = ets_table_name(RegistryName),
+            try ets:insert(Table, {LogicalName, Pid})
+            catch error:badarg -> ok  %% member not yet started; action will seed it
+            end,
+            yes;
+        no ->
+            no
+    end.
 
 %% Removes the registration for `{RegistryName, LogicalName}`.
 %% The local ETS entry is deleted immediately (so subsequent `whereis_name`
