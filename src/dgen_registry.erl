@@ -33,22 +33,24 @@
 %% Consistency model
 %% -----------------
 %% `whereis_name` reads from a local ETS table — it never touches FDB and
-%% never blocks.  `register_name` writes through an FDB priority_call so FDB's
-%% serialisable isolation detects simultaneous competing registrations on
-%% different nodes: exactly one wins and the other returns `no`.
+%% never blocks.
 %%
-%% ETS is kept in sync by the `dgen_registry_member` gen_server, which
-%% receives broadcast casts from the elector's post-commit actions whenever a
-%% name is registered or unregistered anywhere in the cluster.  The table is
-%% populated from FDB on member startup.  There is therefore a short window
-%% after registration where a remote node's `whereis_name` may still return
-%% `undefined`; this is the same trade-off as `gproc` global mode.
+%% `register_name` routes through the local member gen_server.  The current
+%% leader member is the sole writer for the name table: it serialises
+%% registrations through its own mailbox, writes to FDB, and broadcasts
+%% `{name_registered, …}` to every follower member.  If this node is a
+%% follower, its member process forwards the call to the leader.
+%%
+%% This avoids FDB write conflicts between nodes while still persisting names
+%% durably.  There is a short window after registration where a remote node's
+%% `whereis_name` may still return `undefined` (eventual consistency via
+%% async broadcast); this is the same trade-off as `gproc` global mode.
 %%
 %% Auto-unregistration
 %% -------------------
-%% The member monitors every registered Pid.  When the monitored process
-%% exits the member removes the ETS entry and casts `{unregister, Name}` to
-%% the elector, which propagates the removal to all peers.
+%% The leader member monitors every registered Pid.  When the monitored
+%% process exits the leader removes the entry from FDB and ETS and broadcasts
+%% `{name_unregistered, …}` to all peer members.
 %% ---------------------------------------------------------------------------
 
 -export([
@@ -94,33 +96,23 @@ start_link(SupName, Name, Tenant) ->
 %%
 %% Consistency notes
 %% -----------------
-%% We route through the durable queue (`dgen_server:call`) rather than
-%% `priority_call` for two reasons:
+%% The call is routed to the local member gen_server.  If this node is the
+%% current leader the member handles it directly (writes to FDB, updates ETS,
+%% broadcasts to peers).  If this node is a follower the member forwards the
+%% call to the leader's member process.
 %%
-%% 1. Queue ordering vs. zombie registrations.
-%%    When a monitored process dies, the member casts `{unregister, Name}` to
-%%    the elector queue.  A `priority_call` bypasses the queue and can
-%%    therefore see the FDB state *before* that unregister is processed —
-%%    returning `no` for a name that belongs to a dead process.  Using the
-%%    durable queue ensures the `register` is ordered after any preceding
-%%    `unregister` for the same name.
-%%
-%% 2. ETS lag on the registering node.
-%%    The `yes/no` reply arrives from FDB before the elector's post-commit
-%%    action (the `name_registered` cast) has been processed by the local
-%%    member gen_server.  We therefore update the local ETS table
-%%    synchronously here, immediately before returning `yes`, so that a
-%%    `whereis_name` call on this node is consistent right away.
-%%
-%%    Remote nodes still receive the update via the elector's action cast
-%%    (eventual consistency), and the ets:insert in the member is idempotent.
+%% In either case the `yes/no` reply arrives before the leader's
+%% `{name_registered, …}` broadcast has been processed by the local member.
+%% We therefore update the local ETS table synchronously here, immediately
+%% before returning `yes`, so that a `whereis_name` call on this node is
+%% consistent right away.  The ets:insert in the member is idempotent.
 -spec register_name({atom(), term()}, pid()) -> yes | no.
 register_name({RegistryName, LogicalName}, Pid) ->
-    case dgen_server:call(elector_name(RegistryName), {register, LogicalName, Pid}) of
+    case gen_server:call(member_name(RegistryName), {register, LogicalName, Pid}) of
         yes ->
             Table = ets_table_name(RegistryName),
             try ets:insert(Table, {LogicalName, Pid})
-            catch error:badarg -> ok  %% member not yet started; action will seed it
+            catch error:badarg -> ok  %% member not yet started
             end,
             yes;
         no ->
@@ -129,14 +121,14 @@ register_name({RegistryName, LogicalName}, Pid) ->
 
 %% Removes the registration for `{RegistryName, LogicalName}`.
 %% The local ETS entry is deleted immediately (so subsequent `whereis_name`
-%% calls on this node return `undefined` right away).  The elector removes
-%% the entry from FDB and broadcasts `{name_unregistered, …}` to all peer
-%% members asynchronously.
+%% calls on this node return `undefined` right away).  The local member
+%% forwards the unregister to the leader, which removes the entry from FDB
+%% and broadcasts `{name_unregistered, …}` to all peer members asynchronously.
 -spec unregister_name({atom(), term()}) -> ok.
 unregister_name({RegistryName, LogicalName}) ->
     Table = ets_table_name(RegistryName),
     try ets:delete(Table, LogicalName) catch error:badarg -> ok end,
-    dgen_server:cast(elector_name(RegistryName), {unregister, LogicalName}).
+    gen_server:cast(member_name(RegistryName), {unregister, LogicalName}).
 
 %% Looks up the Pid for `{RegistryName, LogicalName}` from the local ETS
 %% cache.  Never blocks; returns `undefined` if not registered or if the
@@ -205,7 +197,7 @@ init({Name, Tenant}) ->
     MemberName = member_name(Name),
 
     %% Elector must start first: the member's init casts `{join, MemberId}`
-    %% to it and calls `priority_call(get_names)` to seed the ETS table.
+    %% to it immediately after creating the ETS table.
     ElectorSpec = #{
         id => elector,
         start =>
@@ -229,7 +221,8 @@ init({Name, Tenant}) ->
                 #{
                     name => Name,
                     elector => ElectorName,
-                    member_name => MemberName
+                    member_name => MemberName,
+                    tenant => Tenant
                 }
             ]},
         restart => permanent,

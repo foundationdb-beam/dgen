@@ -4,46 +4,28 @@
 %% ---------------------------------------------------------------------------
 %% Overview
 %%
-%% The elector is a dgen_server — its state (member map + current leader +
-%% registered name table) is stored durably in FDB and is shared across every
-%% node that runs the same named registry.  Messages arrive via a durable FIFO
-%% queue, so even if the elector process crashes mid-way through a change, the
-%% pending message will be replayed once the process restarts.
+%% The elector is a dgen_server — its state (member map + current leader) is
+%% stored durably in FDB and is shared across every node that runs the same
+%% named registry.
 %%
-%% Because dgen_server serialises queue consumption through FDB transactions,
-%% the leader election and name registrations are consistent: only one node's
-%% elector process can commit a state update at a time.
+%% Name registration is NO LONGER handled here.  The elected leader member
+%% process is the single writer for the name table; it stores names directly
+%% in FDB under a well-known key prefix and keeps the other members' ETS
+%% tables in sync via gen_server casts.
 %%
-%% Callback dispatch
-%% -----------------
-%% Mutating calls use `handle_call_tx/4` and `handle_cast_tx/3` — the `_tx`
-%% variants that receive the live FDB transaction context.  This lets us write
-%% the leader key atomically alongside the state update.
-%%
-%% Read-only priority_calls (`get_leader`, `get_members`, `get_names`) fall
-%% through to `handle_call/3` via the catch-all clause in `handle_call_tx/4`.
-%%
-%% Name registration
-%% -----------------
-%% `{register, LogicalName, Pid}` is delivered via priority_call (bypasses the
-%% durable queue) so that the caller gets a synchronous yes/no.  FDB's
-%% serialisable isolation provides the race-free guarantee: two nodes that
-%% simultaneously try to register the same name will conflict and one will
-%% retry with the already-populated state, returning `no`.
+%% The elector's only jobs are:
+%%   1. Maintain the live member set.
+%%   2. Elect a leader (lists:min/1 over member IDs — deterministic).
+%%   3. Write the leader key to FDB atomically with state changes.
+%%   4. Notify all members of the current leader after each membership change.
 %%
 %% Leadership algorithm
 %% --------------------
-%% The current leader is `lists:min/1` over live member ids.  Member ids are
-%% `{node(), atom()}` so the order is lexicographic — deterministic and
-%% requires no additional coordination.
+%% Current leader = lists:min/1 over live member IDs.
+%% Member IDs are {node(), atom()} so the ordering is lexicographic.
 %%
 %% Leader key in FDB
 %% -----------------
-%% In addition to the normal dgen_server state encoding, the elector writes a
-%% standalone FDB key for the current leader whenever membership changes.
-%% External processes can watch this key directly via the backend for
-%% low-latency leader-change notifications.
-%%
 %%   Key path: {Tuid, <<"leader">>}
 %%   Value:    term_to_binary(MemberId | undefined)
 %% ---------------------------------------------------------------------------
@@ -62,8 +44,7 @@
 -type member_info() :: #{joined_at := integer()}.
 -type registry_state() :: #{
     members := #{member_id() => member_info()},
-    leader := member_id() | undefined,
-    names := #{term() => pid()}
+    leader := member_id() | undefined
 }.
 
 %% ---------------------------------------------------------------------------
@@ -73,45 +54,14 @@
 -spec init(#{name := atom()}) -> {ok, dgen_server:tuid(), registry_state()}.
 init(#{name := Name}) ->
     Tuid = {<<"dgen_registry">>, atom_to_binary(Name)},
-    State = #{members => #{}, leader => undefined, names => #{}},
+    State = #{members => #{}, leader => undefined},
     {ok, Tuid, State}.
 
-%% ---------------------------------------------------------------------------
-%% handle_call_tx/4  (preferred over handle_call/3 by dgen_server)
-%%
-%% Handles mutating calls inside the live FDB transaction.
-%% Falls through to handle_call/3 for read-only requests so we don't have to
-%% duplicate those clauses here.
-%% ---------------------------------------------------------------------------
-
+%% Delegate read-only priority_calls to handle_call/3.
 -spec handle_call_tx(dgen_server:tx_ctx(), term(), dgen_server:from(), registry_state()) ->
     dgen_server:reply_ret().
-
-handle_call_tx(_TxCtx, {register, LogicalName, Pid}, _From, State = #{names := Names}) ->
-    case maps:is_key(LogicalName, Names) of
-        true ->
-            %% Name already taken — return no without modifying state.
-            {reply, no, State};
-        false ->
-            NewState = State#{names => Names#{LogicalName => Pid}},
-            Actions = [
-                fun(#{members := Members}) ->
-                    broadcast_to_members(Members, {name_registered, LogicalName, Pid})
-                end
-            ],
-            {reply, yes, NewState, Actions}
-    end;
-
 handle_call_tx(_TxCtx, Request, From, State) ->
-    %% Delegate read-only requests to the non-tx handler.
     handle_call(Request, From, State).
-
-%% ---------------------------------------------------------------------------
-%% handle_cast_tx/3
-%%
-%% Mutating casts run inside the FDB transaction so state + leader key are
-%% updated atomically.
-%% ---------------------------------------------------------------------------
 
 -spec handle_cast_tx(dgen_server:tx_ctx(), term(), registry_state()) ->
     dgen_server:noreply_ret().
@@ -119,37 +69,27 @@ handle_call_tx(_TxCtx, Request, From, State) ->
 handle_cast_tx(TxCtx, {join, MemberId}, State = #{members := Members}) ->
     MemberInfo = #{joined_at => erlang:system_time(millisecond)},
     NewState = elect_leader(TxCtx, State#{members => Members#{MemberId => MemberInfo}}),
+    Leader = maps:get(leader, NewState),
     Actions = [
         fun(#{members := All}) ->
             ExistingIds = maps:keys(maps:remove(MemberId, All)),
-            notify_join(MemberId, maps:keys(All), ExistingIds)
+            notify_join(MemberId, maps:keys(All), ExistingIds, Leader)
         end
     ],
     {noreply, NewState, Actions};
 
 handle_cast_tx(TxCtx, {member_down, MemberId}, State = #{members := Members}) ->
     NewState = elect_leader(TxCtx, State#{members => maps:remove(MemberId, Members)}),
+    Leader = maps:get(leader, NewState),
     Actions = [
         fun(#{members := Remaining}) ->
-            broadcast_to_members(Remaining, {member_down, MemberId})
-        end
-    ],
-    {noreply, NewState, Actions};
-
-handle_cast_tx(_TxCtx, {unregister, LogicalName}, State = #{names := Names}) ->
-    NewState = State#{names => maps:remove(LogicalName, Names)},
-    Actions = [
-        fun(#{members := Members}) ->
-            broadcast_to_members(Members, {name_unregistered, LogicalName})
+            broadcast_to_members(Remaining, {leader_changed, Leader})
         end
     ],
     {noreply, NewState, Actions}.
 
 %% ---------------------------------------------------------------------------
-%% handle_call/3  (read-only, no tx context needed)
-%%
-%% Used directly for priority_calls that only read state.  Also serves as the
-%% fall-through target from handle_call_tx/4.
+%% handle_call/3  (read-only priority_calls)
 %% ---------------------------------------------------------------------------
 
 -spec handle_call(term(), dgen_server:from(), registry_state()) ->
@@ -159,12 +99,7 @@ handle_call(get_leader, _From, State) ->
     {reply, maps:get(leader, State, undefined), State};
 
 handle_call(get_members, _From, State) ->
-    {reply, maps:keys(maps:get(members, State, #{})), State};
-
-handle_call(get_names, _From, State) ->
-    %% Returns #{LogicalName => Pid} — used by members to seed their ETS
-    %% table on startup.
-    {reply, maps:get(names, State, #{}), State}.
+    {reply, maps:keys(maps:get(members, State, #{})), State}.
 
 %% ---------------------------------------------------------------------------
 %% Internal helpers
@@ -198,10 +133,16 @@ leader_key_tuple(Tuid) ->
 
 %% Notify helpers — run post-commit as dgen_server actions.
 
-notify_join(NewMemberId, AllMemberIds, ExistingIds) ->
+%% Tell the new member who all peers are and who the leader is.
+%% Tell each existing member about the new peer and the (possibly new) leader.
+notify_join(NewMemberId, AllMemberIds, ExistingIds, Leader) ->
     cast_to_member(NewMemberId, {members, AllMemberIds}),
+    cast_to_member(NewMemberId, {leader_changed, Leader}),
     lists:foreach(
-        fun(Id) -> cast_to_member(Id, {new_member, NewMemberId}) end,
+        fun(Id) ->
+            cast_to_member(Id, {new_member, NewMemberId}),
+            cast_to_member(Id, {leader_changed, Leader})
+        end,
         ExistingIds
     ).
 
