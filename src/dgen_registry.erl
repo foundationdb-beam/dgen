@@ -7,10 +7,10 @@
 %% This module implements the four-function contract required for OTP `via`
 %% tuples:
 %%
-%%   register_name/2    — register a Pid under a logical name
-%%   unregister_name/1  — remove a registration
-%%   whereis_name/1     — look up the Pid for a logical name (O(1) ETS read)
-%%   send/2             — send a message to a named process
+%%   register_name/2    — consistent write through the leader
+%%   unregister_name/1  — consistent delete through the leader
+%%   whereis_name/1     — snapshot read from the local member's map
+%%   send/2             — routes a message to a named process
 %%
 %% Name terms
 %% ----------
@@ -32,25 +32,31 @@
 %%
 %% Consistency model
 %% -----------------
-%% `whereis_name` reads from a local ETS table — it never touches FDB and
-%% never blocks.
+%% All writes (`register_name`, `unregister_name`) and consistent reads
+%% (`whereis_name_consistent`) go through the elected leader member process.
+%% The leader is the single writer for the name table, backed by FDB.
 %%
-%% `register_name` routes through the local member gen_server.  The current
-%% leader member is the sole writer for the name table: it serialises
-%% registrations through its own mailbox, writes to FDB, and broadcasts
-%% `{name_registered, …}` to every follower member.  If this node is a
-%% follower, its member process forwards the call to the leader.
+%% `whereis_name/1` (used by the OTP via-tuple machinery) is a snapshot read
+%% served from the local member's in-memory map — no network hop, no FDB
+%% round-trip.  This map is kept in sync by one-way replication casts from
+%% the leader.  There is therefore a short window after registration where a
+%% remote node's `whereis_name/1` may still return `undefined`; this is the
+%% same eventual-consistency trade-off as `gproc` global mode.
 %%
-%% This avoids FDB write conflicts between nodes while still persisting names
-%% durably.  There is a short window after registration where a remote node's
-%% `whereis_name` may still return `undefined` (eventual consistency via
-%% async broadcast); this is the same trade-off as `gproc` global mode.
+%% Leadership
+%% ----------
+%% The elected leader is the member process on the Erlang node that most
+%% recently committed a FDB transaction for the elector queue — i.e., whoever
+%% wins the FDB consensus.  When leadership changes, the elector sets a
+%% distributed lock in FDB so all elector consumers pause while replication
+%% paths are reconfigured.  The new leader reads the authoritative name
+%% snapshot from FDB on assumption and broadcasts it to all followers.
 %%
 %% Auto-unregistration
 %% -------------------
-%% The leader member monitors every registered Pid.  When the monitored
-%% process exits the leader removes the entry from FDB and ETS and broadcasts
-%% `{name_unregistered, …}` to all peer members.
+%% The leader monitors every registered Pid.  When a monitored process exits,
+%% the leader removes the entry from FDB and propagates `{name_unregistered}`
+%% to all follower members.
 %% ---------------------------------------------------------------------------
 
 -export([
@@ -62,13 +68,14 @@
     unregister_name/1,
     whereis_name/1,
     send/2,
-    %% Convenience
+    %% Consistent (leader-routed) name lookup
+    whereis_name_consistent/1,
+    %% Convenience queries
     get_leader/1,
     get_members/1,
     %% Name derivation helpers (exported for tests / introspection)
     elector_name/1,
-    member_name/1,
-    ets_table_name/1
+    member_name/1
 ]).
 
 -export([init/1]).
@@ -92,57 +99,29 @@ start_link(SupName, Name, Tenant) ->
 %% ---------------------------------------------------------------------------
 
 %% Registers `Pid` under `{RegistryName, LogicalName}`.
-%% Returns `yes` on success, `no` if the name is already taken.
-%%
-%% Consistency notes
-%% -----------------
-%% The call is routed to the local member gen_server.  If this node is the
-%% current leader the member handles it directly (writes to FDB, updates ETS,
-%% broadcasts to peers).  If this node is a follower the member forwards the
-%% call to the leader's member process.
-%%
-%% In either case the `yes/no` reply arrives before the leader's
-%% `{name_registered, …}` broadcast has been processed by the local member.
-%% We therefore update the local ETS table synchronously here, immediately
-%% before returning `yes`, so that a `whereis_name` call on this node is
-%% consistent right away.  The ets:insert in the member is idempotent.
+%% Routes through the local member, which forwards to the leader if needed.
+%% Returns `yes` on success, `no` if the name is already taken or no leader
+%% is currently elected.
 -spec register_name({atom(), term()}, pid()) -> yes | no.
 register_name({RegistryName, LogicalName}, Pid) ->
-    case gen_server:call(member_name(RegistryName), {register, LogicalName, Pid}) of
-        yes ->
-            Table = ets_table_name(RegistryName),
-            try ets:insert(Table, {LogicalName, Pid})
-            catch error:badarg -> ok  %% member not yet started
-            end,
-            yes;
-        no ->
-            no
-    end.
+    gen_server:call(member_name(RegistryName), {register, LogicalName, Pid}).
 
 %% Removes the registration for `{RegistryName, LogicalName}`.
-%% The local ETS entry is deleted immediately (so subsequent `whereis_name`
-%% calls on this node return `undefined` right away).  The local member
-%% forwards the unregister to the leader, which removes the entry from FDB
-%% and broadcasts `{name_unregistered, …}` to all peer members asynchronously.
+%% Fire-and-forget: routes through the local member, which forwards to the
+%% leader.  The local member also removes the entry from its own map
+%% immediately so snapshot reads on this node are consistent right away.
 -spec unregister_name({atom(), term()}) -> ok.
 unregister_name({RegistryName, LogicalName}) ->
-    Table = ets_table_name(RegistryName),
-    try ets:delete(Table, LogicalName) catch error:badarg -> ok end,
     gen_server:cast(member_name(RegistryName), {unregister, LogicalName}).
 
-%% Looks up the Pid for `{RegistryName, LogicalName}` from the local ETS
-%% cache.  Never blocks; returns `undefined` if not registered or if the
-%% member has not yet started (ETS table doesn't exist yet).
+%% Snapshot read — served from the local member's in-memory map.
+%% Never blocks on the leader or FDB.  May be slightly stale on follower nodes
+%% in the brief window between a remote registration and the replication cast
+%% arriving.
 -spec whereis_name({atom(), term()}) -> pid() | undefined.
 whereis_name({RegistryName, LogicalName}) ->
-    Table = ets_table_name(RegistryName),
-    try
-        case ets:lookup(Table, LogicalName) of
-            [{_, Pid}] -> Pid;
-            [] -> undefined
-        end
-    catch
-        error:badarg -> undefined
+    try gen_server:call(member_name(RegistryName), {whereis_snapshot, LogicalName})
+    catch exit:_ -> undefined
     end.
 
 %% Sends `Msg` to the process registered as `Name`, returning the Pid.
@@ -156,6 +135,19 @@ send(Name, Msg) ->
         Pid ->
             Pid ! Msg,
             Pid
+    end.
+
+%% ---------------------------------------------------------------------------
+%% Consistent name lookup (leader-routed)
+%% ---------------------------------------------------------------------------
+
+%% Consistent read routed through the leader.
+%% Returns the authoritative Pid for `LogicalName`, or `undefined` if not
+%% registered.  More expensive than `whereis_name/1` but never stale.
+-spec whereis_name_consistent({atom(), term()}) -> pid() | undefined.
+whereis_name_consistent({RegistryName, LogicalName}) ->
+    try gen_server:call(member_name(RegistryName), {whereis, LogicalName})
+    catch exit:_ -> undefined
     end.
 
 %% ---------------------------------------------------------------------------
@@ -182,12 +174,6 @@ elector_name(Name) ->
 member_name(Name) ->
     list_to_atom(atom_to_list(Name) ++ "_member").
 
-%% The ETS table owned by the local member process, used as the name lookup
-%% cache for `whereis_name/1`.  Schema: `{LogicalName, Pid}`.
--spec ets_table_name(atom()) -> atom().
-ets_table_name(Name) ->
-    list_to_atom("dgen_registry_names_" ++ atom_to_list(Name)).
-
 %% ---------------------------------------------------------------------------
 %% Supervisor callbacks
 %% ---------------------------------------------------------------------------
@@ -197,7 +183,7 @@ init({Name, Tenant}) ->
     MemberName = member_name(Name),
 
     %% Elector must start first: the member's init casts `{join, MemberId}`
-    %% to it immediately after creating the ETS table.
+    %% to it immediately after starting.
     ElectorSpec = #{
         id => elector,
         start =>
