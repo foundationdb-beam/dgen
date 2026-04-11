@@ -75,11 +75,23 @@ argument is the
 -type noreply_ret() :: {noreply, state()} | {noreply, state(), [action()]}.
 -type stop_ret() :: {stop, term(), state()} | {stop, term(), state(), [action()]}.
 
+%% Passed as the first argument to `_tx` callback variants.
+%% `td` is the current FDB transaction+directory pair; `tuid` is the server's
+%% tenant-unique identifier.  Both may be used to read or write arbitrary keys
+%% within the same atomic transaction as the callback.
+-type tx_ctx() :: #{td := dgen_backend:tenant(), tuid := tuid()}.
+
 -callback init(Args :: term()) -> init_ret().
 -callback handle_cast(Msg :: term(), State :: state()) -> noreply_ret() | lock_ret() | stop_ret().
+-callback handle_cast_tx(TxCtx :: tx_ctx(), Msg :: term(), State :: state()) ->
+    noreply_ret() | lock_ret() | stop_ret().
 -callback handle_call(Request :: term(), From :: from(), State :: state()) ->
     reply_ret() | lock_ret() | stop_ret().
+-callback handle_call_tx(TxCtx :: tx_ctx(), Request :: term(), From :: from(), State :: state()) ->
+    reply_ret() | lock_ret() | stop_ret().
 -callback handle_info(Info :: term(), State :: state()) -> noreply_ret() | stop_ret().
+-callback handle_info_tx(TxCtx :: tx_ctx(), Info :: term(), State :: state()) ->
+    noreply_ret() | stop_ret().
 -callback handle_locked(EventType :: event_type(), Msg :: term(), State :: state()) ->
     reply_ret() | noreply_ret() | stop_ret().
 
@@ -87,8 +99,11 @@ argument is the
 
 -optional_callbacks([
     handle_cast/2,
+    handle_cast_tx/3,
     handle_call/3,
+    handle_call_tx/4,
     handle_info/2,
+    handle_info_tx/3,
     handle_locked/3,
     handle_dead_letter/2
 ]).
@@ -106,7 +121,7 @@ argument is the
 -type options() :: [option()].
 -type start_ret() :: gen_server:start_ret().
 
--export_type([server/0, option/0, options/0]).
+-export_type([server/0, option/0, options/0, tx_ctx/0]).
 
 -define(DefaultTuid(Mod), {<<"dgen_server">>, atom_to_binary(Mod)}).
 -define(TxCallbackTimeout, 5000).
@@ -456,22 +471,28 @@ terminate(_Reason, _State) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
-invoke_tx_callback(Td, Callback, Args, State = #state{mod = Mod}) ->
+%% Dispatches a callback, preferring the `_tx` variant (which receives a
+%% `tx_ctx()` as its first argument) when the callback module exports it.
+%%
+%% Resolution order for a callback named `handle_foo/N`:
+%%   1. `handle_foo_tx/(N+1)` — receives `#{td, tuid}` prepended to Args
+%%   2. `handle_foo/N`        — standard variant, no tx context
+invoke_tx_callback(Td, Callback, Args, State = #state{mod = Mod, tuid = Tuid}) ->
     T1 = erlang:monotonic_time(millisecond),
     Arity = length(Args) + 1,
+    TxCallback = tx_callback_name(Callback),
+    TxCtx = #{td => Td, tuid => Tuid},
     Result =
-        case erlang:function_exported(Mod, Callback, Arity) of
+        case erlang:function_exported(Mod, TxCallback, Arity + 1) of
             true ->
-                case get_mod_state(Td, State) of
-                    {{ok, ModState}, State1} ->
-                        Args2 = modify_args_for_callback(Callback, Args, ModState),
-                        CallbackResult = erlang:apply(Mod, Callback, Args2),
-                        {ok, ModState, CallbackResult, State1};
-                    {{error, not_found}, _State1} ->
-                        {error, {mod_state_not_found, Mod}}
-                end;
+                dispatch_callback(Td, Mod, TxCallback, [TxCtx | Args], State);
             false ->
-                {error, {function_not_exported, {Mod, Callback, Arity}}}
+                case erlang:function_exported(Mod, Callback, Arity) of
+                    true ->
+                        dispatch_callback(Td, Mod, Callback, Args, State);
+                    false ->
+                        {error, {function_not_exported, {Mod, Callback, Arity}}}
+                end
         end,
     T2 = erlang:monotonic_time(millisecond),
     if
@@ -480,6 +501,18 @@ invoke_tx_callback(Td, Callback, Args, State = #state{mod = Mod}) ->
         true ->
             Result
     end.
+
+dispatch_callback(Td, Mod, Fn, Args, State) ->
+    case get_mod_state(Td, State) of
+        {{ok, ModState}, State1} ->
+            CallbackResult = erlang:apply(Mod, Fn, Args ++ [ModState]),
+            {ok, ModState, CallbackResult, State1};
+        {{error, not_found}, _} ->
+            {error, {mod_state_not_found, Mod}}
+    end.
+
+tx_callback_name(Callback) ->
+    list_to_atom(atom_to_list(Callback) ++ "_tx").
 
 invoke_handle_locked_callback(EventType, Msg, ModState, State = #state{mod = Mod}) ->
     case erlang:function_exported(Mod, handle_locked, 3) of
@@ -490,8 +523,6 @@ invoke_handle_locked_callback(EventType, Msg, ModState, State = #state{mod = Mod
             {error, {function_not_exported, {Mod, handle_locked, 3}}}
     end.
 
-modify_args_for_callback(_, Args, ModState) ->
-    Args ++ [ModState].
 
 delete(Tenant, Tuid) ->
     dgen_backend:transactional(Tenant, fun(Td = {Tx, Dir}) ->
