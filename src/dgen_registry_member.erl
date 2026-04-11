@@ -5,34 +5,34 @@
 %% Overview
 %%
 %% Each node that participates in a named registry runs one member process.
-%% The member's responsibilities are:
+%% The member has two distinct responsibilities:
 %%
-%%   1. Announce this node's presence to the elector on startup (join).
-%%   2. Maintain erlang:monitor/2 references for every known peer process.
-%%   3. Forward DOWN notifications to the elector so it can recompute the
-%%      leader and update the FDB leader key atomically.
+%% 1. Distributed membership tracking
+%%    Announces this node's presence to the elector on startup, monitors peer
+%%    member processes (across nodes via erlang:monitor), and forwards DOWN
+%%    notifications to the elector so it can recompute the leader and update
+%%    the FDB leader key atomically.
 %%
-%% Member identity
-%% ---------------
-%% A member id is `{node(), MemberName}` where `MemberName` is the atom under
-%% which this gen_server is locally registered (defaults to
-%% `<RegistryName>_member`).  The remote member processes are similarly
-%% registered under the same atom on their respective nodes, so inter-node
-%% casts use the `{Name, Node}` form.
+%% 2. Local process registry cache
+%%    Owns an ETS table (`dgen_registry_names_{RegistryName}`) that maps
+%%    LogicalName → Pid.  `dgen_registry:whereis_name/1` reads from this
+%%    table without any FDB round-trip.
 %%
-%% Monitor lifecycle
-%% -----------------
-%% * `{members, [MemberId]}` — sent by the elector after a join; the full
-%%   roster is provided so the new member can monitor all existing peers in
-%%   one shot.
-%% * `{new_member, MemberId}` — sent by the elector to all existing members
-%%   when a new peer joins.
-%% * `{'DOWN', Ref, process, _, _}` — fires when a monitored peer process
-%%   exits.  The member reports this to the elector and cleans up locally.
-%% * `{member_down, MemberId}` — sent by the elector to remaining members
-%%   after processing a `member_down` cast, allowing faster local cleanup
-%%   for members that don't monitor the dead peer directly (e.g. because the
-%%   peer is on a partitioned node where the monitor fires as `noconnection`).
+%%    On startup the table is seeded from the elector's current `names` map
+%%    via a priority_call.  Thereafter the elector's post-commit actions
+%%    broadcast `{name_registered, …}` and `{name_unregistered, …}` casts
+%%    to keep all members' tables in sync.
+%%
+%%    Each registered Pid is monitored.  When the monitored process exits,
+%%    the entry is removed from ETS and `{unregister, LogicalName}` is cast
+%%    to the elector so all other members are notified.
+%%
+%% DOWN disambiguation
+%% -------------------
+%% A single DOWN message can come from either a peer-member monitor or a
+%% registered-process monitor.  The two monitor reference spaces are kept
+%% separate (`monitors` vs `ref_to_name`) so each DOWN can be dispatched
+%% in O(1) without any scanning.
 %% ---------------------------------------------------------------------------
 
 -export([start_link/2]).
@@ -41,10 +41,13 @@
 -record(state, {
     member_id :: dgen_registry_elector:member_id(),
     elector :: atom(),
-    %% MemberId => monitor_ref (one monitor per peer)
+    ets_table :: atom(),
+    %% Peer-member monitors
     members :: #{dgen_registry_elector:member_id() => reference()},
-    %% Reverse map: monitor_ref => MemberId (for O(1) DOWN lookup)
-    monitors :: #{reference() => dgen_registry_elector:member_id()}
+    monitors :: #{reference() => dgen_registry_elector:member_id()},
+    %% Registered-process monitors
+    name_to_ref :: #{term() => reference()},
+    ref_to_name :: #{reference() => term()}
 }).
 
 %% ---------------------------------------------------------------------------
@@ -59,52 +62,102 @@ start_link(Name, Args) ->
 %% gen_server callbacks
 %% ---------------------------------------------------------------------------
 
-init(#{elector := Elector, member_name := MemberName}) ->
+init(#{name := RegistryName, elector := Elector, member_name := MemberName}) ->
     MemberId = {node(), MemberName},
-    %% Announce ourselves.  dgen_server:cast enqueues to FDB; if the elector
-    %% process is briefly unavailable the message survives in the durable queue.
+    Table = dgen_registry:ets_table_name(RegistryName),
+    ets:new(Table, [set, named_table, protected, {read_concurrency, true}]),
+    %% Seed the ETS table with any names already registered in FDB.
+    %% priority_call bypasses the durable queue so this returns quickly even
+    %% if there are pending membership changes being processed.
+    ExistingNames =
+        try
+            dgen_server:priority_call(Elector, get_names, 5000)
+        catch
+            exit:{timeout, _} -> #{};
+            exit:{noproc, _} -> #{}
+        end,
+    {NameToRef, RefToName} = seed_name_monitors(ExistingNames, Table),
+    %% Announce presence after seeding so the join action's member list
+    %% broadcast doesn't race with our ETS population.
     dgen_server:cast(Elector, {join, MemberId}),
-    State = #state{
+    {ok, #state{
         member_id = MemberId,
         elector = Elector,
+        ets_table = Table,
         members = #{},
-        monitors = #{}
-    },
-    {ok, State}.
+        monitors = #{},
+        name_to_ref = NameToRef,
+        ref_to_name = RefToName
+    }}.
 
 handle_call(get_members, _From, State = #state{members = Members}) ->
     {reply, maps:keys(Members), State};
 
 handle_call(get_leader, _From, State = #state{elector = Elector}) ->
-    %% Delegate to the elector — this is just a convenience pass-through.
     {reply, dgen_server:priority_call(Elector, get_leader), State};
 
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
 
+%% ---- Peer membership messages (from elector actions) --------------------
+
 handle_cast({members, MemberIds}, State) ->
-    %% Full roster from the elector — sent once after our join is processed.
-    {noreply, add_monitors(MemberIds, State)};
+    {noreply, add_member_monitors(MemberIds, State)};
 
 handle_cast({new_member, MemberId}, State) ->
-    %% Incremental: a peer joined after us.
-    {noreply, add_monitors([MemberId], State)};
+    {noreply, add_member_monitors([MemberId], State)};
 
 handle_cast({member_down, MemberId}, State) ->
-    %% The elector confirmed a peer is gone.  Clean up our local state even
-    %% if we haven't received (or never receive) the erlang DOWN for it.
     {noreply, remove_member(MemberId, State)};
+
+%% ---- Registered-name messages (from elector actions) -------------------
+
+handle_cast({name_registered, LogicalName, Pid}, State) ->
+    #state{ets_table = Table, name_to_ref = NTR, ref_to_name = RTN} = State,
+    %% Idempotent: if we already have a monitor for this name (e.g. from a
+    %% concurrent registration race), demonitor the old one first.
+    {NTR1, RTN1} = demonitor_name(LogicalName, NTR, RTN),
+    ets:insert(Table, {LogicalName, Pid}),
+    Ref = erlang:monitor(process, Pid),
+    {noreply, State#state{
+        name_to_ref = NTR1#{LogicalName => Ref},
+        ref_to_name = RTN1#{Ref => LogicalName}
+    }};
+
+handle_cast({name_unregistered, LogicalName}, State) ->
+    #state{ets_table = Table, name_to_ref = NTR, ref_to_name = RTN} = State,
+    ets:delete(Table, LogicalName),
+    {NTR1, RTN1} = demonitor_name(LogicalName, NTR, RTN),
+    {noreply, State#state{name_to_ref = NTR1, ref_to_name = RTN1}};
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
+%% ---- Process DOWN messages -----------------------------------------------
+
 handle_info({'DOWN', Ref, process, _Pid, _Reason}, State) ->
-    #state{monitors = Monitors, elector = Elector, member_id = Self} = State,
+    #state{
+        monitors = Monitors,
+        ref_to_name = RefToName,
+        elector = Elector,
+        member_id = Self,
+        ets_table = Table
+    } = State,
     case maps:get(Ref, Monitors, undefined) of
         undefined ->
-            {noreply, State};
+            %% Not a peer-member monitor — check registered-process monitors.
+            case maps:get(Ref, RefToName, undefined) of
+                undefined ->
+                    {noreply, State};
+                LogicalName ->
+                    ets:delete(Table, LogicalName),
+                    dgen_server:cast(Elector, {unregister, LogicalName}),
+                    NTR = maps:remove(LogicalName, State#state.name_to_ref),
+                    RTN = maps:remove(Ref, RefToName),
+                    {noreply, State#state{name_to_ref = NTR, ref_to_name = RTN}}
+            end;
         Self ->
-            %% Should not happen (we don't monitor ourselves), but handle it.
+            %% Should not monitor ourselves, but handle gracefully.
             {noreply, State};
         DeadMemberId ->
             dgen_server:cast(Elector, {member_down, DeadMemberId}),
@@ -124,9 +177,23 @@ code_change(_OldVsn, State, _Extra) ->
 %% Internal helpers
 %% ---------------------------------------------------------------------------
 
-%% Establish process monitors for all members we haven't seen before.
-%% Skips ourselves (no self-monitor) and already-monitored peers (idempotent).
-add_monitors(MemberIds, State = #state{member_id = Self, members = Members, monitors = Monitors}) ->
+%% Seed the ETS table and set up process monitors for names that were already
+%% registered in FDB before this member started.
+seed_name_monitors(Names, Table) ->
+    maps:fold(
+        fun(LogicalName, Pid, {NTR, RTN}) ->
+            ets:insert(Table, {LogicalName, Pid}),
+            Ref = erlang:monitor(process, Pid),
+            {NTR#{LogicalName => Ref}, RTN#{Ref => LogicalName}}
+        end,
+        {#{}, #{}},
+        Names
+    ).
+
+%% Add erlang:monitor/2 for a list of peer member process names.
+%% Skips self and already-monitored peers (idempotent).
+add_member_monitors(MemberIds, State) ->
+    #state{member_id = Self, members = Members, monitors = Monitors} = State,
     {NewMembers, NewMonitors} = lists:foldl(
         fun(MemberId, {MA, MonA}) ->
             case MemberId =:= Self orelse maps:is_key(MemberId, MA) of
@@ -143,7 +210,6 @@ add_monitors(MemberIds, State = #state{member_id = Self, members = Members, moni
     ),
     State#state{members = NewMembers, monitors = NewMonitors}.
 
-%% Remove a member and demonitor it.
 remove_member(MemberId, State = #state{members = Members, monitors = Monitors}) ->
     case maps:get(MemberId, Members, undefined) of
         undefined ->
@@ -154,4 +220,15 @@ remove_member(MemberId, State = #state{members = Members, monitors = Monitors}) 
                 members = maps:remove(MemberId, Members),
                 monitors = maps:remove(Ref, Monitors)
             }
+    end.
+
+%% Demonitor and remove map entries for a registered LogicalName.
+%% Returns updated {NameToRef, RefToName}.
+demonitor_name(LogicalName, NTR, RTN) ->
+    case maps:get(LogicalName, NTR, undefined) of
+        undefined ->
+            {NTR, RTN};
+        OldRef ->
+            erlang:demonitor(OldRef, [flush]),
+            {maps:remove(LogicalName, NTR), maps:remove(OldRef, RTN)}
     end.
