@@ -2,6 +2,7 @@
 -behaviour(dgen_server).
 
 -define(DOCATTRS, ?OTP_RELEASE >= 27).
+-define(SnapshotTimeout, 2000).
 
 -if(?DOCATTRS).
 -moduledoc """
@@ -165,9 +166,11 @@ handle_call(get_members, _From, State) ->
 -doc """
 Called synchronously after a `{lock, NewState}` commit, before the lock clears.
 
-Sets up replication paths by notifying all members of the new leader.
-The lock clears automatically (in dgen_server's `after` block) once this
-callback returns, regardless of return value.
+Notifies all members of the new leader, then pulls the leader's names snapshot
+and pushes it to every follower via synchronous calls. Because the lock is still
+held for the duration of this callback, snapshot distribution is guaranteed to
+complete before any other consumer resumes queue processing — eliminating the
+race where a stale snapshot from a previous leader could arrive after a newer one.
 """.
 -endif.
 -spec handle_locked(dgen_server:event_type(), term(), registry_state()) ->
@@ -188,12 +191,16 @@ handle_locked(cast, {join, MemberId}, State) ->
         end,
         ExistingIds
     ),
+    %% Distribute the leader's names snapshot to all followers synchronously
+    %% while the lock is still held.
+    distribute_snapshot(Leader, maps:keys(maps:remove(Leader, Members))),
     {noreply, State};
 handle_locked(cast, {member_down, _MemberId}, State) ->
     #{members := Members, leader := Leader} = State,
     %% Surviving members already detected the death via their own DOWN signals.
     %% Only the new leader identity needs to be broadcast.
     broadcast_to_members(Members, {leader_changed, Leader}),
+    distribute_snapshot(Leader, maps:keys(maps:remove(Leader, Members))),
     {noreply, State}.
 
 %% ---------------------------------------------------------------------------
@@ -236,8 +243,61 @@ leader_db_key(Dir, Tuid) ->
 leader_key_tuple(Tuid) ->
     dgen_key:extend(Tuid, <<"leader">>).
 
+%% Pull the new leader's names snapshot and push it to all follower members via
+%% synchronous calls.  Called from handle_locked, so this runs within the lock
+%% period: no other consumer can process a queue message until this returns.
+%%
+%% {leader_changed, Leader} is always cast to Leader before this is called.
+%% Erlang's per-pair message ordering guarantee means that cast arrives at the
+%% leader before the get_names_snapshot call, so the leader has already assumed
+%% leadership and can serve its authoritative names map.
+distribute_snapshot(undefined, _FollowerIds) ->
+    ok;
+distribute_snapshot(_Leader, []) ->
+    ok;
+distribute_snapshot(Leader, FollowerIds) ->
+    %% Let this call crash if the leader is unreachable — the elector supervisor
+    %% will restart us, triggering a new membership change and a fresh handle_locked.
+    Snapshot = call_to_member(Leader, get_names_snapshot),
+    %% Push to all followers in parallel, then collect within a single deadline
+    %% window so lock hold time is bounded by ?SnapshotTimeout regardless of
+    %% cluster size.  Unreachable followers are tolerated: their DOWN signal will
+    %% cause them to rejoin, at which point they receive a fresh snapshot.
+    Parent = self(),
+    Refs = [
+        begin
+            Ref = make_ref(),
+            spawn(fun() ->
+                try
+                    call_to_member(Id, {apply_names_snapshot, Snapshot})
+                catch
+                    exit:_ -> ok
+                end,
+                Parent ! {snapshot_ack, Ref}
+            end),
+            Ref
+        end
+     || Id <- FollowerIds
+    ],
+    Deadline = erlang:monotonic_time(millisecond) + ?SnapshotTimeout,
+    collect_snapshot_acks(Refs, Deadline).
+
+collect_snapshot_acks([], _Deadline) ->
+    ok;
+collect_snapshot_acks(Refs, Deadline) ->
+    Remaining = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    receive
+        {snapshot_ack, Ref} ->
+            collect_snapshot_acks(lists:delete(Ref, Refs), Deadline)
+    after Remaining ->
+        ok
+    end.
+
 broadcast_to_members(Members, Msg) ->
     lists:foreach(fun(Id) -> cast_to_member(Id, Msg) end, maps:keys(Members)).
 
 cast_to_member({Node, Name}, Msg) ->
     gen_server:cast({Name, Node}, Msg).
+
+call_to_member({Node, Name}, Msg) ->
+    gen_server:call({Name, Node}, Msg, ?SnapshotTimeout).

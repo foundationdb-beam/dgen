@@ -29,25 +29,25 @@ established or changes. Keeps its local `names` map in sync by receiving
 casts from the leader (one-way replication).
 
 Forwards `{register, …}` calls and `{unregister, …}` casts to the leader.
-For both, the follower also updates its own `names` map immediately so that
-a subsequent `whereis_snapshot` on this node reflects the change without
-waiting for the replication cast to arrive over the network.
-(@todo - isn't this^ a bug? If the register is denied by the leader, the follower's
-local map will be wrong)
+For `register`, the follower also updates its own `names` map on receiving
+`yes` from the leader, so a subsequent `whereis_snapshot` on this node
+reflects the change without waiting for the replication cast. On `no` the
+local map is left unchanged.
 
 ## Leader role
 
 Assumed when the elector broadcasts `{leader_changed, Self}`. On assuming
 leadership the member uses its current in-memory `names` map (which already
-holds the replicated snapshot from when it was a follower), sets up
-`erlang:monitor/2` for every entry, and broadcasts a `{names_snapshot, …}`
-to all followers so their maps are consistent. Any stale entries (Pids
-that died while this node was a follower) are removed when their DOWN
-signals arrive.
-(@todo - I believe the snapshot must be fully mediated by the elector's lock period.
-Having the snapshot be asynchronously cast could overlap with another leadership
-change. The elector must be changed to pull the snapshot and then push it to all members with
-blocking confirmation)
+holds the replicated snapshot from when it was a follower) and sets up
+`erlang:monitor/2` for every entry. Any stale entries (Pids that died while
+this node was a follower) are removed when their DOWN signals arrive.
+
+The elector is responsible for distributing the new leader's snapshot to all
+followers via synchronous calls within the lock period (see
+`dgen_registry_elector:distribute_snapshot/2`). This ensures followers receive
+the snapshot before any subsequent membership change can be processed,
+preventing a stale snapshot from a previous leader from arriving after a
+newer one.
 
 The leader is the sole writer for the name table. It:
 
@@ -188,6 +188,14 @@ handle_call({whereis, _LogicalName}, _From, State) ->
 
 handle_call({whereis_snapshot, LogicalName}, _From, State) ->
     {reply, maps:get(LogicalName, State#state.names, undefined), State};
+%% ---- Snapshot distribution (called by elector within lock period) ----------
+
+%% Returns the current names list for the elector to push to followers.
+handle_call(get_names_snapshot, _From, State) ->
+    {reply, maps:to_list(State#state.names), State};
+%% Applies a snapshot pushed by the elector during a leadership transition.
+handle_call({apply_names_snapshot, NamesList}, _From, State) ->
+    {reply, ok, State#state{names = maps:from_list(NamesList)}};
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
 
@@ -306,11 +314,12 @@ code_change(_OldVsn, State, _Extra) ->
 %% Internal helpers
 %% ---------------------------------------------------------------------------
 
-%% Use the current in-memory names map as the starting snapshot, set up
-%% process monitors for every entry, and broadcast the snapshot to all peers.
+%% Set up process monitors for every entry in the current names map.
 %% Any stale Pid entries (processes that died while this node was a follower)
 %% will self-correct when their DOWN signals arrive.
-assume_leadership(State = #state{names = Names, members = Members}) ->
+%% Snapshot distribution to followers is handled by the elector within the
+%% lock period via distribute_snapshot/2 in dgen_registry_elector.
+assume_leadership(State = #state{names = Names}) ->
     {NTR, RTN} = maps:fold(
         fun(LogicalName, Pid, {NTRAcc, RTNAcc}) ->
             Ref = erlang:monitor(process, Pid),
@@ -318,13 +327,6 @@ assume_leadership(State = #state{names = Names, members = Members}) ->
         end,
         {#{}, #{}},
         Names
-    ),
-    NamesList = maps:to_list(Names),
-    maps:foreach(
-        fun(MemberId, _) ->
-            cast_to_member(MemberId, {names_snapshot, NamesList})
-        end,
-        Members
     ),
     State#state{name_to_ref = NTR, ref_to_name = RTN}.
 

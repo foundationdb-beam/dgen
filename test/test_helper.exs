@@ -1,2 +1,2 @@
 DGen.Case.init()
-ExUnit.start()
+ExUnit.start(capture_log: true)
