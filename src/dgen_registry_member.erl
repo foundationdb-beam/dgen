@@ -10,7 +10,9 @@
 %% Storage
 %% -------
 %% Both leader and follower keep a `names :: #{LogicalName => pid()}` map in
-%% their gen_server state.  There is no ETS table.
+%% their gen_server state.  There is no ETS table and no durable storage for
+%% name→pid mappings.  Pids are node-local and process-lifetime-scoped; they
+%% have no meaning after a restart and must never be written to FDB.
 %%
 %% Consistent reads and writes go through the leader.
 %% Snapshot reads (`whereis_snapshot`) are served from the local member's map
@@ -31,28 +33,25 @@
 %% Leader role
 %% -----------
 %% Assumed when the elector broadcasts `{leader_changed, Self}`.  On assuming
-%% leadership the member reads the authoritative name table from FDB via a
-%% range scan, sets up `erlang:monitor/2` for every registered Pid, and
-%% broadcasts a `{names_snapshot, …}` to all follower members.
+%% leadership the member uses its current in-memory `names` map (which already
+%% holds the replicated snapshot from when it was a follower), sets up
+%% `erlang:monitor/2` for every entry, and broadcasts a `{names_snapshot, …}`
+%% to all followers so their maps are consistent.  Any stale entries (Pids
+%% that died while this node was a follower) are removed when their DOWN
+%% signals arrive.
 %%
 %% The leader is the SOLE writer for the name table.  It:
 %%   - Handles `{register, LogicalName, Pid}` calls: checks the in-memory map,
-%%     writes the entry to FDB, updates the local map, monitors the Pid, and
-%%     replicates `{name_registered, …}` to all followers.
+%%     updates it, monitors the Pid, and replicates `{name_registered, …}`.
 %%   - Handles `{whereis, LogicalName}` calls: consistent read from local map.
-%%   - Handles `{unregister, LogicalName}` casts: deletes from FDB, updates
-%%     the local map, demonitors the Pid, replicates `{name_unregistered, …}`.
-%%   - Monitors every registered Pid.  When one dies, deletes from FDB and
-%%     replicates `{name_unregistered, …}` to followers.
+%%   - Handles `{unregister, LogicalName}` casts: updates the map, demonitors,
+%%     and replicates `{name_unregistered, …}`.
+%%   - Monitors every registered Pid.  When one dies, removes from the map
+%%     and replicates `{name_unregistered, …}` to followers.
 %%
 %% On `{leader_changed, Other}` when currently leader, the member relinquishes
 %% leadership: demonitors all registered Pids and clears the leader-only
 %% state.  The `names` map is kept intact (it still serves snapshot reads).
-%%
-%% FDB key layout (names sub-space)
-%% ----------------------------------
-%%   Prefix  : {Tuid, <<"names">>}
-%%   Per-name: {Tuid, <<"names">>, term_to_binary(LogicalName)}  →  term_to_binary(Pid)
 %% ---------------------------------------------------------------------------
 
 -export([start_link/2]).
@@ -61,10 +60,9 @@
 -record(state, {
     member_id :: dgen_registry_elector:member_id(),
     elector :: atom(),
-    tenant :: dgen_backend:tenant(),
-    tuid :: dgen_server:tuid(),
     leader :: dgen_registry_elector:member_id() | undefined,
     %% Name → Pid map.  Authoritative on leader; replicated snapshot on followers.
+    %% Never written to durable storage — Pids are ephemeral.
     names :: #{term() => pid()},
     %% Peer-member monitors (all members)
     members :: #{dgen_registry_elector:member_id() => reference()},
@@ -86,17 +84,14 @@ start_link(Name, Args) ->
 %% gen_server callbacks
 %% ---------------------------------------------------------------------------
 
-init(#{name := RegistryName, elector := Elector, member_name := MemberName, tenant := Tenant}) ->
+init(#{elector := Elector, member_name := MemberName}) ->
     MemberId = {node(), MemberName},
-    Tuid = {<<"dgen_registry">>, atom_to_binary(RegistryName)},
     %% Announce presence; the elector's post-commit action (or handle_locked)
     %% will reply with {members, AllIds} and {leader_changed, Leader}.
     dgen_server:cast(Elector, {join, MemberId}),
     {ok, #state{
         member_id = MemberId,
         elector = Elector,
-        tenant = Tenant,
-        tuid = Tuid,
         leader = undefined,
         names = #{},
         members = #{},
@@ -114,13 +109,11 @@ init(#{name := RegistryName, elector := Elector, member_name := MemberName, tena
 %% Leader: handle registration directly.
 handle_call({register, LogicalName, Pid}, _From,
             State = #state{leader = Leader, member_id = Leader}) ->
-    #state{names = Names, tenant = Tenant, tuid = Tuid,
-           members = Members, name_to_ref = NTR, ref_to_name = RTN} = State,
+    #state{names = Names, members = Members, name_to_ref = NTR, ref_to_name = RTN} = State,
     case maps:is_key(LogicalName, Names) of
         true ->
             {reply, no, State};
         false ->
-            ok = write_name(Tenant, Tuid, LogicalName, Pid),
             Ref = erlang:monitor(process, Pid),
             broadcast_to_peers(Members, {name_registered, LogicalName, Pid}),
             {reply, yes, State#state{
@@ -229,9 +222,7 @@ handle_cast({names_snapshot, NamesList}, State) ->
 
 %% Leader: handle directly.
 handle_cast({unregister, LogicalName}, State = #state{leader = Leader, member_id = Leader}) ->
-    #state{tenant = Tenant, tuid = Tuid, names = Names,
-           members = Members, name_to_ref = NTR, ref_to_name = RTN} = State,
-    delete_name(Tenant, Tuid, LogicalName),
+    #state{names = Names, members = Members, name_to_ref = NTR, ref_to_name = RTN} = State,
     {NTR1, RTN1} = demonitor_name(LogicalName, NTR, RTN),
     broadcast_to_peers(Members, {name_unregistered, LogicalName}),
     {noreply, State#state{
@@ -265,8 +256,6 @@ handle_info({'DOWN', Ref, process, _Pid, _Reason}, State) ->
         ref_to_name = RefToName,
         elector = Elector,
         member_id = Self,
-        tenant = Tenant,
-        tuid = Tuid,
         members = Members
     } = State,
     case maps:get(Ref, Monitors, undefined) of
@@ -276,7 +265,6 @@ handle_info({'DOWN', Ref, process, _Pid, _Reason}, State) ->
                 undefined ->
                     {noreply, State};
                 LogicalName ->
-                    delete_name(Tenant, Tuid, LogicalName),
                     broadcast_to_peers(Members, {name_unregistered, LogicalName}),
                     NTR = maps:remove(LogicalName, State#state.name_to_ref),
                     RTN = maps:remove(Ref, RefToName),
@@ -307,23 +295,11 @@ code_change(_OldVsn, State, _Extra) ->
 %% Internal helpers
 %% ---------------------------------------------------------------------------
 
-%% Read the authoritative name table from FDB, set up process monitors, and
-%% broadcast a full snapshot to all peers so their local maps are up to date.
-assume_leadership(State = #state{tenant = Tenant, tuid = Tuid, members = Members}) ->
-    B = dgen_config:backend(),
-    Names = dgen_backend:transactional(Tenant, fun({Tx, Dir}) ->
-        {Start, End} = B:dir_range(Dir, dgen_key:extend(Tuid, <<"names">>)),
-        lists:foldl(
-            fun({K, V}, Acc) ->
-                Unpacked = B:dir_unpack(Dir, K),
-                LogicalName = binary_to_term(element(tuple_size(Unpacked), Unpacked)),
-                Pid = binary_to_term(V),
-                Acc#{LogicalName => Pid}
-            end,
-            #{},
-            B:get_range(Tx, Start, End, [])
-        )
-    end),
+%% Use the current in-memory names map as the starting snapshot, set up
+%% process monitors for every entry, and broadcast the snapshot to all peers.
+%% Any stale Pid entries (processes that died while this node was a follower)
+%% will self-correct when their DOWN signals arrive.
+assume_leadership(State = #state{names = Names, members = Members}) ->
     {NTR, RTN} = maps:fold(
         fun(LogicalName, Pid, {NTRAcc, RTNAcc}) ->
             Ref = erlang:monitor(process, Pid),
@@ -336,7 +312,7 @@ assume_leadership(State = #state{tenant = Tenant, tuid = Tuid, members = Members
     maps:foreach(fun(MemberId, _) ->
         cast_to_member(MemberId, {names_snapshot, NamesList})
     end, Members),
-    State#state{names = Names, name_to_ref = NTR, ref_to_name = RTN}.
+    State#state{name_to_ref = NTR, ref_to_name = RTN}.
 
 %% Demonitor all registered Pids; keep the names map for snapshot reads.
 relinquish_leadership(State = #state{name_to_ref = NTR}) ->
@@ -344,20 +320,6 @@ relinquish_leadership(State = #state{name_to_ref = NTR}) ->
         erlang:demonitor(Ref, [flush])
     end, NTR),
     State#state{name_to_ref = #{}, ref_to_name = #{}}.
-
-write_name(Tenant, Tuid, LogicalName, Pid) ->
-    B = dgen_config:backend(),
-    dgen_backend:transactional(Tenant, fun({Tx, Dir}) ->
-        Key = B:dir_pack(Dir, dgen_key:extend(Tuid, <<"names">>, term_to_binary(LogicalName))),
-        B:set(Tx, Key, term_to_binary(Pid))
-    end).
-
-delete_name(Tenant, Tuid, LogicalName) ->
-    B = dgen_config:backend(),
-    dgen_backend:transactional(Tenant, fun({Tx, Dir}) ->
-        Key = B:dir_pack(Dir, dgen_key:extend(Tuid, <<"names">>, term_to_binary(LogicalName))),
-        B:clear_range(Tx, Key, B:key_strinc(Key))
-    end).
 
 add_member_monitors(MemberIds, State) ->
     #state{member_id = Self, members = Members, monitors = Monitors} = State,

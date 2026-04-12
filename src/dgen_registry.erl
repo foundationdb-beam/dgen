@@ -205,10 +205,8 @@ init({Name, Tenant}) ->
             {dgen_registry_member, start_link, [
                 MemberName,
                 #{
-                    name => Name,
                     elector => ElectorName,
-                    member_name => MemberName,
-                    tenant => Tenant
+                    member_name => MemberName
                 }
             ]},
         restart => permanent,

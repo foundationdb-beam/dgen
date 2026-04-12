@@ -142,9 +142,10 @@ uses the coordination window to fan out replication-topology casts to every memb
 - Existing members receive `{new_member, Id}` and `{leader_changed, Leader}`.
 
 The new leader member receives `{leader_changed, Self}`, which triggers `assume_leadership`:
-a synchronous FDB range scan over the names sub-space to load the authoritative snapshot,
-followed by a `{names_snapshot, …}` broadcast to all followers.  This happens
-asynchronously in the member's gen_server, after the elector lock has cleared.
+it uses its current in-memory `names` map (already populated from replication while it was
+a follower), sets up process monitors for every entry, and broadcasts a `{names_snapshot, …}`
+to all followers.  Any stale Pid entries self-correct when their DOWN signals arrive.
+This happens asynchronously in the member's gen_server, after the elector lock has cleared.
 
 When leadership does not change (e.g. a new member joins on the same node), no lock is
 taken; a plain `{noreply, NewState, Actions}` handles the notifications.
@@ -186,14 +187,15 @@ replication cast arrives shortly after.
 ### FDB key layout
 
 ```
-{<<"dgen_registry">>, RegistryName, <<"leader">>}         → term_to_binary(MemberId | undefined)
-{<<"dgen_registry">>, RegistryName, <<"names">>, NameBin} → term_to_binary(Pid)
+{<<"dgen_registry">>, RegistryName, <<"leader">>} → term_to_binary(MemberId | undefined)
 ```
 
-where `NameBin = term_to_binary(LogicalName)` and `RegistryName = atom_to_binary(Name)`.
-The leader key is written atomically with every membership state change.  Name keys are
-written and deleted by the leader member directly (outside the elector's dgen_server queue),
-using `dgen_backend:transactional/2`.
+where `RegistryName = atom_to_binary(Name)`.  The leader key is the only registry data
+written to FDB; it is updated atomically with every membership state change by the elector.
+
+Name→Pid mappings are **never written to FDB**.  Pids are node-local and process-lifetime-
+scoped; they have no meaning after a restart.  The authoritative names map lives in the
+leader member's gen_server state and is replicated in-memory to followers.
 
 ### Auto-unregistration
 
