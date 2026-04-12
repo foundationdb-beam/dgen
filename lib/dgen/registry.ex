@@ -22,7 +22,7 @@ defmodule DGen.Registry do
 
   ## Consistency model
 
-  `register_name/2`, `unregister_name/1`, and `whereis_name_consistent/2`
+  `register_name/2`, `unregister_name/1`, and `whereis_name_consistent/1`
   route through the elected leader. `whereis_name/1` (used by the OTP
   via-tuple machinery) is served from the local member's in-memory map —
   no network hop or backend round-trip. There is a short replication window

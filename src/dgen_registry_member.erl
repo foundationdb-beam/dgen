@@ -23,10 +23,11 @@ without contacting the leader.
 
 ## Follower role
 
-Receives `{leader_changed, Leader}` from the elector when leadership is
-established or changes. Keeps its local `names` map in sync by receiving
-`{name_registered, …}`, `{name_unregistered, …}`, and `{names_snapshot, …}`
-casts from the leader (one-way replication).
+Keeps its local `names` map in sync by receiving `{name_registered, …}`,
+`{name_unregistered, …}`, and `{apply_names_snapshot, …}` casts from the
+leader (one-way replication).  All follower messages come from the leader
+process, so Erlang's per-pair FIFO guarantee ensures followers always see a
+snapshot before any `{name_registered}` broadcast that post-dates it.
 
 Forwards `{register, …}` calls and `{unregister, …}` casts to the leader.
 For `register`, the follower also updates its own `names` map on receiving
@@ -36,18 +37,13 @@ local map is left unchanged.
 
 ## Leader role
 
-Assumed when the elector broadcasts `{leader_changed, Self}`. On assuming
-leadership the member uses its current in-memory `names` map (which already
-holds the replicated snapshot from when it was a follower) and sets up
-`erlang:monitor/2` for every entry. Any stale entries (Pids that died while
-this node was a follower) are removed when their DOWN signals arrive.
-
-The elector is responsible for distributing the new leader's snapshot to all
-followers via synchronous calls within the lock period (see
-`dgen_registry_elector:distribute_snapshot/2`). This ensures followers receive
-the snapshot before any subsequent membership change can be processed,
-preventing a stale snapshot from a previous leader from arriving after a
-newer one.
+Assumed when the elector calls `{elector_assume_and_distribute, …}`.  On
+assuming leadership the member uses the supplied snapshot (or its own names
+map if the snapshot is `self_snapshot`), sets up `erlang:monitor/2` for
+every entry, and distributes `{apply_names_snapshot}` casts to all followers
+from its own process (same sender as future `{name_registered}` broadcasts —
+see elector moduledoc for the FIFO ordering guarantee).  Any stale Pid
+entries are removed when their DOWN signals arrive.
 
 The leader is the sole writer for the name table. It:
 
@@ -59,9 +55,9 @@ The leader is the sole writer for the name table. It:
 - Monitors every registered Pid. When one dies, removes from the map
   and replicates `{name_unregistered, …}` to followers.
 
-On `{leader_changed, Other}` when currently leader, the member relinquishes
-leadership: demonitors all registered Pids and clears the leader-only
-state. The `names` map is kept intact (it still serves snapshot reads).
+On relinquishing leadership the member demonitors all registered Pids and
+clears the leader-only state.  The `names` map is kept intact (it still
+serves snapshot reads).
 """.
 -endif.
 
@@ -100,8 +96,8 @@ start_link(Name, Args) ->
 
 init(#{elector := Elector, member_name := MemberName}) ->
     MemberId = {node(), MemberName},
-    %% Announce presence; the elector's post-commit action (or handle_locked)
-    %% will reply with {members, AllIds} and {leader_changed, Leader}.
+    %% Announce presence; the elector will call {elector_assume_and_distribute}
+    %% on the new leader, which then sends {apply_names_snapshot} to this member.
     dgen_server:cast(Elector, {join, MemberId}),
     {ok, #state{
         member_id = MemberId,
@@ -188,14 +184,53 @@ handle_call({whereis, _LogicalName}, _From, State) ->
 
 handle_call({whereis_snapshot, LogicalName}, _From, State) ->
     {reply, maps:get(LogicalName, State#state.names, undefined), State};
-%% ---- Snapshot distribution (called by elector within lock period) ----------
+%% ---- Elector calls (during lock period) ------------------------------------
 
-%% Returns the current names list for the elector to push to followers.
-handle_call(get_names_snapshot, _From, State) ->
-    {reply, maps:to_list(State#state.names), State};
-%% Applies a snapshot pushed by the elector during a leadership transition.
-handle_call({apply_names_snapshot, NamesList}, _From, State) ->
-    {reply, ok, State#state{names = maps:from_list(NamesList)}};
+%% Atomically relinquish leadership and return the current names snapshot.
+%% Called by the elector when a new member becomes the new leader: the old
+%% leader hands off its authoritative state and stops accepting writes in a
+%% single step.  Any registration already in the mailbox before this call is
+%% processed first (FIFO) and included in the returned snapshot; any arriving
+%% after this call returns 'no' — leader is undefined until {apply_names_snapshot}
+%% arrives from the new leader.
+handle_call({transfer_snapshot, _NewLeader}, _From,
+            State = #state{member_id = Self, leader = Self}) ->
+    %% Set leader = undefined (not NewLeader) so this member stays silent on
+    %% registrations until {apply_names_snapshot} arrives from the new leader.
+    %% If we set leader = NewLeader here, any pending {register} call would be
+    %% forwarded to a leader that has not yet assumed leadership and would fail.
+    %% The correct leader is communicated atomically via {apply_names_snapshot}.
+    State1 = relinquish_leadership(State#state{leader = undefined}),
+    {reply, maps:to_list(State1#state.names), State1};
+%% Called by the elector to atomically assume leadership and fan out the
+%% names snapshot to all followers.
+%%
+%% `Snapshot` is either `self_snapshot` (use own names — leader was already
+%% an existing member) or a `[{Name, Pid}]` list pre-fetched from the old
+%% leader via `transfer_snapshot`.
+%%
+%% `MemberId` is the newly joining member that triggered this transition, or
+%% `undefined` for a `member_down` event.
+%%
+%% `AllIds` is the full current member list.
+%%
+%% After updating own state the leader sends `{apply_names_snapshot}` casts
+%% to every follower from its own process (maintaining FIFO ordering with
+%% subsequent `{name_registered}` broadcasts).
+handle_call({elector_assume_and_distribute, Snapshot, MemberId, AllIds}, _From,
+            State = #state{member_id = Self, leader = OldLeader}) ->
+    State1 = do_leader_changed(Self, OldLeader, Self, State),
+    State2 = case Snapshot of
+        self_snapshot -> State1;
+        NamesList -> State1#state{names = maps:from_list(NamesList)}
+    end,
+    State3 = add_member_monitors(extra_member_ids(MemberId, AllIds, Self), State2),
+    Names = maps:to_list(State3#state.names),
+    lists:foreach(
+        fun(Id) -> cast_to_member(Id, {apply_names_snapshot, Names, Self, extra_member_ids(MemberId, AllIds, Id)}) end,
+        lists:delete(Self, AllIds)
+    ),
+    {reply, ok, State3};
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
 
@@ -203,46 +238,19 @@ handle_call(_Request, _From, State) ->
 %% handle_cast/2
 %% ---------------------------------------------------------------------------
 
-%% ---- Peer membership (from elector) ----------------------------------------
-
-handle_cast({members, MemberIds}, State) ->
-    {noreply, add_member_monitors(MemberIds, State)};
-%% New member joined; as leader, send them the current names snapshot.
-handle_cast(
-    {new_member, NewMemberId}, State = #state{member_id = Self, leader = Self, names = Names}
-) ->
-    cast_to_member(NewMemberId, {names_snapshot, maps:to_list(Names)}),
-    {noreply, add_member_monitors([NewMemberId], State)};
-handle_cast({new_member, NewMemberId}, State) ->
-    {noreply, add_member_monitors([NewMemberId], State)};
-%% ---- Leadership transitions ------------------------------------------------
-
-handle_cast({leader_changed, NewLeader}, State = #state{member_id = Self, leader = OldLeader}) ->
-    State1 =
-        if
-            OldLeader =:= Self, NewLeader =/= Self ->
-                %% Lost leadership — demonitor registered Pids, keep names for snapshot reads.
-                relinquish_leadership(State#state{leader = NewLeader});
-            OldLeader =/= Self, NewLeader =:= Self ->
-                %% Gained leadership — assume leadership and seed followers with current names snapshot.
-                assume_leadership(State#state{leader = NewLeader});
-            true ->
-                %% No role change.
-                State#state{leader = NewLeader}
-        end,
-    {noreply, State1};
-%% ---- One-way replication from leader to followers -------------------------
-
 handle_cast({name_registered, LogicalName, Pid}, State = #state{names = Names}) ->
     {noreply, State#state{names = Names#{LogicalName => Pid}}};
 handle_cast({name_unregistered, LogicalName}, State = #state{names = Names}) ->
     {noreply, State#state{names = maps:remove(LogicalName, Names)}};
-%% Replace the local names map with the leader's current snapshot.
-handle_cast({names_snapshot, NamesList}, State) ->
-    {noreply, State#state{names = maps:from_list(NamesList)}};
-%% ---- Unregister -----------------------------------------------------------
-
-%% Leader: handle directly.
+%% Leadership transition snapshot sent by the new leader to all followers.
+%% Applies the leader transition, the names update, and extra member monitors
+%% atomically within a single cast — no other message can interleave.
+handle_cast({apply_names_snapshot, NamesList, NewLeader, ExtraMembers},
+            State = #state{member_id = Self, leader = OldLeader}) ->
+    State1 = do_leader_changed(NewLeader, OldLeader, Self, State),
+    State2 = State1#state{names = maps:from_list(NamesList)},
+    {noreply, add_member_monitors(ExtraMembers, State2)};
+%% Leader: handle unregister directly.
 handle_cast({unregister, LogicalName}, State = #state{leader = Leader, member_id = Leader}) ->
     #state{names = Names, members = Members, name_to_ref = NTR, ref_to_name = RTN} = State,
     {NTR1, RTN1} = demonitor_name(LogicalName, NTR, RTN),
@@ -260,10 +268,7 @@ handle_cast({unregister, LogicalName}, State = #state{leader = Leader, names = N
 ->
     cast_to_member(Leader, {unregister, LogicalName}),
     {noreply, State#state{names = maps:remove(LogicalName, Names)}};
-%% No leader — drop.
-handle_cast({unregister, _LogicalName}, State) ->
-    {noreply, State};
-handle_cast(_Msg, State) ->
+handle_cast(_, State) ->
     {noreply, State}.
 
 %% ---------------------------------------------------------------------------
@@ -314,11 +319,21 @@ code_change(_OldVsn, State, _Extra) ->
 %% Internal helpers
 %% ---------------------------------------------------------------------------
 
+do_leader_changed(NewLeader, OldLeader, Self, State) ->
+    if
+        OldLeader =:= Self, NewLeader =/= Self ->
+            %% Lost leadership — demonitor registered Pids, keep names for snapshot reads.
+            relinquish_leadership(State#state{leader = NewLeader});
+        OldLeader =/= Self, NewLeader =:= Self ->
+            %% Gained leadership — set up monitors for all currently known names.
+            assume_leadership(State#state{leader = NewLeader});
+        true ->
+            State#state{leader = NewLeader}
+    end.
+
 %% Set up process monitors for every entry in the current names map.
 %% Any stale Pid entries (processes that died while this node was a follower)
 %% will self-correct when their DOWN signals arrive.
-%% Snapshot distribution to followers is handled by the elector within the
-%% lock period via distribute_snapshot/2 in dgen_registry_elector.
 assume_leadership(State = #state{names = Names}) ->
     {NTR, RTN} = maps:fold(
         fun(LogicalName, Pid, {NTRAcc, RTNAcc}) ->
@@ -378,6 +393,15 @@ demonitor_name(LogicalName, NTR, RTN) ->
             erlang:demonitor(OldRef, [flush]),
             {maps:remove(LogicalName, NTR), maps:remove(OldRef, RTN)}
     end.
+
+%% Returns the list of member IDs to add as monitors for a given member during
+%% a join/member_down leadership transition.
+%%   - undefined MemberId (member_down):    no extra monitors for anyone.
+%%   - Id = MemberId (new joining member):  add all current peers.
+%%   - Id ≠ MemberId (existing member):     add only the new member.
+extra_member_ids(undefined, _AllIds, _Id) -> [];
+extra_member_ids(MemberId, AllIds, MemberId) -> AllIds;
+extra_member_ids(MemberId, _AllIds, _Id) -> [MemberId].
 
 broadcast_to_peers(Members, Msg) ->
     maps:foreach(fun(MemberId, _) -> cast_to_member(MemberId, Msg) end, Members).

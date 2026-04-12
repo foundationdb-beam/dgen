@@ -31,12 +31,15 @@ instead of `{noreply, …}`. This atomically:
 2. Sets a distributed lock key that pauses all other elector consumers
    from processing further queue messages.
 
-`handle_locked/3` is then called (synchronously, before the lock clears)
-with the committed state. It performs the one-time fan-out:
+`handle_locked/4` is then called (synchronously, before the lock clears)
+with the committed state. It calls only the new leader — never followers
+directly — via `{elector_assume_and_distribute}`. The leader then distributes
+`{apply_names_snapshot}` casts to all followers from its own process.
 
-- Tells every member who the new leader is (`{leader_changed, Leader}`).
-- Gives the new member its peer list and the new leader.
-- Gives existing members the new member's identity.
+Because the casts originate from the same process as subsequent
+`{name_registered}` broadcasts, Erlang's per-pair FIFO guarantee ensures
+every follower sees the snapshot before any registration that post-dates
+the leadership transition.
 
 The lock clears automatically after `handle_locked` returns, signalling
 all waiting consumers to resume.
@@ -53,7 +56,6 @@ Value:    term_to_binary(MemberId | undefined)
 -export([
     init/1,
     handle_cast_tx/3,
-    handle_call_tx/4,
     handle_call/3,
     handle_locked/4,
     leader_db_key/2
@@ -83,14 +85,6 @@ init(#{name := Name}) ->
     {ok, Tuid, State}.
 
 -if(?DOCATTRS).
--doc "Delegates read-only priority calls to `handle_call/3`.".
--endif.
--spec handle_call_tx(dgen_server:tx_ctx(), term(), dgen_server:from(), registry_state()) ->
-    dgen_server:reply_ret().
-handle_call_tx(_TxCtx, Request, From, State) ->
-    handle_call(Request, From, State).
-
--if(?DOCATTRS).
 -doc """
 Processes membership change messages within a backend transaction.
 
@@ -112,16 +106,11 @@ handle_cast_tx(TxCtx, {join, MemberId}, State) ->
             %% Leadership changed — lock so handle_locked can set up replication paths.
             {lock, NewState};
         true ->
-            %% Leader unchanged — notify about the new member via post-commit actions.
+            %% Leader unchanged — route through the leader so all follower messages
+            %% come from the same sender (FIFO with subsequent name broadcasts).
             Actions = [
                 fun(#{members := All, leader := L}) ->
-                    ExistingIds = maps:keys(maps:remove(MemberId, All)),
-                    cast_to_member(MemberId, {members, maps:keys(All)}),
-                    cast_to_member(MemberId, {leader_changed, L}),
-                    lists:foreach(
-                        fun(Id) -> cast_to_member(Id, {new_member, MemberId}) end,
-                        ExistingIds
-                    )
+                    call_to_member(L, {elector_assume_and_distribute, self_snapshot, MemberId, maps:keys(All)})
                 end
             ],
             {noreply, NewState, Actions}
@@ -166,11 +155,18 @@ handle_call(get_members, _From, State) ->
 -doc """
 Called synchronously after a `{lock, NewState}` commit, before the lock clears.
 
-Notifies all members of the new leader, then pulls the leader's names snapshot
-and pushes it to every follower via synchronous calls. Because the lock is still
-held for the duration of this callback, snapshot distribution is guaranteed to
-complete before any other consumer resumes queue processing — eliminating the
-race where a stale snapshot from a previous leader could arrive after a newer one.
+The elector calls only the new leader — never followers directly.  The leader
+atomically assumes leadership and distributes the names snapshot to all
+followers as casts from its own process.  Because the casts originate from the
+same process as subsequent `{name_registered}` broadcasts, Erlang's per-pair
+FIFO guarantee ensures every follower sees the snapshot before any registration
+that post-dates the transition.
+
+For the special case where a new member itself wins the election (it has no
+prior state), the elector first calls the old leader via `transfer_snapshot` to
+atomically read the authoritative state and relinquish leadership — any
+registration already in the old leader's mailbox is flushed and included in
+the snapshot before the handoff.
 """.
 -endif.
 -spec handle_locked(dgen_server:db_ctx(), dgen_server:event_type(), term(), registry_state()) ->
@@ -180,27 +176,28 @@ handle_locked(_DbCtx, cast, {join, MemberId}, State) ->
     #{members := Members, leader := Leader} = State,
     AllIds = maps:keys(Members),
     ExistingIds = maps:keys(maps:remove(MemberId, Members)),
-    %% New member: who all the peers are + who the leader is.
-    cast_to_member(MemberId, {members, AllIds}),
-    cast_to_member(MemberId, {leader_changed, Leader}),
-    %% Existing members: identity of the new peer + updated leader.
-    lists:foreach(
-        fun(Id) ->
-            cast_to_member(Id, {new_member, MemberId}),
-            cast_to_member(Id, {leader_changed, Leader})
+    Snapshot =
+        if
+            Leader =:= MemberId, ExistingIds =/= [] ->
+                %% New member won the election but has no prior state.  Call the
+                %% old leader to atomically hand off its snapshot and relinquish —
+                %% any registration in its mailbox is flushed into the snapshot
+                %% before leadership transfers.
+                [SnapshotSource | _] = ExistingIds,
+                call_to_member(SnapshotSource, {transfer_snapshot, Leader});
+            true ->
+                %% Existing member is (or remains) the leader — use its own names.
+                self_snapshot
         end,
-        ExistingIds
-    ),
-    %% Distribute the leader's names snapshot to all followers synchronously
-    %% while the lock is still held.
-    distribute_snapshot(Leader, maps:keys(maps:remove(Leader, Members))),
+    call_to_member(Leader, {elector_assume_and_distribute, Snapshot, MemberId, AllIds}),
     {noreply, State};
 handle_locked(_DbCtx, cast, {member_down, _MemberId}, State) ->
     #{members := Members, leader := Leader} = State,
-    %% Surviving members already detected the death via their own DOWN signals.
-    %% Only the new leader identity needs to be broadcast.
-    broadcast_to_members(Members, {leader_changed, Leader}),
-    distribute_snapshot(Leader, maps:keys(maps:remove(Leader, Members))),
+    AllIds = maps:keys(Members),
+    case Leader of
+        undefined -> ok;
+        _ -> call_to_member(Leader, {elector_assume_and_distribute, self_snapshot, undefined, AllIds})
+    end,
     {noreply, State}.
 
 %% ---------------------------------------------------------------------------
@@ -242,62 +239,6 @@ leader_db_key(Dir, Tuid) ->
 
 leader_key_tuple(Tuid) ->
     dgen_key:extend(Tuid, <<"leader">>).
-
-%% Pull the new leader's names snapshot and push it to all follower members via
-%% synchronous calls.  Called from handle_locked, so this runs within the lock
-%% period: no other consumer can process a queue message until this returns.
-%%
-%% {leader_changed, Leader} is always cast to Leader before this is called.
-%% Erlang's per-pair message ordering guarantee means that cast arrives at the
-%% leader before the get_names_snapshot call, so the leader has already assumed
-%% leadership and can serve its authoritative names map.
-distribute_snapshot(undefined, _FollowerIds) ->
-    ok;
-distribute_snapshot(_Leader, []) ->
-    ok;
-distribute_snapshot(Leader, FollowerIds) ->
-    %% Let this call crash if the leader is unreachable — the elector supervisor
-    %% will restart us, triggering a new membership change and a fresh handle_locked.
-    Snapshot = call_to_member(Leader, get_names_snapshot),
-    %% Push to all followers in parallel, then collect within a single deadline
-    %% window so lock hold time is bounded by ?SnapshotTimeout regardless of
-    %% cluster size.  Unreachable followers are tolerated: their DOWN signal will
-    %% cause them to rejoin, at which point they receive a fresh snapshot.
-    Parent = self(),
-    Refs = [
-        begin
-            Ref = make_ref(),
-            spawn(fun() ->
-                try
-                    call_to_member(Id, {apply_names_snapshot, Snapshot})
-                catch
-                    exit:_ -> ok
-                end,
-                Parent ! {snapshot_ack, Ref}
-            end),
-            Ref
-        end
-     || Id <- FollowerIds
-    ],
-    Deadline = erlang:monotonic_time(millisecond) + ?SnapshotTimeout,
-    collect_snapshot_acks(Refs, Deadline).
-
-collect_snapshot_acks([], _Deadline) ->
-    ok;
-collect_snapshot_acks(Refs, Deadline) ->
-    Remaining = max(0, Deadline - erlang:monotonic_time(millisecond)),
-    receive
-        {snapshot_ack, Ref} ->
-            collect_snapshot_acks(lists:delete(Ref, Refs), Deadline)
-    after Remaining ->
-        ok
-    end.
-
-broadcast_to_members(Members, Msg) ->
-    lists:foreach(fun(Id) -> cast_to_member(Id, Msg) end, maps:keys(Members)).
-
-cast_to_member({Node, Name}, Msg) ->
-    gen_server:cast({Name, Node}, Msg).
 
 call_to_member({Node, Name}, Msg) ->
     gen_server:call({Name, Node}, Msg, ?SnapshotTimeout).

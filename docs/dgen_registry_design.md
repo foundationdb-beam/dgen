@@ -45,21 +45,32 @@ is used as a one-time fallback.
 When the committed leader changes, `handle_cast_tx` returns `{lock, NewState}`
 instead of `{noreply, …, Actions}`.  This atomically commits the new leader to the
 DB and pauses all other elector consumers via a distributed lock.  `handle_locked/4`
-uses this coordination window to fan out casts to every member before queue
-processing resumes:
+runs synchronously within the lock window and calls only the new leader — never
+followers directly.
 
-- New member receives `{members, AllIds}` and `{leader_changed, Leader}`.
-- Existing members receive `{new_member, Id}` and `{leader_changed, Leader}`.
+**Snapshot handoff** (new member wins election): The elector first calls
+`{transfer_snapshot, NewLeader}` on an existing member, which atomically relinquishes
+its own leadership and returns its current `names` snapshot in a single
+`gen_server:call`.  Any registration already in that member's mailbox before the call
+is processed first (FIFO) and included in the snapshot.  After relinquishing, that
+member returns `no` for registrations until it receives a snapshot from the new leader.
 
-The new leader member receives `{leader_changed, Self}`, which triggers
-`assume_leadership`: it uses its current in-memory `names` map (already populated
-from replication while it was a follower), sets up process monitors for every entry,
-and broadcasts a `{names_snapshot, …}` to all followers.  Any stale Pid entries
-self-correct when their `DOWN` signals arrive.  This happens asynchronously in the
-member's gen_server, after the elector lock has cleared.
+**Leader assumption**: The elector then calls `{elector_assume_and_distribute, Snapshot,
+MemberId, AllIds}` on the new leader.  The leader atomically:
 
-When leadership does not change (e.g. a new member joins on the same node), no lock
-is taken; a plain `{noreply, NewState, Actions}` handles the notifications.
+1. Assumes leadership (sets up `erlang:monitor/2` for every name in the snapshot).
+2. Applies the snapshot (or uses its own `names` map if it was already a member).
+3. Sends `{apply_names_snapshot, Names, Self, ExtraMembers}` casts to all followers
+   from its own process.
+
+Because those casts originate from the same process as subsequent `{name_registered}`
+broadcasts, Erlang's per-pair FIFO guarantee ensures every follower sees the snapshot
+before any registration that post-dates the leadership transition.
+
+When leadership does not change (e.g. a new member joins on the same node as the
+current leader), no lock is taken; a plain `{noreply, NewState, Actions}` calls
+`{elector_assume_and_distribute}` on the (unchanged) leader to distribute the new
+membership information.
 
 ### Name storage
 
