@@ -4,6 +4,7 @@ DGen.Case.init()
 # the :peer module.  Longnames with 127.0.0.1 avoid hostname-resolution
 # issues.  Using the OS PID prevents collisions between concurrent runs.
 if !Node.alive?() do
+  System.cmd("epmd", ["-daemon"])
   node_name = :"dgen_test_#{:os.getpid()}@127.0.0.1"
   {:ok, _} = Node.start(node_name, :longnames)
 end
