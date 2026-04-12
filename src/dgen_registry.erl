@@ -120,8 +120,10 @@ unregister_name({RegistryName, LogicalName}) ->
 %% arriving.
 -spec whereis_name({atom(), term()}) -> pid() | undefined.
 whereis_name({RegistryName, LogicalName}) ->
-    try gen_server:call(member_name(RegistryName), {whereis_snapshot, LogicalName})
-    catch exit:_ -> undefined
+    try
+        gen_server:call(member_name(RegistryName), {whereis_snapshot, LogicalName})
+    catch
+        exit:_ -> undefined
     end.
 
 %% Sends `Msg` to the process registered as `Name`, returning the Pid.
@@ -146,8 +148,10 @@ send(Name, Msg) ->
 %% registered.  More expensive than `whereis_name/1` but never stale.
 -spec whereis_name_consistent({atom(), term()}) -> pid() | undefined.
 whereis_name_consistent({RegistryName, LogicalName}) ->
-    try gen_server:call(member_name(RegistryName), {whereis, LogicalName})
-    catch exit:_ -> undefined
+    try
+        gen_server:call(member_name(RegistryName), {whereis, LogicalName})
+    catch
+        exit:_ -> undefined
     end.
 
 %% ---------------------------------------------------------------------------
@@ -215,5 +219,4 @@ init({Name, Tenant}) ->
         modules => [dgen_registry_member]
     },
 
-    {ok, {#{strategy => one_for_one, intensity => 5, period => 10},
-          [ElectorSpec, MemberSpec]}}.
+    {ok, {#{strategy => one_for_one, intensity => 5, period => 10}, [ElectorSpec, MemberSpec]}}.

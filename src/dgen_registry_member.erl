@@ -107,8 +107,11 @@ init(#{elector := Elector, member_name := MemberName}) ->
 %% ---- Name registration ----------------------------------------------------
 
 %% Leader: handle registration directly.
-handle_call({register, LogicalName, Pid}, _From,
-            State = #state{leader = Leader, member_id = Leader}) ->
+handle_call(
+    {register, LogicalName, Pid},
+    _From,
+    State = #state{leader = Leader, member_id = Leader}
+) ->
     #state{names = Names, members = Members, name_to_ref = NTR, ref_to_name = RTN} = State,
     case maps:is_key(LogicalName, Names) of
         true ->
@@ -122,13 +125,15 @@ handle_call({register, LogicalName, Pid}, _From,
                 ref_to_name = RTN#{Ref => LogicalName}
             }}
     end;
-
 %% Follower: forward to leader, then update local names map optimistically.
 %% The optimistic update ensures that a subsequent whereis_snapshot on this
 %% node returns the Pid immediately, without waiting for the replication cast
 %% from the leader (which may lose the race with the reply over the network).
-handle_call({register, LogicalName, Pid}, _From,
-            State = #state{leader = Leader}) when Leader =/= undefined ->
+handle_call(
+    {register, LogicalName, Pid},
+    _From,
+    State = #state{leader = Leader}
+) when Leader =/= undefined ->
     {Node, Name} = Leader,
     try gen_server:call({Name, Node}, {register, LogicalName, Pid}) of
         yes ->
@@ -139,19 +144,22 @@ handle_call({register, LogicalName, Pid}, _From,
         exit:_ ->
             {reply, no, State}
     end;
-
 %% No leader yet.
 handle_call({register, _LogicalName, _Pid}, _From, State) ->
     {reply, no, State};
-
 %% ---- Consistent read (leader only) ----------------------------------------
 
-handle_call({whereis, LogicalName}, _From,
-            State = #state{leader = Leader, member_id = Leader}) ->
+handle_call(
+    {whereis, LogicalName},
+    _From,
+    State = #state{leader = Leader, member_id = Leader}
+) ->
     {reply, maps:get(LogicalName, State#state.names, undefined), State};
-
-handle_call({whereis, LogicalName}, _From,
-            State = #state{leader = Leader}) when Leader =/= undefined ->
+handle_call(
+    {whereis, LogicalName},
+    _From,
+    State = #state{leader = Leader}
+) when Leader =/= undefined ->
     {Node, Name} = Leader,
     try
         Reply = gen_server:call({Name, Node}, {whereis, LogicalName}),
@@ -160,15 +168,12 @@ handle_call({whereis, LogicalName}, _From,
         exit:_ ->
             {reply, undefined, State}
     end;
-
 handle_call({whereis, _LogicalName}, _From, State) ->
     {reply, undefined, State};
-
 %% ---- Snapshot read (any member, served from local names map) ---------------
 
 handle_call({whereis_snapshot, LogicalName}, _From, State) ->
     {reply, maps:get(LogicalName, State#state.names, undefined), State};
-
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
 
@@ -180,15 +185,14 @@ handle_call(_Request, _From, State) ->
 
 handle_cast({members, MemberIds}, State) ->
     {noreply, add_member_monitors(MemberIds, State)};
-
 %% New member joined; as leader, send them the current names snapshot.
-handle_cast({new_member, NewMemberId}, State = #state{member_id = Self, leader = Self, names = Names}) ->
+handle_cast(
+    {new_member, NewMemberId}, State = #state{member_id = Self, leader = Self, names = Names}
+) ->
     cast_to_member(NewMemberId, {names_snapshot, maps:to_list(Names)}),
     {noreply, add_member_monitors([NewMemberId], State)};
-
 handle_cast({new_member, NewMemberId}, State) ->
     {noreply, add_member_monitors([NewMemberId], State)};
-
 %% ---- Leadership transitions ------------------------------------------------
 
 handle_cast({leader_changed, NewLeader}, State = #state{member_id = Self, leader = OldLeader}) ->
@@ -205,19 +209,15 @@ handle_cast({leader_changed, NewLeader}, State = #state{member_id = Self, leader
                 State#state{leader = NewLeader}
         end,
     {noreply, State1};
-
 %% ---- One-way replication from leader to followers -------------------------
 
 handle_cast({name_registered, LogicalName, Pid}, State = #state{names = Names}) ->
     {noreply, State#state{names = Names#{LogicalName => Pid}}};
-
 handle_cast({name_unregistered, LogicalName}, State = #state{names = Names}) ->
     {noreply, State#state{names = maps:remove(LogicalName, Names)}};
-
 %% Replace the local names map with the leader's current snapshot.
 handle_cast({names_snapshot, NamesList}, State) ->
     {noreply, State#state{names = maps:from_list(NamesList)}};
-
 %% ---- Unregister -----------------------------------------------------------
 
 %% Leader: handle directly.
@@ -230,19 +230,17 @@ handle_cast({unregister, LogicalName}, State = #state{leader = Leader, member_id
         name_to_ref = NTR1,
         ref_to_name = RTN1
     }};
-
 %% Follower: update local map immediately, then forward to leader.
 %% Immediate local update ensures whereis_snapshot returns undefined before
 %% the replication cast arrives from the leader.
-handle_cast({unregister, LogicalName}, State = #state{leader = Leader, names = Names})
-  when Leader =/= undefined ->
+handle_cast({unregister, LogicalName}, State = #state{leader = Leader, names = Names}) when
+    Leader =/= undefined
+->
     cast_to_member(Leader, {unregister, LogicalName}),
     {noreply, State#state{names = maps:remove(LogicalName, Names)}};
-
 %% No leader — drop.
 handle_cast({unregister, _LogicalName}, State) ->
     {noreply, State};
-
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
@@ -281,7 +279,6 @@ handle_info({'DOWN', Ref, process, _Pid, _Reason}, State) ->
             dgen_server:cast(Elector, {member_down, DeadMemberId}),
             {noreply, remove_member(DeadMemberId, State)}
     end;
-
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -309,16 +306,22 @@ assume_leadership(State = #state{names = Names, members = Members}) ->
         Names
     ),
     NamesList = maps:to_list(Names),
-    maps:foreach(fun(MemberId, _) ->
-        cast_to_member(MemberId, {names_snapshot, NamesList})
-    end, Members),
+    maps:foreach(
+        fun(MemberId, _) ->
+            cast_to_member(MemberId, {names_snapshot, NamesList})
+        end,
+        Members
+    ),
     State#state{name_to_ref = NTR, ref_to_name = RTN}.
 
 %% Demonitor all registered Pids; keep the names map for snapshot reads.
 relinquish_leadership(State = #state{name_to_ref = NTR}) ->
-    maps:foreach(fun(_LogicalName, Ref) ->
-        erlang:demonitor(Ref, [flush])
-    end, NTR),
+    maps:foreach(
+        fun(_LogicalName, Ref) ->
+            erlang:demonitor(Ref, [flush])
+        end,
+        NTR
+    ),
     State#state{name_to_ref = #{}, ref_to_name = #{}}.
 
 add_member_monitors(MemberIds, State) ->

@@ -83,7 +83,9 @@ handle_call_tx(_TxCtx, Request, From, State) ->
 -spec handle_cast_tx(dgen_server:tx_ctx(), term(), registry_state()) ->
     dgen_server:noreply_ret() | dgen_server:lock_ret().
 
-handle_cast_tx(TxCtx, {join, MemberId}, State = #{name := Name, members := Members, leader := OldLeader}) ->
+handle_cast_tx(
+    TxCtx, {join, MemberId}, State = #{name := Name, members := Members, leader := OldLeader}
+) ->
     MemberInfo = #{joined_at => erlang:system_time(millisecond)},
     NewMembers = Members#{MemberId => MemberInfo},
     NewLeader = elect_leader(TxCtx, Name, NewMembers),
@@ -107,8 +109,9 @@ handle_cast_tx(TxCtx, {join, MemberId}, State = #{name := Name, members := Membe
             ],
             {noreply, NewState, Actions}
     end;
-
-handle_cast_tx(TxCtx, {member_down, MemberId}, State = #{name := Name, members := Members, leader := OldLeader}) ->
+handle_cast_tx(
+    TxCtx, {member_down, MemberId}, State = #{name := Name, members := Members, leader := OldLeader}
+) ->
     case maps:is_key(MemberId, Members) of
         false ->
             %% Already removed — idempotent.
@@ -137,7 +140,6 @@ handle_cast_tx(TxCtx, {member_down, MemberId}, State = #{name := Name, members :
 
 handle_call(get_leader, _From, State) ->
     {reply, maps:get(leader, State, undefined), State};
-
 handle_call(get_members, _From, State) ->
     {reply, maps:keys(maps:get(members, State, #{})), State}.
 
@@ -170,7 +172,6 @@ handle_locked(cast, {join, MemberId}, State = #{members := Members, leader := Le
         ExistingIds
     ),
     {noreply, State};
-
 handle_locked(cast, {member_down, _MemberId}, State = #{members := Members, leader := Leader}) ->
     %% Surviving members already detected the death via their own DOWN signals.
     %% Only the new leader identity needs to be broadcast.

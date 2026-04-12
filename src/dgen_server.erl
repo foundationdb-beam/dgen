@@ -121,7 +121,20 @@ argument is the
 -type options() :: [option()].
 -type start_ret() :: gen_server:start_ret().
 
--export_type([server/0, option/0, options/0, tx_ctx/0]).
+-export_type([
+    server/0,
+    option/0,
+    options/0,
+    tx_ctx/0,
+    tuid/0,
+    from/0,
+    event_type/0,
+    lock_ret/0,
+    reply_ret/0,
+    noreply_ret/0,
+    init_ret/0,
+    stop_ret/0
+]).
 
 -define(DefaultTuid(Mod), {<<"dgen_server">>, atom_to_binary(Mod)}).
 -define(TxCallbackTimeout, 5000).
@@ -522,7 +535,6 @@ invoke_handle_locked_callback(EventType, Msg, ModState, State = #state{mod = Mod
         false ->
             {error, {function_not_exported, {Mod, handle_locked, 3}}}
     end.
-
 
 delete(Tenant, Tuid) ->
     dgen_backend:transactional(Tenant, fun(Td = {Tx, Dir}) ->
