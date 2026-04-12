@@ -193,8 +193,11 @@ handle_call({whereis_snapshot, LogicalName}, _From, State) ->
 %% processed first (FIFO) and included in the returned snapshot; any arriving
 %% after this call returns 'no' — leader is undefined until {apply_names_snapshot}
 %% arrives from the new leader.
-handle_call({transfer_snapshot, _NewLeader}, _From,
-            State = #state{member_id = Self, leader = Self}) ->
+handle_call(
+    {transfer_snapshot, _NewLeader},
+    _From,
+    State = #state{member_id = Self, leader = Self}
+) ->
     %% Set leader = undefined (not NewLeader) so this member stays silent on
     %% registrations until {apply_names_snapshot} arrives from the new leader.
     %% If we set leader = NewLeader here, any pending {register} call would be
@@ -217,17 +220,25 @@ handle_call({transfer_snapshot, _NewLeader}, _From,
 %% After updating own state the leader sends `{apply_names_snapshot}` casts
 %% to every follower from its own process (maintaining FIFO ordering with
 %% subsequent `{name_registered}` broadcasts).
-handle_call({elector_assume_and_distribute, Snapshot, MemberId, AllIds}, _From,
-            State = #state{member_id = Self, leader = OldLeader}) ->
+handle_call(
+    {elector_assume_and_distribute, Snapshot, MemberId, AllIds},
+    _From,
+    State = #state{member_id = Self, leader = OldLeader}
+) ->
     State1 = do_leader_changed(Self, OldLeader, Self, State),
-    State2 = case Snapshot of
-        self_snapshot -> State1;
-        NamesList -> State1#state{names = maps:from_list(NamesList)}
-    end,
+    State2 =
+        case Snapshot of
+            self_snapshot -> State1;
+            NamesList -> State1#state{names = maps:from_list(NamesList)}
+        end,
     State3 = add_member_monitors(extra_member_ids(MemberId, AllIds, Self), State2),
     Names = maps:to_list(State3#state.names),
     lists:foreach(
-        fun(Id) -> cast_to_member(Id, {apply_names_snapshot, Names, Self, extra_member_ids(MemberId, AllIds, Id)}) end,
+        fun(Id) ->
+            cast_to_member(
+                Id, {apply_names_snapshot, Names, Self, extra_member_ids(MemberId, AllIds, Id)}
+            )
+        end,
         lists:delete(Self, AllIds)
     ),
     {reply, ok, State3};
@@ -245,8 +256,10 @@ handle_cast({name_unregistered, LogicalName}, State = #state{names = Names}) ->
 %% Leadership transition snapshot sent by the new leader to all followers.
 %% Applies the leader transition, the names update, and extra member monitors
 %% atomically within a single cast — no other message can interleave.
-handle_cast({apply_names_snapshot, NamesList, NewLeader, ExtraMembers},
-            State = #state{member_id = Self, leader = OldLeader}) ->
+handle_cast(
+    {apply_names_snapshot, NamesList, NewLeader, ExtraMembers},
+    State = #state{member_id = Self, leader = OldLeader}
+) ->
     State1 = do_leader_changed(NewLeader, OldLeader, Self, State),
     State2 = State1#state{names = maps:from_list(NamesList)},
     {noreply, add_member_monitors(ExtraMembers, State2)};

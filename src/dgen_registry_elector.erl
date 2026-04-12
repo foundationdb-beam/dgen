@@ -110,7 +110,9 @@ handle_cast_tx(TxCtx, {join, MemberId}, State) ->
             %% come from the same sender (FIFO with subsequent name broadcasts).
             Actions = [
                 fun(#{members := All, leader := L}) ->
-                    call_to_member(L, {elector_assume_and_distribute, self_snapshot, MemberId, maps:keys(All)})
+                    call_to_member(
+                        L, {elector_assume_and_distribute, self_snapshot, MemberId, maps:keys(All)}
+                    )
                 end
             ],
             {noreply, NewState, Actions}
@@ -195,8 +197,12 @@ handle_locked(_DbCtx, cast, {member_down, _MemberId}, State) ->
     #{members := Members, leader := Leader} = State,
     AllIds = maps:keys(Members),
     case Leader of
-        undefined -> ok;
-        _ -> call_to_member(Leader, {elector_assume_and_distribute, self_snapshot, undefined, AllIds})
+        undefined ->
+            ok;
+        _ ->
+            call_to_member(
+                Leader, {elector_assume_and_distribute, self_snapshot, undefined, AllIds}
+            )
     end,
     {noreply, State}.
 
