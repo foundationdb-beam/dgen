@@ -1,58 +1,69 @@
 -module(dgen_registry_member).
 -behaviour(gen_server).
 
-%% ---------------------------------------------------------------------------
-%% Overview
-%%
-%% Each node participating in a named registry runs one member process.
-%% The member has two roles depending on whether it is the current leader.
-%%
-%% Storage
-%% -------
-%% Both leader and follower keep a `names :: #{LogicalName => pid()}` map in
-%% their gen_server state.  There is no ETS table and no durable storage for
-%% name→pid mappings.  Pids are node-local and process-lifetime-scoped; they
-%% have no meaning after a restart and must never be written to FDB.
-%%
-%% Consistent reads and writes go through the leader.
-%% Snapshot reads (`whereis_snapshot`) are served from the local member's map
-%% without contacting the leader.
-%%
-%% Follower role
-%% -------------
-%% Receives `{leader_changed, Leader}` from the elector when leadership is
-%% established or changes.  Keeps its local `names` map in sync by receiving
-%% `{name_registered, …}`, `{name_unregistered, …}`, and `{names_snapshot, …}`
-%% casts from the leader (one-way replication).
-%%
-%% Forwards `{register, …}` calls and `{unregister, …}` casts to the leader.
-%% For both, the follower also updates its own `names` map immediately so that
-%% a subsequent `whereis_snapshot` on this node reflects the change without
-%% waiting for the replication cast to arrive over the network.
-%%
-%% Leader role
-%% -----------
-%% Assumed when the elector broadcasts `{leader_changed, Self}`.  On assuming
-%% leadership the member uses its current in-memory `names` map (which already
-%% holds the replicated snapshot from when it was a follower), sets up
-%% `erlang:monitor/2` for every entry, and broadcasts a `{names_snapshot, …}`
-%% to all followers so their maps are consistent.  Any stale entries (Pids
-%% that died while this node was a follower) are removed when their DOWN
-%% signals arrive.
-%%
-%% The leader is the SOLE writer for the name table.  It:
-%%   - Handles `{register, LogicalName, Pid}` calls: checks the in-memory map,
-%%     updates it, monitors the Pid, and replicates `{name_registered, …}`.
-%%   - Handles `{whereis, LogicalName}` calls: consistent read from local map.
-%%   - Handles `{unregister, LogicalName}` casts: updates the map, demonitors,
-%%     and replicates `{name_unregistered, …}`.
-%%   - Monitors every registered Pid.  When one dies, removes from the map
-%%     and replicates `{name_unregistered, …}` to followers.
-%%
-%% On `{leader_changed, Other}` when currently leader, the member relinquishes
-%% leadership: demonitors all registered Pids and clears the leader-only
-%% state.  The `names` map is kept intact (it still serves snapshot reads).
-%% ---------------------------------------------------------------------------
+-define(DOCATTRS, ?OTP_RELEASE >= 27).
+
+-if(?DOCATTRS).
+-moduledoc """
+Local name cache and consistent read/write proxy for `dgen_registry`.
+
+Each node participating in a named registry runs one member process.
+The member has two roles depending on whether it is the current leader.
+
+## Storage
+
+Both leader and follower keep a `names :: #{LogicalName => pid()}` map in
+their gen_server state. There is no ETS table and no durable storage for
+name→pid mappings. Pids are node-local and process-lifetime-scoped; they
+have no meaning after a restart and must never be written to the backend.
+
+Consistent reads and writes go through the leader.
+Snapshot reads (`whereis_snapshot`) are served from the local member's map
+without contacting the leader.
+
+## Follower role
+
+Receives `{leader_changed, Leader}` from the elector when leadership is
+established or changes. Keeps its local `names` map in sync by receiving
+`{name_registered, …}`, `{name_unregistered, …}`, and `{names_snapshot, …}`
+casts from the leader (one-way replication).
+
+Forwards `{register, …}` calls and `{unregister, …}` casts to the leader.
+For both, the follower also updates its own `names` map immediately so that
+a subsequent `whereis_snapshot` on this node reflects the change without
+waiting for the replication cast to arrive over the network.
+(@todo - isn't this^ a bug? If the register is denied by the leader, the follower's
+local map will be wrong)
+
+## Leader role
+
+Assumed when the elector broadcasts `{leader_changed, Self}`. On assuming
+leadership the member uses its current in-memory `names` map (which already
+holds the replicated snapshot from when it was a follower), sets up
+`erlang:monitor/2` for every entry, and broadcasts a `{names_snapshot, …}`
+to all followers so their maps are consistent. Any stale entries (Pids
+that died while this node was a follower) are removed when their DOWN
+signals arrive.
+(@todo - I believe the snapshot must be fully mediated by the elector's lock period.
+Having the snapshot be asynchronously cast could overlap with another leadership
+change. The elector must be changed to pull the snapshot and then push it to all members with
+blocking confirmation)
+
+The leader is the sole writer for the name table. It:
+
+- Handles `{register, LogicalName, Pid}` calls: checks the in-memory map,
+  updates it, monitors the Pid, and replicates `{name_registered, …}`.
+- Handles `{whereis, LogicalName}` calls: consistent read from local map.
+- Handles `{unregister, LogicalName}` casts: updates the map, demonitors,
+  and replicates `{name_unregistered, …}`.
+- Monitors every registered Pid. When one dies, removes from the map
+  and replicates `{name_unregistered, …}` to followers.
+
+On `{leader_changed, Other}` when currently leader, the member relinquishes
+leadership: demonitors all registered Pids and clears the leader-only
+state. The `names` map is kept intact (it still serves snapshot reads).
+""".
+-endif.
 
 -export([start_link/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
@@ -76,6 +87,9 @@
 %% Public API
 %% ---------------------------------------------------------------------------
 
+-if(?DOCATTRS).
+-doc "Starts the member process registered as `Name`.".
+-endif.
 -spec start_link(Name :: atom(), Args :: map()) -> gen_server:start_ret().
 start_link(Name, Args) ->
     gen_server:start_link({local, Name}, ?MODULE, Args, []).
@@ -202,7 +216,7 @@ handle_cast({leader_changed, NewLeader}, State = #state{member_id = Self, leader
                 %% Lost leadership — demonitor registered Pids, keep names for snapshot reads.
                 relinquish_leadership(State#state{leader = NewLeader});
             OldLeader =/= Self, NewLeader =:= Self ->
-                %% Gained leadership — read authoritative snapshot from FDB, seed followers.
+                %% Gained leadership — assume leadership and seed followers with current names snapshot.
                 assume_leadership(State#state{leader = NewLeader});
             true ->
                 %% No role change.

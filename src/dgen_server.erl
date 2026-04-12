@@ -76,7 +76,7 @@ argument is the
 -type stop_ret() :: {stop, term(), state()} | {stop, term(), state(), [action()]}.
 
 %% Passed as the first argument to `_tx` callback variants.
-%% `td` is the current FDB transaction+directory pair; `tuid` is the server's
+%% `td` is the current backend transaction+directory pair; `tuid` is the server's
 %% tenant-unique identifier.  Both may be used to read or write arbitrary keys
 %% within the same atomic transaction as the callback.
 -type tx_ctx() :: #{td := dgen_backend:tenant(), tuid := tuid()}.

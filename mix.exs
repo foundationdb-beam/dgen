@@ -44,7 +44,8 @@ defmodule Dgen.MixProject do
       extras: [
         "README.md",
         "CHANGELOG.md",
-        "DESIGN.md"
+        "docs/dgen_server_design.md",
+        "docs/dgen_registry_design.md"
       ]
     ]
   end
