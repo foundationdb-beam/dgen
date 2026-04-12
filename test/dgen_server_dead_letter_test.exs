@@ -1,4 +1,4 @@
-defmodule DGenServer.DeadLetterTest do
+defmodule DGen.Server.DeadLetterTest do
   use DGen.Case, async: true
   import ExUnit.CaptureLog
 
@@ -30,7 +30,7 @@ defmodule DGenServer.DeadLetterTest do
       # Attempt 1: consumer processes the message (N=0 < 2), crashes, N→1 in queue
       capture_log(fn ->
         {:ok, pid} = start(tenant, tuid, threshold)
-        DGenServer.cast(pid, :crash_me)
+        DGen.Server.cast(pid, :crash_me)
         wait_for_down(pid)
       end)
 
@@ -53,7 +53,7 @@ defmodule DGenServer.DeadLetterTest do
       assert Process.alive?(pid)
       assert 0 = :dgen_queue.length(tenant, :dgen_server.get_quid(tuid))
 
-      DGenServer.kill(pid, :normal)
+      DGen.Server.kill(pid, :normal)
     end
 
     test "subsequent messages are processed normally after a dead-letter", context do
@@ -66,19 +66,19 @@ defmodule DGenServer.DeadLetterTest do
       # One crash → attempt 1 with N=0 < 1, then N=1 in queue
       capture_log(fn ->
         {:ok, pid} = start(tenant, tuid, threshold)
-        DGenServer.cast(pid, :crash_me)
+        DGen.Server.cast(pid, :crash_me)
         wait_for_down(pid)
       end)
 
       # Next consumer: N=1 >= threshold=1 → dead-letter, then processes next messages
       {:ok, pid} = start(tenant, tuid, threshold)
-      DGenServer.cast(pid, {:incr, 5})
+      DGen.Server.cast(pid, {:incr, 5})
 
       # Use a queued call so it is processed after the preceding cast
       assert 5 = DCrasher.call_get(pid)
       assert 0 = :dgen_queue.length(tenant, :dgen_server.get_quid(tuid))
 
-      DGenServer.kill(pid, :normal)
+      DGen.Server.kill(pid, :normal)
     end
   end
 
@@ -92,7 +92,7 @@ defmodule DGenServer.DeadLetterTest do
 
       # Non-consuming push server: the call goes straight to the durable queue.
       {:ok, push_pid} =
-        DGenServer.start_link(DCrasher, [tuid],
+        DGen.Server.start_link(DCrasher, [tuid],
           tenant: tenant,
           consume: false,
           dead_letter_threshold: threshold
@@ -101,7 +101,7 @@ defmodule DGenServer.DeadLetterTest do
       caller =
         Task.async(fn ->
           try do
-            DGenServer.call(push_pid, :crash_me, 30_000)
+            DGen.Server.call(push_pid, :crash_me, 30_000)
           catch
             :error, {:dead_letter, n} -> {:dead_letter, n}
           end
@@ -122,8 +122,8 @@ defmodule DGenServer.DeadLetterTest do
       assert {:dead_letter, ^threshold} = Task.await(caller, 10_000)
       assert Process.alive?(pid_final)
 
-      DGenServer.kill(pid_final, :normal)
-      DGenServer.kill(push_pid, :normal)
+      DGen.Server.kill(pid_final, :normal)
+      DGen.Server.kill(push_pid, :normal)
     end
   end
 
@@ -140,7 +140,7 @@ defmodule DGenServer.DeadLetterTest do
           {:ok, pid} = DCrasher.start_link(tenant, tuid)
 
           if :dgen_queue.length(tenant, :dgen_server.get_quid(tuid)) == 0 do
-            DGenServer.cast(pid, :crash_me)
+            DGen.Server.cast(pid, :crash_me)
           end
 
           wait_for_down(pid)

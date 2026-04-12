@@ -98,7 +98,9 @@ argument is the
 -callback handle_info(Info :: term(), State :: state()) -> noreply_ret() | stop_ret().
 -callback handle_info_tx(TxCtx :: tx_ctx(), Info :: term(), State :: state()) ->
     noreply_ret() | stop_ret().
--callback handle_locked(DbCtx :: db_ctx(), EventType :: event_type(), Msg :: term(), State :: state()) ->
+-callback handle_locked(
+    DbCtx :: db_ctx(), EventType :: event_type(), Msg :: term(), State :: state()
+) ->
     reply_ret() | noreply_ret() | stop_ret().
 
 -callback handle_dead_letter(Msg :: term(), AttemptCount :: non_neg_integer()) -> any().
@@ -534,7 +536,9 @@ dispatch_callback(Td, Mod, Fn, Args, State) ->
 tx_callback_name(Callback) ->
     list_to_atom(atom_to_list(Callback) ++ "_tx").
 
-invoke_handle_locked_callback(EventType, Msg, ModState, State = #state{mod = Mod, tenant = Tenant, tuid = Tuid}) ->
+invoke_handle_locked_callback(
+    EventType, Msg, ModState, State = #state{mod = Mod, tenant = Tenant, tuid = Tuid}
+) ->
     case erlang:function_exported(Mod, handle_locked, 4) of
         true ->
             DbCtx = #{db => Tenant, tuid => Tuid},

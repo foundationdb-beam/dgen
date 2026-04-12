@@ -24,6 +24,10 @@
 
 ### Breaking changes
 
+- **`DGenServer` renamed to `DGen.Server`** — `use DGenServer` becomes `use DGen.Server`;
+  all `DGenServer.*` call sites become `DGen.Server.*`. The module now lives at
+  `lib/dgen/server.ex`.
+
 - **`handle_locked/3` → `handle_locked/4`** — a `db_ctx()` map is now prepended as
   the first argument, matching the convention of `handle_call_tx/4` and friends.
   `db_ctx()` carries `#{db := tenant(), tuid := tuid()}` where `db` is the DB-level

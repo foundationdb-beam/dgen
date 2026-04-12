@@ -1,11 +1,11 @@
-defmodule DGenServer.ActionsTest do
+defmodule DGen.Server.ActionsTest do
   use DGen.Case, async: true
 
   alias DGen.ActionEcho
 
   defp kill(pid) do
     mref = Process.monitor(pid)
-    DGenServer.kill(pid, :normal)
+    DGen.Server.kill(pid, :normal)
 
     receive do
       {:DOWN, ^mref, :process, ^pid, :normal} -> :ok

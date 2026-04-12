@@ -1,20 +1,20 @@
 defmodule DGen.ActionEcho do
-  use DGenServer
+  use DGen.Server
 
   def start_link(tenant, tuid),
-    do: DGenServer.start_link(__MODULE__, [tuid], tenant: tenant)
+    do: DGen.Server.start_link(__MODULE__, [tuid], tenant: tenant)
 
   def get_then_take_action(pid, notify_pid),
-    do: DGenServer.call(pid, {:get_then_take_action, notify_pid})
+    do: DGen.Server.call(pid, {:get_then_take_action, notify_pid})
 
   def incr_then_take_action(pid, notify_pid, n \\ 1),
-    do: DGenServer.cast(pid, {:incr_then_take_action, notify_pid, n})
+    do: DGen.Server.cast(pid, {:incr_then_take_action, notify_pid, n})
 
   def priority_get_then_take_action(pid, notify_pid),
-    do: DGenServer.priority_call(pid, {:get_then_take_action, notify_pid})
+    do: DGen.Server.priority_call(pid, {:get_then_take_action, notify_pid})
 
   def priority_incr_then_take_action(pid, notify_pid, n \\ 1),
-    do: DGenServer.priority_cast(pid, {:incr_then_take_action, notify_pid, n})
+    do: DGen.Server.priority_cast(pid, {:incr_then_take_action, notify_pid, n})
 
   @impl true
   def init([tuid]), do: {:ok, tuid, 0}

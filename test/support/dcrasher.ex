@@ -4,16 +4,16 @@ defmodule DGen.DCrasher do
 
   Used to exercise the dead-letter queue logic in dgen_server.
   """
-  use DGenServer
+  use DGen.Server
 
   def start_link(tenant, tuid, opts \\ []),
-    do: DGenServer.start_link(__MODULE__, [tuid], [{:tenant, tenant} | opts])
+    do: DGen.Server.start_link(__MODULE__, [tuid], [{:tenant, tenant} | opts])
 
   # Priority call — bypasses queue, safe for "is the consumer alive?" checks
-  def get(pid), do: DGenServer.priority_call(pid, :get)
+  def get(pid), do: DGen.Server.priority_call(pid, :get)
 
   # Queued call — waits for all previously enqueued casts to be processed first
-  def call_get(pid), do: DGenServer.call(pid, :get, 5_000)
+  def call_get(pid), do: DGen.Server.call(pid, :get, 5_000)
 
   @impl true
   def init([tuid]), do: {:ok, tuid, 0}

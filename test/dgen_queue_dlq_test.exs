@@ -27,7 +27,7 @@ defmodule DGen.QueueDLQTest do
     # N=0 < @threshold → callback runs → throw → crash → N=1 written to queue
     capture_log(fn ->
       {:ok, pid} = DCrasher.start_link(tenant, tuid, dead_letter_threshold: @threshold)
-      DGenServer.cast(pid, :crash_me)
+      DGen.Server.cast(pid, :crash_me)
       wait_for_down(pid)
     end)
 
@@ -35,7 +35,7 @@ defmodule DGen.QueueDLQTest do
     {:ok, pid} = DCrasher.start_link(tenant, tuid, dead_letter_threshold: @threshold)
     # Priority call returns once the consumer is idle (dead-letter has been committed)
     DCrasher.get(pid)
-    # Stop without deleting FDB state (DGenServer.kill would wipe the queue/DLQ)
+    # Stop without deleting FDB state (DGen.Server.kill would wipe the queue/DLQ)
     GenServer.stop(pid)
 
     quid

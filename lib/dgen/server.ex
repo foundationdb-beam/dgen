@@ -1,4 +1,4 @@
-defmodule DGenServer do
+defmodule DGen.Server do
   @callback init(args :: term) ::
               {:ok, state :: term()}
               | {:ok, tuid :: tuple(), state :: term()}
@@ -7,22 +7,37 @@ defmodule DGenServer do
   @callback handle_cast(msg :: term, state :: term) ::
               {:noreply, new_state :: term}
 
+  @callback handle_cast_tx(tx_ctx :: map, msg :: term, state :: term) ::
+              {:noreply, new_state :: term}
+
   @callback handle_call(request :: term, from :: term, state :: term) ::
+              {:reply, reply :: term, new_state :: term} | {:noreply, new_state :: term}
+
+  @callback handle_call_tx(tx_ctx :: map, request :: term, from :: term, state :: term) ::
               {:reply, reply :: term, new_state :: term} | {:noreply, new_state :: term}
 
   @callback handle_info(info :: term, state :: term) ::
               {:noreply, new_state :: term}
 
-  @callback handle_locked(db_ctx :: term, event_type :: term, msg :: term, state :: term) ::
+  @callback handle_info_tx(tx_ctx :: map, info :: term, state :: term) ::
+              {:noreply, new_state :: term}
+
+  @callback handle_locked(db_ctx :: map, event_type :: term, msg :: term, state :: term) ::
               {:reply, reply :: term, new_state :: term}
               | {:noreply, new_state :: term}
 
-  @optional_callbacks handle_cast: 2, handle_call: 3, handle_info: 2, handle_locked: 4
+  @optional_callbacks handle_cast: 2,
+                      handle_cast_tx: 3,
+                      handle_call: 3,
+                      handle_call_tx: 4,
+                      handle_info: 2,
+                      handle_info_tx: 3,
+                      handle_locked: 4
 
   @doc false
   defmacro __using__(opts) do
     quote location: :keep, bind_quoted: [opts: opts] do
-      @behaviour DGenServer
+      @behaviour DGen.Server
 
       if not Module.has_attribute?(__MODULE__, :doc) do
         @doc """

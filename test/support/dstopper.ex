@@ -4,30 +4,30 @@ defmodule DGen.DStopper do
 
   Used to verify bug #2 (handle_info stop) and bug #3 (queued call stop).
   """
-  use DGenServer
+  use DGen.Server
 
   def start_link(tenant, tuid),
-    do: DGenServer.start_link(__MODULE__, [tuid], tenant: tenant)
+    do: DGen.Server.start_link(__MODULE__, [tuid], tenant: tenant)
 
   def start_link_opts(tenant, tuid, opts),
-    do: DGenServer.start_link(__MODULE__, [tuid], [{:tenant, tenant} | opts])
+    do: DGen.Server.start_link(__MODULE__, [tuid], [{:tenant, tenant} | opts])
 
   def stop_via_call(pid),
-    do: DGenServer.call(pid, :stop_me, 10_000)
+    do: DGen.Server.call(pid, :stop_me, 10_000)
 
   def stop_via_cast(pid),
-    do: DGenServer.cast(pid, :stop_me)
+    do: DGen.Server.cast(pid, :stop_me)
 
   def stop_with_action_via_call(pid, notify_pid),
-    do: DGenServer.call(pid, {:stop_me_with_action, notify_pid}, 10_000)
+    do: DGen.Server.call(pid, {:stop_me_with_action, notify_pid}, 10_000)
 
   def stop_with_action_via_cast(pid, notify_pid),
-    do: DGenServer.cast(pid, {:stop_me_with_action, notify_pid})
+    do: DGen.Server.cast(pid, {:stop_me_with_action, notify_pid})
 
   def stop_with_action_via_info(pid, notify_pid),
     do: send(pid, {:stop_me_with_action, notify_pid})
 
-  def get(pid), do: DGenServer.priority_call(pid, :get)
+  def get(pid), do: DGen.Server.priority_call(pid, :get)
 
   @impl true
   def init([tuid]), do: {:ok, tuid, 0}

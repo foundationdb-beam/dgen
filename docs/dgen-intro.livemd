@@ -82,24 +82,24 @@ Chat.history(pid)
 
 ## Durable GenServer
 
-The same chat server, but using `DGenServer` for automatic persistence.
+The same chat server, but using `DGen.Server` for automatic persistence.
 
 ```elixir
 defmodule DChat do
-  use DGenServer
+  use DGen.Server
 
   defstruct idx: 0, messages: []
 
-  def start(tenant), do: DGenServer.start(__MODULE__, [], [tenant: tenant])
+  def start(tenant), do: DGen.Server.start(__MODULE__, [], [tenant: tenant])
 
   def restart(pid, tenant) do
     GenServer.stop(pid)
     start(tenant)
   end
 
-  def new_message(pid, name, text), do: DGenServer.call(pid, {:new_message, name, text})
+  def new_message(pid, name, text), do: DGen.Server.call(pid, {:new_message, name, text})
 
-  def history(pid), do: DGenServer.call(pid, :history)
+  def history(pid), do: DGen.Server.call(pid, :history)
 
   @impl true
   def init([]) do
@@ -148,7 +148,7 @@ Restart the durable server.
 {:ok, pid} = DChat.restart(pid, tenant)
 ```
 
-**The history persists** — DGenServer automatically saves and restores state.
+**The history persists** — DGen.Server automatically saves and restores state.
 
 ```elixir
 DChat.history(pid)

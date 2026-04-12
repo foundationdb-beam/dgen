@@ -1,4 +1,4 @@
-defmodule DGenServer.InlineThrowTest do
+defmodule DGen.Server.InlineThrowTest do
   use DGen.Case, async: true
   import ExUnit.CaptureLog
 
@@ -23,7 +23,7 @@ defmodule DGenServer.InlineThrowTest do
       # No consumer is running, so the caller times out.
       capture_log(fn ->
         try do
-          DGenServer.call(pid, :throw_me, 200)
+          DGen.Server.call(pid, :throw_me, 200)
         catch
           :error, :timeout -> :ok
         end

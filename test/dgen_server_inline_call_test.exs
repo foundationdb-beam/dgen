@@ -1,4 +1,4 @@
-defmodule DGenServer.InlineCallTest do
+defmodule DGen.Server.InlineCallTest do
   use DGen.Case, async: true
 
   alias DGen.DCounter
@@ -6,7 +6,7 @@ defmodule DGenServer.InlineCallTest do
 
   defp kill(pid) do
     mref = Process.monitor(pid)
-    DGenServer.kill(pid, :normal)
+    DGen.Server.kill(pid, :normal)
 
     receive do
       {:DOWN, ^mref, :process, ^pid, :normal} -> :ok
