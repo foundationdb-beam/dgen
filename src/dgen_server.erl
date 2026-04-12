@@ -162,7 +162,8 @@ argument is the
         undefined
         | {dgen_backend:versionstamp() | dgen_backend:future(), {ok, term()} | {error, not_found}},
     cache_misses = 0 :: non_neg_integer(),
-    dead_letter_threshold = infinity :: pos_integer() | infinity
+    dead_letter_threshold = infinity :: pos_integer() | infinity,
+    consume_k = 1 :: pos_integer()
 }).
 
 -type internalstate() :: #state{}.
@@ -176,8 +177,8 @@ See `start_link/3` for details on `Mod`, `Arg`, and `Opts`.
 -endif.
 -spec start(module(), term(), options()) -> start_ret().
 start(Mod, Arg, Opts) ->
-    {Tenant, Consume, Reset, Cache, DLT} = parse_opts(Opts),
-    gen_server:start(?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT}, Opts).
+    {Tenant, Consume, Reset, Cache, DLT, ConsumeK} = parse_opts(Opts),
+    gen_server:start(?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT, ConsumeK}, Opts).
 
 -if(?DOCATTRS).
 -doc """
@@ -188,8 +189,8 @@ See `start_link/3` for details on `Mod`, `Arg`, and `Opts`.
 -endif.
 -spec start(gen_server:server_name(), module(), term(), options()) -> start_ret().
 start(Reg, Mod, Arg, Opts) ->
-    {Tenant, Consume, Reset, Cache, DLT} = parse_opts(Opts),
-    gen_server:start(Reg, ?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT}, Opts).
+    {Tenant, Consume, Reset, Cache, DLT, ConsumeK} = parse_opts(Opts),
+    gen_server:start(Reg, ?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT, ConsumeK}, Opts).
 
 -if(?DOCATTRS).
 -doc """
@@ -203,8 +204,8 @@ Starts a dgen_server process linked to the calling process.
 -endif.
 -spec start_link(module(), term(), options()) -> start_ret().
 start_link(Mod, Arg, Opts) ->
-    {Tenant, Consume, Reset, Cache, DLT} = parse_opts(Opts),
-    gen_server:start_link(?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT}, Opts).
+    {Tenant, Consume, Reset, Cache, DLT, ConsumeK} = parse_opts(Opts),
+    gen_server:start_link(?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT, ConsumeK}, Opts).
 
 -if(?DOCATTRS).
 -doc """
@@ -215,8 +216,8 @@ See `start_link/3` for details on `Mod`, `Arg`, and `Opts`.
 -endif.
 -spec start_link(gen_server:server_name(), module(), term(), options()) -> start_ret().
 start_link(Reg, Mod, Arg, Opts) ->
-    {Tenant, Consume, Reset, Cache, DLT} = parse_opts(Opts),
-    gen_server:start_link(Reg, ?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT}, Opts).
+    {Tenant, Consume, Reset, Cache, DLT, ConsumeK} = parse_opts(Opts),
+    gen_server:start_link(Reg, ?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT, ConsumeK}, Opts).
 
 -if(?DOCATTRS).
 -doc "Sends an asynchronous cast request to the dgen_server's durable queue.".
@@ -345,10 +346,11 @@ parse_opts(Opts) ->
     Reset = proplists:get_value(reset, Opts, false),
     Cache = proplists:get_value(cache, Opts, true),
     DeadLetterThreshold = proplists:get_value(dead_letter_threshold, Opts, infinity),
-    {Tenant, Consume, Reset, Cache, DeadLetterThreshold}.
+    ConsumeK = proplists:get_value(consume_k, Opts, 1),
+    {Tenant, Consume, Reset, Cache, DeadLetterThreshold, ConsumeK}.
 
 -spec init(term()) -> {ok, internalstate()} | {error, term()}.
-init({Tenant, Mod, Arg, Consume, Reset, Cache, DeadLetterThreshold}) ->
+init({Tenant, Mod, Arg, Consume, Reset, Cache, DeadLetterThreshold, ConsumeK}) ->
     case init_tuid(Mod, Arg) of
         {ok, Tuid, InitialState} ->
             State = #state{
@@ -356,7 +358,8 @@ init({Tenant, Mod, Arg, Consume, Reset, Cache, DeadLetterThreshold}) ->
                 mod = Mod,
                 tuid = Tuid,
                 cache = Cache,
-                dead_letter_threshold = DeadLetterThreshold
+                dead_letter_threshold = DeadLetterThreshold,
+                consume_k = ConsumeK
             },
             {_, State1} = init_mod_state(Tenant, InitialState, Reset, State),
             [gen_server:cast(self(), consume) || Consume],
@@ -442,9 +445,7 @@ finalize_inline_call(Result, GsFrom, Tenant) ->
 
 -spec handle_cast(term(), internalstate()) ->
     {noreply, internalstate()} | {stop, term(), internalstate()}.
-handle_cast(consume, State = #state{tenant = Tenant, tuid = Tuid}) ->
-    % 1 at a time because we are limited to 5 seconds per transaction
-    K = 1,
+handle_cast(consume, State = #state{tenant = Tenant, tuid = Tuid, consume_k = K}) ->
     Ret = handle_consume(Tenant, K, Tuid, State),
     case Ret of
         {noreply, #state{watch = undefined, cache_misses = Misses}} when Misses > 0 ->
@@ -676,18 +677,29 @@ get_state_key(Tuple) ->
 
 handle_consume(Tenant, K, Tuid, State = #state{dead_letter_threshold = Threshold}) ->
     Quid = get_quid(Tuid),
-    Result = dgen_backend:transactional(Tenant, fun(Td) ->
-        case is_locked(Td, State) of
-            true ->
-                Watch = dgen_queue:watch_push(Td, Quid),
-                {{noreply, []}, undefined, State#state{watch = Watch}};
-            false ->
-                consume_queued(Td, K, Quid, Threshold, State)
+    Result = dgen_backend:transactional(Tenant, fun(Td = {Tx, _}) ->
+        try
+            case is_locked(Td, State) of
+                true ->
+                    Watch = dgen_queue:watch_push(Td, Quid),
+                    {{noreply, []}, undefined, State#state{watch = Watch}};
+                false ->
+                    consume_queued(Td, K, Quid, Threshold, State)
+            end
+        catch
+            error:{erlfdb_error, _} = E ->
+                io:format("handle_consume CAUGHT before commit: ~p~n  tx_ops=~p~n",
+                          [E, erlfdb:get_committed_version(Tx)]),
+                erlang:error(E)
         end
     end),
     case Result of
         {reraise, Class, Reason, Stack} ->
             erlang:raise(Class, Reason, Stack);
+        {lock_batch, PriorActions, EventType, Msg, ModState, State2} ->
+            State3 = resolve_version(State2),
+            _ = handle_actions(PriorActions, [], ModState),
+            consume_locked(EventType, Msg, ModState, false, State3);
         {{lock, EventType, Msg}, ModState, State2} ->
             State3 = resolve_version(State2),
             consume_locked(EventType, Msg, ModState, false, State3);
@@ -701,24 +713,50 @@ consume_queued(Td, K, Quid, Threshold, State) ->
             Watch = dgen_queue:watch_push(Td, Quid),
             {{noreply, []}, undefined, State#state{watch = Watch}};
         {ok, KVs} ->
-            [{RawKey, RawBin}] = KVs,
-            Envelope = normalize_message(binary_to_term(RawBin)),
-            N = envelope_attempts(Envelope),
-            State1 = State#state{watch = undefined},
-            case is_dead_letter(N, Threshold) of
-                true ->
-                    dgen_queue:consume_peeked(Td, KVs, Quid),
-                    handle_dead_letter_internal(Td, to_dl_envelope(Envelope), N, State1);
-                false ->
-                    try
-                        R = invoke_queued_msg(Td, Envelope, State1),
-                        dgen_queue:consume_peeked(Td, KVs, Quid),
-                        R
-                    catch
-                        Class:Reason:Stack ->
-                            dgen_queue:update_peeked(Td, RawKey, increment_envelope(Envelope)),
-                            {reraise, Class, Reason, Stack}
-                    end
+            consume_batch(Td, KVs, Quid, Threshold, State#state{watch = undefined}, [], [], undefined)
+    end.
+
+%% Processes peeked KVs one at a time, accumulating actions, consumed KVs, and the
+%% latest ModState. A single consume_peeked call is issued per exit path for one clear_range.
+consume_batch(Td, [], Quid, _Threshold, State, AccActions, AccKVs, LatestModState) ->
+    dgen_queue:consume_peeked(Td, lists:reverse(AccKVs), Quid),
+    FinalActions = lists:append(lists:reverse(AccActions)),
+    {{noreply, FinalActions}, LatestModState, State#state{cache_misses = 0}};
+consume_batch(Td, [{RawKey, RawBin} | Rest], Quid, Threshold, State, AccActions, AccKVs, _LatestModState) ->
+    Envelope = normalize_message(binary_to_term(RawBin)),
+    N = envelope_attempts(Envelope),
+    case is_dead_letter(N, Threshold) of
+        true ->
+            AllKVs = lists:reverse([{RawKey, RawBin} | AccKVs]),
+            dgen_queue:consume_peeked(Td, AllKVs, Quid),
+            handle_dead_letter_internal(Td, to_dl_envelope(Envelope), N, State);
+        false ->
+            try invoke_queued_msg(Td, Envelope, State) of
+                {{noreply, Actions}, NewModState, State1} ->
+                    consume_batch(Td, Rest, Quid, Threshold, State1,
+                                  [Actions | AccActions], [{RawKey, RawBin} | AccKVs], NewModState);
+                {{lock, EventType, Msg}, ModState, State1} ->
+                    AllKVs = lists:reverse([{RawKey, RawBin} | AccKVs]),
+                    dgen_queue:consume_peeked(Td, AllKVs, Quid),
+                    PriorActions = lists:append(lists:reverse(AccActions)),
+                    State2 = State1#state{cache_misses = 0},
+                    case PriorActions of
+                        [] -> {{lock, EventType, Msg}, ModState, State2};
+                        _ -> {lock_batch, PriorActions, EventType, Msg, ModState, State2}
+                    end;
+                {{stop, Reason, Actions}, ModState, State1} ->
+                    AllKVs = lists:reverse([{RawKey, RawBin} | AccKVs]),
+                    dgen_queue:consume_peeked(Td, AllKVs, Quid),
+                    All = lists:append(lists:reverse([Actions | AccActions])),
+                    {{stop, Reason, All}, ModState, State1#state{cache_misses = 0}}
+            catch
+                Class:Reason:Stack ->
+                    case AccKVs of
+                        [] -> ok;
+                        _ -> dgen_queue:consume_peeked(Td, lists:reverse(AccKVs), Quid)
+                    end,
+                    dgen_queue:update_peeked(Td, RawKey, increment_envelope(Envelope)),
+                    {reraise, Class, Reason, Stack}
             end
     end.
 
@@ -892,7 +930,9 @@ set_lock({Tx, Dir}, State = #state{tuid = Tuid}) ->
 clear_lock(Td = {Tx, Dir}, #state{tuid = Tuid}) ->
     B = dgen_config:backend(),
     LockKey = B:dir_pack(Dir, get_lock_key(Tuid)),
-    B:clear_range(Tx, LockKey, B:key_strinc(LockKey)),
+    LockEnd = B:key_strinc(LockKey),
+    io:format("clear_lock: LockKey=~p EndKey=~p~n", [LockKey, LockEnd]),
+    B:clear_range(Tx, LockKey, LockEnd),
     dgen_queue:notify(Td, get_quid(Tuid)).
 
 get_lock_key(Tuid) ->

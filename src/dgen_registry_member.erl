@@ -29,6 +29,16 @@ leader (one-way replication).  All follower messages come from the leader
 process, so Erlang's per-pair FIFO guarantee ensures followers always see a
 snapshot before any `{name_registered}` broadcast that post-dates it.
 
+## Partition recovery
+
+The member subscribes to `nodeup`/`nodedown` events via
+`net_kernel:monitor_nodes/1`.  On `{nodeup, Node}`, the member re-announces
+itself to the elector (`{join, Self}`).  This handles the case where an
+Erlang-level network partition caused both sides to remove each other from
+the member set via `{member_down}` while the DB remained healthy: once the
+partition heals and distribution reconnects, both sides re-join and the
+elector reconstitutes the cluster without requiring a restart.
+
 Forwards `{register, …}` calls and `{unregister, …}` casts to the leader.
 For `register`, the follower also updates its own `names` map on receiving
 `yes` from the leader, so a subsequent `whereis_snapshot` on this node
@@ -96,6 +106,7 @@ start_link(Name, Args) ->
 
 init(#{elector := Elector, member_name := MemberName}) ->
     MemberId = {node(), MemberName},
+    net_kernel:monitor_nodes(true),
     %% Announce presence; the elector will call {elector_assume_and_distribute}
     %% on the new leader, which then sends {apply_names_snapshot} to this member.
     dgen_server:cast(Elector, {join, MemberId}),
@@ -319,10 +330,17 @@ handle_info({'DOWN', Ref, process, _Pid, _Reason}, State) ->
             dgen_server:cast(Elector, {member_down, DeadMemberId}),
             {noreply, remove_member(DeadMemberId, State)}
     end;
+handle_info({nodeup, _Node}, State = #state{elector = Elector, member_id = Self}) ->
+    %% Re-announce to the elector — this member may have been removed from the
+    %% member set while the node was unreachable (partition).  The elector handles
+    %% duplicate joins idempotently; this is a no-op if already a current member.
+    dgen_server:cast(Elector, {join, Self}),
+    {noreply, State};
 handle_info(_Info, State) ->
     {noreply, State}.
 
 terminate(_Reason, _State) ->
+    net_kernel:monitor_nodes(false),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->

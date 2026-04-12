@@ -326,6 +326,82 @@ defmodule DGen.RegistryClusterTest do
   end
 
   # ---------------------------------------------------------------------------
+  # Partition recovery
+  # ---------------------------------------------------------------------------
+
+  describe "partition recovery via nodeup" do
+    test "cluster reconstitutes after Erlang distribution disconnects and reconnects", %{
+      reg: reg,
+      peer_node: peer_node
+    } do
+      # Capture before disconnect — erpc won't work across the partition.
+      peer_member = :erpc.call(peer_node, :dgen_registry, :member_name, [reg])
+
+      # Sever Erlang distribution between primary and peer.  Both erlang:monitor/2
+      # references fire DOWN with :noconnection; each member submits {member_down,
+      # other} to the elector via FDB, which remains accessible to both nodes.
+      :net_kernel.disconnect(peer_node)
+
+      # The primary must detect the peer's departure and remove it from the
+      # elector's member set.
+      assert eventually(
+               fn ->
+                 not Enum.any?(:dgen_registry.get_members(reg), fn {n, _} -> n == peer_node end)
+               end,
+               5_000
+             ),
+             "primary did not remove peer from member set after disconnect"
+
+      # Reconnect.  Both members receive {nodeup, _} and re-cast {join, Self}
+      # to the elector, which reconstitutes the full member set and re-elects
+      # a leader.
+      Node.connect(peer_node)
+
+      # Primary: both members and a leader must reappear.
+      assert eventually(
+               fn ->
+                 members = :dgen_registry.get_members(reg)
+
+                 :dgen_registry.get_leader(reg) != :undefined and
+                   {peer_node, peer_member} in members
+               end,
+               5_000
+             ),
+             "primary did not reconstitute cluster after reconnect"
+
+      # Peer: leader must reappear.  Wrap in try/catch because distribution
+      # may briefly be in the process of reconnecting when we first poll.
+      assert eventually(
+               fn ->
+                 try do
+                   :erpc.call(peer_node, :dgen_registry, :get_leader, [reg]) != :undefined
+                 catch
+                   :exit, _ -> false
+                 end
+               end,
+               5_000
+             ),
+             "peer did not see a leader after reconnect"
+
+      # Registry must be fully functional: register on primary, replicate to peer.
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+
+      assert eventually(
+               fn -> :dgen_registry.register_name({reg, :post_partition}, pid) == :yes end,
+               5_000
+             ),
+             "could not register name after partition recovery"
+
+      assert eventually(
+               fn -> remote_whereis(peer_node, reg, :post_partition) == pid end,
+               5_000
+             ),
+             "name not replicated to peer after partition recovery"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Via-tuple across nodes
   # ---------------------------------------------------------------------------
 

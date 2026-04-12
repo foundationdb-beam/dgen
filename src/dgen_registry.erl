@@ -238,7 +238,10 @@ init({Name, Tenant}) ->
     MemberName = member_name(Name),
 
     %% Elector must start first: the member's init casts `{join, MemberId}`
-    %% to it immediately after starting.
+    %% to it immediately after starting. A large consume_k is chosen
+    %% because the in-transaction work is very small, and we want to keep
+    %% a single node as the sole consumer as much as possible, to avoid
+    %% leadership churn.
     ElectorSpec = #{
         id => elector,
         start =>
@@ -246,7 +249,7 @@ init({Name, Tenant}) ->
                 {local, ElectorName},
                 dgen_registry_elector,
                 #{name => Name},
-                [{tenant, Tenant}]
+                [{tenant, Tenant}, {consume_k, 50}]
             ]},
         restart => permanent,
         shutdown => 5000,

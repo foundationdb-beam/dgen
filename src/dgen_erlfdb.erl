@@ -46,19 +46,25 @@ get(Tx, Key) ->
 
 -spec set(dgen_backend:tx(), dgen_backend:key(), binary()) -> ok.
 set(Tx, Key, Value) ->
+    log_key(set, Key),
     erlfdb:set(Tx, Key, Value).
 
 -spec clear_range(dgen_backend:tx(), dgen_backend:key(), dgen_backend:key()) -> ok.
 clear_range(Tx, StartKey, EndKey) ->
+    log_key(clear_range_start, StartKey),
+    log_key(clear_range_end, EndKey),
     erlfdb:clear_range(Tx, StartKey, EndKey).
 
 -spec get_range(dgen_backend:tx(), dgen_backend:key(), dgen_backend:key(), list()) ->
     [{dgen_backend:key(), binary()}].
 get_range(Tx, StartKey, EndKey, Opts) ->
+    log_key(get_range_start, StartKey),
+    log_key(get_range_end, EndKey),
     erlfdb:get_range(Tx, StartKey, EndKey, Opts).
 
 -spec add(dgen_backend:tx(), dgen_backend:key(), integer()) -> ok.
 add(Tx, Key, Value) ->
+    log_key(add, Key),
     erlfdb:add(Tx, Key, Value).
 
 %% Versionstamp operations
@@ -69,10 +75,12 @@ get_next_tx_id(Tx) ->
 
 -spec set_versionstamped_key(dgen_backend:tx(), dgen_backend:key(), binary()) -> ok.
 set_versionstamped_key(Tx, Key, Value) ->
+    log_key(set_versionstamped_key, Key),
     erlfdb:set_versionstamped_key(Tx, Key, Value).
 
 -spec set_versionstamped_value(dgen_backend:tx(), dgen_backend:key(), binary()) -> ok.
 set_versionstamped_value(Tx, Key, Value) ->
+    log_key(set_versionstamped_value, Key),
     erlfdb:set_versionstamped_value(Tx, Key, Value).
 
 -spec get_versionstamp(dgen_backend:tx()) -> dgen_backend:future().
@@ -93,11 +101,13 @@ wait_for_all(Futures) ->
 
 -spec watch(dgen_backend:tx(), dgen_backend:key()) -> dgen_backend:future().
 watch(Tx, Key) ->
+    log_key(watch, Key),
     Future = erlfdb:watch(Tx, Key),
     wrap_future(Future).
 
 -spec watch(dgen_backend:tx(), dgen_backend:key(), list()) -> dgen_backend:future().
 watch(Tx, Key, Opts) ->
+    log_key(watch, Key),
     Future = erlfdb:watch(Tx, Key, Opts),
     wrap_future(Future).
 
@@ -146,3 +156,10 @@ sandbox_open(Name, DirName) ->
     Root = erlfdb_directory:root([{node_prefix, <<16#FE>>}, {content_prefix, <<>>}]),
     Dir = erlfdb_directory:create_or_open(Db, Root, DirName),
     {Db, Dir}.
+
+%% Internal — log every key touched so we can find the one causing error 1036.
+log_key(Op, <<16#FF, _/binary>> = Key) ->
+    {_, Stack} = process_info(self(), current_stacktrace),
+    io:format("ILLEGAL_KEY [~p/~p] ~p: ~p~n  stack: ~p~n", [node(), self(), Op, Key, Stack]);
+log_key(Op, Key) ->
+    io:format("key [~p/~p] ~p: ~p~n", [node(), self(), Op, Key]).

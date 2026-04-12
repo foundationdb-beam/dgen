@@ -169,6 +169,18 @@ prior state), the elector first calls the old leader via `transfer_snapshot` to
 atomically read the authoritative state and relinquish leadership — any
 registration already in the old leader's mailbox is flushed and included in
 the snapshot before the handoff.
+
+## Partition tolerance
+
+All calls to member processes are wrapped in `try/catch`.  If a target is
+unreachable (e.g. an Erlang-level network partition while the DB is healthy):
+
+- `transfer_snapshot` failure: falls back to `self_snapshot` — the new leader
+  starts with empty names for that transition window.
+- `elector_assume_and_distribute` failure: the call is skipped and the lock
+  clears normally.  The membership change is already committed to the DB; the
+  affected members self-correct on the next membership event (typically the
+  `{member_down}` that follows shortly when monitors fire).
 """.
 -endif.
 -spec handle_locked(dgen_server:db_ctx(), dgen_server:event_type(), term(), registry_state()) ->
@@ -186,12 +198,16 @@ handle_locked(_DbCtx, cast, {join, MemberId}, State) ->
                 %% any registration in its mailbox is flushed into the snapshot
                 %% before leadership transfers.
                 [SnapshotSource | _] = ExistingIds,
-                call_to_member(SnapshotSource, {transfer_snapshot, Leader});
+                try call_to_member(SnapshotSource, {transfer_snapshot, Leader})
+                catch exit:_ -> self_snapshot
+                end;
             true ->
                 %% Existing member is (or remains) the leader — use its own names.
                 self_snapshot
         end,
-    call_to_member(Leader, {elector_assume_and_distribute, Snapshot, MemberId, AllIds}),
+    try call_to_member(Leader, {elector_assume_and_distribute, Snapshot, MemberId, AllIds})
+    catch exit:_ -> ok
+    end,
     {noreply, State};
 handle_locked(_DbCtx, cast, {member_down, _MemberId}, State) ->
     #{members := Members, leader := Leader} = State,
@@ -200,9 +216,11 @@ handle_locked(_DbCtx, cast, {member_down, _MemberId}, State) ->
         undefined ->
             ok;
         _ ->
-            call_to_member(
-                Leader, {elector_assume_and_distribute, self_snapshot, undefined, AllIds}
-            )
+            try call_to_member(
+                    Leader, {elector_assume_and_distribute, self_snapshot, undefined, AllIds}
+                )
+            catch exit:_ -> ok
+            end
     end,
     {noreply, State}.
 
