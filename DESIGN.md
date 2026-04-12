@@ -88,7 +88,7 @@ the next queue message can be safely processed.
 1. The callback returns `{lock, NewState}`.
 2. The consumer commits `NewState` to FDB **and** writes a lock key (`{Tuid, <<"k">>}`) in
    the same transaction.
-3. Any other elector consumer that tries to consume from the queue reads `is_locked = true`
+3. Any other consumer that tries to consume from the queue reads `is_locked = true`
    and parks itself on a FDB watch instead of processing.
 4. The consumer that set the lock calls `handle_locked/3` with the **same** event type and
    message that triggered the lock, plus the committed `NewState`.  This is the synchronous
