@@ -147,7 +147,7 @@ A callback may return `{lock, State}` to enter locked mode. When locked:
 
 - Standard `call` and `cast` messages are queued but not processed
 - Priority messages and `handle_info` continue to execute
-- The `handle_locked/3` callback is invoked outside of a transaction
+- The `handle_locked/4` callback is invoked outside of a transaction
   - Not subject to FDB transaction limits
   - Side effects are permitted
   - Can modify state, which is written back to the database

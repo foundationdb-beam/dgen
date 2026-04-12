@@ -81,6 +81,12 @@ argument is the
 %% within the same atomic transaction as the callback.
 -type tx_ctx() :: #{td := dgen_backend:tenant(), tuid := tuid()}.
 
+%% Passed as the first argument to `handle_locked/4`.
+%% `db` is the DB-level tenant (not a transaction); `tuid` is the server's
+%% tenant-unique identifier.  Use `dgen_backend:transactional/2` to open
+%% explicit transactions within the locked section.
+-type db_ctx() :: #{db := dgen_backend:tenant(), tuid := tuid()}.
+
 -callback init(Args :: term()) -> init_ret().
 -callback handle_cast(Msg :: term(), State :: state()) -> noreply_ret() | lock_ret() | stop_ret().
 -callback handle_cast_tx(TxCtx :: tx_ctx(), Msg :: term(), State :: state()) ->
@@ -92,7 +98,7 @@ argument is the
 -callback handle_info(Info :: term(), State :: state()) -> noreply_ret() | stop_ret().
 -callback handle_info_tx(TxCtx :: tx_ctx(), Info :: term(), State :: state()) ->
     noreply_ret() | stop_ret().
--callback handle_locked(EventType :: event_type(), Msg :: term(), State :: state()) ->
+-callback handle_locked(DbCtx :: db_ctx(), EventType :: event_type(), Msg :: term(), State :: state()) ->
     reply_ret() | noreply_ret() | stop_ret().
 
 -callback handle_dead_letter(Msg :: term(), AttemptCount :: non_neg_integer()) -> any().
@@ -104,7 +110,7 @@ argument is the
     handle_call_tx/4,
     handle_info/2,
     handle_info_tx/3,
-    handle_locked/3,
+    handle_locked/4,
     handle_dead_letter/2
 ]).
 
@@ -126,6 +132,7 @@ argument is the
     option/0,
     options/0,
     tx_ctx/0,
+    db_ctx/0,
     tuid/0,
     from/0,
     event_type/0,
@@ -527,13 +534,14 @@ dispatch_callback(Td, Mod, Fn, Args, State) ->
 tx_callback_name(Callback) ->
     list_to_atom(atom_to_list(Callback) ++ "_tx").
 
-invoke_handle_locked_callback(EventType, Msg, ModState, State = #state{mod = Mod}) ->
-    case erlang:function_exported(Mod, handle_locked, 3) of
+invoke_handle_locked_callback(EventType, Msg, ModState, State = #state{mod = Mod, tenant = Tenant, tuid = Tuid}) ->
+    case erlang:function_exported(Mod, handle_locked, 4) of
         true ->
-            CallbackResult = erlang:apply(Mod, handle_locked, [EventType, Msg, ModState]),
+            DbCtx = #{db => Tenant, tuid => Tuid},
+            CallbackResult = erlang:apply(Mod, handle_locked, [DbCtx, EventType, Msg, ModState]),
             {ok, ModState, CallbackResult, State};
         false ->
-            {error, {function_not_exported, {Mod, handle_locked, 3}}}
+            {error, {function_not_exported, {Mod, handle_locked, 4}}}
     end.
 
 delete(Tenant, Tuid) ->

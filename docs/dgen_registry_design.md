@@ -44,7 +44,7 @@ is used as a one-time fallback.
 
 When the committed leader changes, `handle_cast_tx` returns `{lock, NewState}`
 instead of `{noreply, …, Actions}`.  This atomically commits the new leader to the
-DB and pauses all other elector consumers via a distributed lock.  `handle_locked/3`
+DB and pauses all other elector consumers via a distributed lock.  `handle_locked/4`
 uses this coordination window to fan out casts to every member before queue
 processing resumes:
 

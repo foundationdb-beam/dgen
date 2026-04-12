@@ -13,11 +13,11 @@ defmodule DGenServer do
   @callback handle_info(info :: term, state :: term) ::
               {:noreply, new_state :: term}
 
-  @callback handle_locked(event_type :: term, msg :: term, state :: term) ::
+  @callback handle_locked(db_ctx :: term, event_type :: term, msg :: term, state :: term) ::
               {:reply, reply :: term, new_state :: term}
               | {:noreply, new_state :: term}
 
-  @optional_callbacks handle_cast: 2, handle_call: 3, handle_info: 2, handle_locked: 3
+  @optional_callbacks handle_cast: 2, handle_call: 3, handle_info: 2, handle_locked: 4
 
   @doc false
   defmacro __using__(opts) do

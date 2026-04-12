@@ -92,10 +92,10 @@ the next queue message can be safely processed.
    the same transaction.
 3. Any other consumer that tries to consume from the queue reads `is_locked = true`
    and parks itself on a DB watch instead of processing.
-4. The consumer that set the lock calls `handle_locked/3` with the **same** event type and
+4. The consumer that set the lock calls `handle_locked/4` with the **same** event type and
    message that triggered the lock, plus the committed `NewState`.  This is the synchronous
    coordination window.
-5. After `handle_locked/3` returns (regardless of its return value), the lock key is cleared
+5. After `handle_locked/4` returns (regardless of its return value), the lock key is cleared
    and the queue watch is notified in an `after` block — always, even on exception.
 6. Parked consumers wake up, see `is_locked = false`, and resume normal queue consumption.
 

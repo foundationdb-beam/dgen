@@ -55,7 +55,7 @@ Value:    term_to_binary(MemberId | undefined)
     handle_cast_tx/3,
     handle_call_tx/4,
     handle_call/3,
-    handle_locked/3,
+    handle_locked/4,
     leader_db_key/2
 ]).
 
@@ -173,10 +173,10 @@ complete before any other consumer resumes queue processing — eliminating the
 race where a stale snapshot from a previous leader could arrive after a newer one.
 """.
 -endif.
--spec handle_locked(dgen_server:event_type(), term(), registry_state()) ->
+-spec handle_locked(dgen_server:db_ctx(), dgen_server:event_type(), term(), registry_state()) ->
     dgen_server:noreply_ret().
 
-handle_locked(cast, {join, MemberId}, State) ->
+handle_locked(_DbCtx, cast, {join, MemberId}, State) ->
     #{members := Members, leader := Leader} = State,
     AllIds = maps:keys(Members),
     ExistingIds = maps:keys(maps:remove(MemberId, Members)),
@@ -195,7 +195,7 @@ handle_locked(cast, {join, MemberId}, State) ->
     %% while the lock is still held.
     distribute_snapshot(Leader, maps:keys(maps:remove(Leader, Members))),
     {noreply, State};
-handle_locked(cast, {member_down, _MemberId}, State) ->
+handle_locked(_DbCtx, cast, {member_down, _MemberId}, State) ->
     #{members := Members, leader := Leader} = State,
     %% Surviving members already detected the death via their own DOWN signals.
     %% Only the new leader identity needs to be broadcast.

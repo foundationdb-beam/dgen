@@ -4,7 +4,7 @@ defmodule DGen.DLocker do
 
   State is an integer counter. Certain operations acquire a lock,
   do long-running work outside the transaction, then commit the
-  result via handle_locked/3.
+  result via handle_locked/4.
   """
   use DGenServer
 
@@ -47,7 +47,7 @@ defmodule DGen.DLocker do
   end
 
   @impl true
-  def handle_locked(event_type, {tag, notify_pid}, state) when tag in [:lock_get, :lock_incr] do
+  def handle_locked(_db_ctx, event_type, {tag, notify_pid}, state) when tag in [:lock_get, :lock_incr] do
     # Signal that we've entered the locked section
     send(notify_pid, {:locked_entered, self()})
 
