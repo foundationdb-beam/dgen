@@ -198,15 +198,19 @@ handle_locked(_DbCtx, cast, {join, MemberId}, State) ->
                 %% any registration in its mailbox is flushed into the snapshot
                 %% before leadership transfers.
                 [SnapshotSource | _] = ExistingIds,
-                try call_to_member(SnapshotSource, {transfer_snapshot, Leader})
-                catch exit:_ -> self_snapshot
+                try
+                    call_to_member(SnapshotSource, {transfer_snapshot, Leader})
+                catch
+                    exit:_ -> self_snapshot
                 end;
             true ->
                 %% Existing member is (or remains) the leader — use its own names.
                 self_snapshot
         end,
-    try call_to_member(Leader, {elector_assume_and_distribute, Snapshot, MemberId, AllIds})
-    catch exit:_ -> ok
+    try
+        call_to_member(Leader, {elector_assume_and_distribute, Snapshot, MemberId, AllIds})
+    catch
+        exit:_ -> ok
     end,
     {noreply, State};
 handle_locked(_DbCtx, cast, {member_down, _MemberId}, State) ->
@@ -216,10 +220,12 @@ handle_locked(_DbCtx, cast, {member_down, _MemberId}, State) ->
         undefined ->
             ok;
         _ ->
-            try call_to_member(
+            try
+                call_to_member(
                     Leader, {elector_assume_and_distribute, self_snapshot, undefined, AllIds}
                 )
-            catch exit:_ -> ok
+            catch
+                exit:_ -> ok
             end
     end,
     {noreply, State}.

@@ -217,7 +217,9 @@ See `start_link/3` for details on `Mod`, `Arg`, and `Opts`.
 -spec start_link(gen_server:server_name(), module(), term(), options()) -> start_ret().
 start_link(Reg, Mod, Arg, Opts) ->
     {Tenant, Consume, Reset, Cache, DLT, ConsumeK} = parse_opts(Opts),
-    gen_server:start_link(Reg, ?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT, ConsumeK}, Opts).
+    gen_server:start_link(
+        Reg, ?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT, ConsumeK}, Opts
+    ).
 
 -if(?DOCATTRS).
 -doc "Sends an asynchronous cast request to the dgen_server's durable queue.".
@@ -677,20 +679,13 @@ get_state_key(Tuple) ->
 
 handle_consume(Tenant, K, Tuid, State = #state{dead_letter_threshold = Threshold}) ->
     Quid = get_quid(Tuid),
-    Result = dgen_backend:transactional(Tenant, fun(Td = {Tx, _}) ->
-        try
-            case is_locked(Td, State) of
-                true ->
-                    Watch = dgen_queue:watch_push(Td, Quid),
-                    {{noreply, []}, undefined, State#state{watch = Watch}};
-                false ->
-                    consume_queued(Td, K, Quid, Threshold, State)
-            end
-        catch
-            error:{erlfdb_error, _} = E ->
-                io:format("handle_consume CAUGHT before commit: ~p~n  tx_ops=~p~n",
-                          [E, erlfdb:get_committed_version(Tx)]),
-                erlang:error(E)
+    Result = dgen_backend:transactional(Tenant, fun(Td) ->
+        case is_locked(Td, State) of
+            true ->
+                Watch = dgen_queue:watch_push(Td, Quid),
+                {{noreply, []}, undefined, State#state{watch = Watch}};
+            false ->
+                consume_queued(Td, K, Quid, Threshold, State)
         end
     end),
     case Result of
@@ -713,7 +708,9 @@ consume_queued(Td, K, Quid, Threshold, State) ->
             Watch = dgen_queue:watch_push(Td, Quid),
             {{noreply, []}, undefined, State#state{watch = Watch}};
         {ok, KVs} ->
-            consume_batch(Td, KVs, Quid, Threshold, State#state{watch = undefined}, [], [], undefined)
+            consume_batch(
+                Td, KVs, Quid, Threshold, State#state{watch = undefined}, [], [], undefined
+            )
     end.
 
 %% Processes peeked KVs one at a time, accumulating actions, consumed KVs, and the
@@ -722,7 +719,9 @@ consume_batch(Td, [], Quid, _Threshold, State, AccActions, AccKVs, LatestModStat
     dgen_queue:consume_peeked(Td, lists:reverse(AccKVs), Quid),
     FinalActions = lists:append(lists:reverse(AccActions)),
     {{noreply, FinalActions}, LatestModState, State#state{cache_misses = 0}};
-consume_batch(Td, [{RawKey, RawBin} | Rest], Quid, Threshold, State, AccActions, AccKVs, _LatestModState) ->
+consume_batch(
+    Td, [{RawKey, RawBin} | Rest], Quid, Threshold, State, AccActions, AccKVs, _LatestModState
+) ->
     Envelope = normalize_message(binary_to_term(RawBin)),
     N = envelope_attempts(Envelope),
     case is_dead_letter(N, Threshold) of
@@ -733,8 +732,16 @@ consume_batch(Td, [{RawKey, RawBin} | Rest], Quid, Threshold, State, AccActions,
         false ->
             try invoke_queued_msg(Td, Envelope, State) of
                 {{noreply, Actions}, NewModState, State1} ->
-                    consume_batch(Td, Rest, Quid, Threshold, State1,
-                                  [Actions | AccActions], [{RawKey, RawBin} | AccKVs], NewModState);
+                    consume_batch(
+                        Td,
+                        Rest,
+                        Quid,
+                        Threshold,
+                        State1,
+                        [Actions | AccActions],
+                        [{RawKey, RawBin} | AccKVs],
+                        NewModState
+                    );
                 {{lock, EventType, Msg}, ModState, State1} ->
                     AllKVs = lists:reverse([{RawKey, RawBin} | AccKVs]),
                     dgen_queue:consume_peeked(Td, AllKVs, Quid),
@@ -931,7 +938,6 @@ clear_lock(Td = {Tx, Dir}, #state{tuid = Tuid}) ->
     B = dgen_config:backend(),
     LockKey = B:dir_pack(Dir, get_lock_key(Tuid)),
     LockEnd = B:key_strinc(LockKey),
-    io:format("clear_lock: LockKey=~p EndKey=~p~n", [LockKey, LockEnd]),
     B:clear_range(Tx, LockKey, LockEnd),
     dgen_queue:notify(Td, get_quid(Tuid)).
 

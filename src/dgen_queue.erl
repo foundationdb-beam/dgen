@@ -124,8 +124,6 @@ consume_peeked({Tx, Dir}, KVs, Quid) ->
     [{FirstKey, _} | _] = KVs,
     {LastKey, _} = lists:last(KVs),
     EndKey = B:key_strinc(LastKey),
-    io:format("consume_peeked: N=~p~n  FirstKey=~p~n  LastKey=~p~n  EndKey=~p~n",
-              [N, FirstKey, LastKey, EndKey]),
     B:clear_range(Tx, FirstKey, EndKey),
     PopKey = get_pop_key(Quid),
     B:add(Tx, B:dir_pack(Dir, PopKey), N).
