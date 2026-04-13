@@ -329,6 +329,7 @@ defmodule DGen.RegistryClusterTest do
   # Partition recovery
   # ---------------------------------------------------------------------------
 
+  # @todo: this test keeps failing randomly... have no leads yet
   describe "partition recovery via nodeup" do
     test "cluster reconstitutes after Erlang distribution disconnects and reconnects", %{
       reg: reg,
