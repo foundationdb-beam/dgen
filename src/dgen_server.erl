@@ -510,11 +510,11 @@ invoke_tx_callback(Td, Callback, Args, State = #state{mod = Mod, tuid = Tuid}) -
     Result =
         case erlang:function_exported(Mod, TxCallback, Arity + 1) of
             true ->
-                dispatch_callback(Td, Mod, TxCallback, [TxCtx | Args], State);
+                dispatch_callback(Td, undefined, Mod, TxCallback, [TxCtx | Args], State);
             false ->
                 case erlang:function_exported(Mod, Callback, Arity) of
                     true ->
-                        dispatch_callback(Td, Mod, Callback, Args, State);
+                        dispatch_callback(Td, undefined, Mod, Callback, Args, State);
                     false ->
                         {error, {function_not_exported, {Mod, Callback, Arity}}}
                 end
@@ -527,23 +527,20 @@ invoke_tx_callback(Td, Callback, Args, State = #state{mod = Mod, tuid = Tuid}) -
             Result
     end.
 
-dispatch_callback(Td, Mod, Fn, Args, State) ->
+dispatch_callback(Td, undefined, Mod, Fn, Args, State) ->
     case get_mod_state(Td, State) of
-        {{ok, ModState}, State1} ->
-            CallbackResult = erlang:apply(Mod, Fn, Args ++ [ModState]),
+        {{ok, ModState}, State1} when ModState =/= undefined ->
+            {ok, _ModState, CallbackResult} = dispatch_callback(Td, ModState, Mod, Fn, Args, State),
             {ok, ModState, CallbackResult, State1};
         {{error, not_found}, _} ->
             {error, {mod_state_not_found, Mod}}
-    end.
-
-%% Like dispatch_callback/5 but uses the provided ModState directly instead of
-%% calling get_mod_state/2. Used by the batch consumer to avoid repeated FDB reads.
-dispatch_callback_with_state(ModState, _Td, Mod, Fn, Args) ->
+    end;
+dispatch_callback(_Td, ModState, Mod, Fn, Args, _State) ->
     CallbackResult = erlang:apply(Mod, Fn, Args ++ [ModState]),
     {ok, ModState, CallbackResult}.
 
 %% Like invoke_tx_callback/4 but uses CurrentModState directly instead of reading from FDB.
-invoke_tx_callback_batch(Td, Callback, Args, CurrentModState, #state{mod = Mod, tuid = Tuid}) ->
+invoke_tx_callback_batch(Td, Callback, Args, CurrentModState, State=#state{mod = Mod, tuid = Tuid}) ->
     T1 = erlang:monotonic_time(millisecond),
     Arity = length(Args) + 1,
     TxCallback = tx_callback_name(Callback),
@@ -551,11 +548,11 @@ invoke_tx_callback_batch(Td, Callback, Args, CurrentModState, #state{mod = Mod, 
     Result =
         case erlang:function_exported(Mod, TxCallback, Arity + 1) of
             true ->
-                dispatch_callback_with_state(CurrentModState, Td, Mod, TxCallback, [TxCtx | Args]);
+                dispatch_callback(Td, CurrentModState, Mod, TxCallback, [TxCtx | Args], State);
             false ->
                 case erlang:function_exported(Mod, Callback, Arity) of
                     true ->
-                        dispatch_callback_with_state(CurrentModState, Td, Mod, Callback, Args);
+                        dispatch_callback(Td, CurrentModState, Mod, Callback, Args, State);
                     false ->
                         {error, {function_not_exported, {Mod, Callback, Arity}}}
                 end
