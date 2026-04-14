@@ -687,7 +687,9 @@ handle_callback_result(
 %% atomic with the mod state write and queue consume.
 handle_callback_result_batch(_Td, _EventType, _Msg, {noreply, ModState}, _OrigModState, State) ->
     {{noreply, []}, ModState, State};
-handle_callback_result_batch(_Td, _EventType, _Msg, {noreply, ModState, Actions}, _OrigModState, State) ->
+handle_callback_result_batch(
+    _Td, _EventType, _Msg, {noreply, ModState, Actions}, _OrigModState, State
+) ->
     {{noreply, Actions}, ModState, State};
 handle_callback_result_batch(_Td, _EventType, _Msg, {reply, Reply, ModState}, _OrigModState, State) ->
     {{reply, Reply, []}, ModState, State};
@@ -771,7 +773,9 @@ consume_call_batch(Td, Request, From, CurrentModState, State) ->
         {error, Reason} ->
             erlang:error(Reason);
         {ok, OrigModState, CallbackResult} ->
-            handle_callback_result_batch(Td, {call, From}, Request, CallbackResult, OrigModState, State)
+            handle_callback_result_batch(
+                Td, {call, From}, Request, CallbackResult, OrigModState, State
+            )
     end.
 
 invoke_queued_msg_batch(Td, {cast, Request, _N}, CurrentModState, State) ->
@@ -797,8 +801,15 @@ consume_queued(Td, K, Quid, Threshold, State) ->
                     erlang:error({mod_state_not_found, Mod});
                 {{ok, InitModState}, State1} ->
                     consume_batch(
-                        Td, KVs, Quid, Threshold, State1#state{watch = undefined}, [], [],
-                        InitModState, InitModState
+                        Td,
+                        KVs,
+                        Quid,
+                        Threshold,
+                        State1#state{watch = undefined},
+                        [],
+                        [],
+                        InitModState,
+                        InitModState
                     )
             end
     end.
@@ -817,8 +828,15 @@ consume_batch(Td, [], Quid, _Threshold, State, AccActions, AccKVs, CurrentModSta
     FinalActions = lists:append(lists:reverse(AccActions)),
     {{noreply, FinalActions}, CurrentModState, State1#state{cache_misses = 0}};
 consume_batch(
-    Td, [{RawKey, RawBin} | Rest], Quid, Threshold, State, AccActions, AccKVs,
-    CurrentModState, InitModState
+    Td,
+    [{RawKey, RawBin} | Rest],
+    Quid,
+    Threshold,
+    State,
+    AccActions,
+    AccKVs,
+    CurrentModState,
+    InitModState
 ) ->
     Envelope = normalize_message(binary_to_term(RawBin)),
     N = envelope_attempts(Envelope),
@@ -873,7 +891,6 @@ consume_batch(
                     {reraise, Class, Reason, Stack}
             end
     end.
-
 
 envelope_attempts({cast, _R, N}) -> N;
 envelope_attempts({call, _R, _F, _O, N}) -> N.
