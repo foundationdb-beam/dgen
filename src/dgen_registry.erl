@@ -241,7 +241,7 @@ init({Name, Tenant}) ->
     %% to it immediately after starting. A large consume_k is chosen
     %% because the in-transaction work is very small, and we want to keep
     %% a single node as the sole consumer as much as possible, to avoid
-    %% leadership churn.
+    %% leadership churn. @todo: Also, we need to turn off inlining
     ElectorSpec = #{
         id => elector,
         start =>

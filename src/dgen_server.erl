@@ -536,6 +536,38 @@ dispatch_callback(Td, Mod, Fn, Args, State) ->
             {error, {mod_state_not_found, Mod}}
     end.
 
+%% Like dispatch_callback/5 but uses the provided ModState directly instead of
+%% calling get_mod_state/2. Used by the batch consumer to avoid repeated FDB reads.
+dispatch_callback_with_state(ModState, _Td, Mod, Fn, Args) ->
+    CallbackResult = erlang:apply(Mod, Fn, Args ++ [ModState]),
+    {ok, ModState, CallbackResult}.
+
+%% Like invoke_tx_callback/4 but uses CurrentModState directly instead of reading from FDB.
+invoke_tx_callback_batch(Td, Callback, Args, CurrentModState, #state{mod = Mod, tuid = Tuid}) ->
+    T1 = erlang:monotonic_time(millisecond),
+    Arity = length(Args) + 1,
+    TxCallback = tx_callback_name(Callback),
+    TxCtx = #{td => Td, tuid => Tuid},
+    Result =
+        case erlang:function_exported(Mod, TxCallback, Arity + 1) of
+            true ->
+                dispatch_callback_with_state(CurrentModState, Td, Mod, TxCallback, [TxCtx | Args]);
+            false ->
+                case erlang:function_exported(Mod, Callback, Arity) of
+                    true ->
+                        dispatch_callback_with_state(CurrentModState, Td, Mod, Callback, Args);
+                    false ->
+                        {error, {function_not_exported, {Mod, Callback, Arity}}}
+                end
+        end,
+    T2 = erlang:monotonic_time(millisecond),
+    if
+        T2 - T1 > ?TxCallbackTimeout ->
+            erlang:error(tooslow);
+        true ->
+            Result
+    end.
+
 tx_callback_name(Callback) ->
     list_to_atom(atom_to_list(Callback) ++ "_tx").
 
@@ -649,6 +681,30 @@ handle_callback_result(
     {_, State1} = set_mod_state(Td, OrigModState, ModState, State),
     {{stop, Reason, Actions}, ModState, State1}.
 
+%% Batch variant of handle_callback_result: does NOT write mod state to the backend.
+%% consume_batch is responsible for a single set_mod_state call at each exit point.
+%% The lock case still sets the lock key within the transaction, as it must be
+%% atomic with the mod state write and queue consume.
+handle_callback_result_batch(_Td, _EventType, _Msg, {noreply, ModState}, _OrigModState, State) ->
+    {{noreply, []}, ModState, State};
+handle_callback_result_batch(_Td, _EventType, _Msg, {noreply, ModState, Actions}, _OrigModState, State) ->
+    {{noreply, Actions}, ModState, State};
+handle_callback_result_batch(_Td, _EventType, _Msg, {reply, Reply, ModState}, _OrigModState, State) ->
+    {{reply, Reply, []}, ModState, State};
+handle_callback_result_batch(
+    _Td, _EventType, _Msg, {reply, Reply, ModState, Actions}, _OrigModState, State
+) ->
+    {{reply, Reply, Actions}, ModState, State};
+handle_callback_result_batch(Td, EventType, Msg, {lock, ModState}, _OrigModState, State) ->
+    State1 = set_lock(Td, State),
+    {{lock, EventType, Msg}, ModState, State1};
+handle_callback_result_batch(_Td, _EventType, _Msg, {stop, Reason, ModState}, _OrigModState, State) ->
+    {{stop, Reason, []}, ModState, State};
+handle_callback_result_batch(
+    _Td, _EventType, _Msg, {stop, Reason, ModState, Actions}, _OrigModState, State
+) ->
+    {{stop, Reason, Actions}, ModState, State}.
+
 finalize({{noreply, Actions}, ModState, State}) ->
     State1 = resolve_version(State),
     _ = handle_actions(Actions, [], ModState),
@@ -702,35 +758,78 @@ handle_consume(Tenant, K, Tuid, State = #state{dead_letter_threshold = Threshold
             finalize(Result)
     end.
 
+consume_cast_batch(Td, Request, CurrentModState, State) ->
+    case invoke_tx_callback_batch(Td, handle_cast, [Request], CurrentModState, State) of
+        {error, Reason} ->
+            erlang:error(Reason);
+        {ok, OrigModState, CallbackResult} ->
+            handle_callback_result_batch(Td, cast, Request, CallbackResult, OrigModState, State)
+    end.
+
+consume_call_batch(Td, Request, From, CurrentModState, State) ->
+    case invoke_tx_callback_batch(Td, handle_call, [Request, From], CurrentModState, State) of
+        {error, Reason} ->
+            erlang:error(Reason);
+        {ok, OrigModState, CallbackResult} ->
+            handle_callback_result_batch(Td, {call, From}, Request, CallbackResult, OrigModState, State)
+    end.
+
+invoke_queued_msg_batch(Td, {cast, Request, _N}, CurrentModState, State) ->
+    consume_cast_batch(Td, Request, CurrentModState, State);
+invoke_queued_msg_batch(Td, {call, Request, From, _Opts, _N}, CurrentModState, State) ->
+    case consume_call_batch(Td, Request, From, CurrentModState, State) of
+        {{reply, Reply, Actions}, ModState, State2} ->
+            set_reply(Td, From, Reply),
+            {{noreply, Actions}, ModState, State2};
+        Other ->
+            Other
+    end.
+
 consume_queued(Td, K, Quid, Threshold, State) ->
     case dgen_queue:peek_k(Td, K, Quid) of
         {error, empty} ->
             Watch = dgen_queue:watch_push(Td, Quid),
             {{noreply, []}, undefined, State#state{watch = Watch}};
         {ok, KVs} ->
-            consume_batch(
-                Td, KVs, Quid, Threshold, State#state{watch = undefined}, [], [], undefined
-            )
+            case get_mod_state(Td, State) of
+                {{error, not_found}, _} ->
+                    #state{mod = Mod} = State,
+                    erlang:error({mod_state_not_found, Mod});
+                {{ok, InitModState}, State1} ->
+                    consume_batch(
+                        Td, KVs, Quid, Threshold, State1#state{watch = undefined}, [], [],
+                        InitModState, InitModState
+                    )
+            end
     end.
 
-%% Processes peeked KVs one at a time, accumulating actions, consumed KVs, and the
-%% latest ModState. A single consume_peeked call is issued per exit path for one clear_range.
-consume_batch(Td, [], Quid, _Threshold, State, AccActions, AccKVs, LatestModState) ->
+%% Processes peeked KVs one at a time, carrying mod state in memory.
+%% Mod state is read once (in consume_queued) and written once at each exit point,
+%% avoiding repeated FDB reads/writes due to set_versionstamped_value not being
+%% visible in read-your-own-writes within the same transaction.
+%%
+%% Parameters:
+%%   8th — CurrentModState: mod state produced by the last successfully invoked callback
+%%   9th — InitModState: mod state at the start of the batch, used for diff-based writes
+consume_batch(Td, [], Quid, _Threshold, State, AccActions, AccKVs, CurrentModState, InitModState) ->
+    {_, State1} = set_mod_state(Td, InitModState, CurrentModState, State),
     dgen_queue:consume_peeked(Td, lists:reverse(AccKVs), Quid),
     FinalActions = lists:append(lists:reverse(AccActions)),
-    {{noreply, FinalActions}, LatestModState, State#state{cache_misses = 0}};
+    {{noreply, FinalActions}, CurrentModState, State1#state{cache_misses = 0}};
 consume_batch(
-    Td, [{RawKey, RawBin} | Rest], Quid, Threshold, State, AccActions, AccKVs, _LatestModState
+    Td, [{RawKey, RawBin} | Rest], Quid, Threshold, State, AccActions, AccKVs,
+    CurrentModState, InitModState
 ) ->
     Envelope = normalize_message(binary_to_term(RawBin)),
     N = envelope_attempts(Envelope),
     case is_dead_letter(N, Threshold) of
         true ->
             AllKVs = lists:reverse([{RawKey, RawBin} | AccKVs]),
+            {_, State1} = set_mod_state(Td, InitModState, CurrentModState, State),
             dgen_queue:consume_peeked(Td, AllKVs, Quid),
-            handle_dead_letter_internal(Td, to_dl_envelope(Envelope), N, State);
+            handle_dead_letter_internal(Td, to_dl_envelope(Envelope), N, State1);
         false ->
-            try invoke_queued_msg(Td, Envelope, State) of
+            try invoke_queued_msg_batch(Td, Envelope, CurrentModState, State) of
                 {{noreply, Actions}, NewModState, State1} ->
                     consume_batch(
                         Td,
@@ -740,43 +839,41 @@ consume_batch(
                         State1,
                         [Actions | AccActions],
                         [{RawKey, RawBin} | AccKVs],
-                        NewModState
+                        NewModState,
+                        InitModState
                     );
                 {{lock, EventType, Msg}, ModState, State1} ->
                     AllKVs = lists:reverse([{RawKey, RawBin} | AccKVs]),
+                    {_, State2} = set_mod_state(Td, InitModState, ModState, State1),
                     dgen_queue:consume_peeked(Td, AllKVs, Quid),
                     PriorActions = lists:append(lists:reverse(AccActions)),
-                    State2 = State1#state{cache_misses = 0},
+                    State3 = State2#state{cache_misses = 0},
                     case PriorActions of
-                        [] -> {{lock, EventType, Msg}, ModState, State2};
-                        _ -> {lock_batch, PriorActions, EventType, Msg, ModState, State2}
+                        [] -> {{lock, EventType, Msg}, ModState, State3};
+                        _ -> {lock_batch, PriorActions, EventType, Msg, ModState, State3}
                     end;
                 {{stop, Reason, Actions}, ModState, State1} ->
                     AllKVs = lists:reverse([{RawKey, RawBin} | AccKVs]),
+                    {_, State2} = set_mod_state(Td, InitModState, ModState, State1),
                     dgen_queue:consume_peeked(Td, AllKVs, Quid),
                     All = lists:append(lists:reverse([Actions | AccActions])),
-                    {{stop, Reason, All}, ModState, State1#state{cache_misses = 0}}
+                    {{stop, Reason, All}, ModState, State2#state{cache_misses = 0}}
             catch
                 Class:Reason:Stack ->
                     case AccKVs of
-                        [] -> ok;
-                        _ -> dgen_queue:consume_peeked(Td, lists:reverse(AccKVs), Quid)
+                        [] ->
+                            ok;
+                        _ ->
+                            % Write mod state for successfully processed prior messages
+                            % before committing their dequeues.
+                            set_mod_state(Td, InitModState, CurrentModState, State),
+                            dgen_queue:consume_peeked(Td, lists:reverse(AccKVs), Quid)
                     end,
                     dgen_queue:update_peeked(Td, RawKey, increment_envelope(Envelope)),
                     {reraise, Class, Reason, Stack}
             end
     end.
 
-invoke_queued_msg(Td, {cast, Request, _N}, State) ->
-    consume_cast(Td, Request, State);
-invoke_queued_msg(Td, {call, Request, From, _Opts, _N}, State) ->
-    case consume_call(Td, Request, From, State) of
-        {{reply, Reply, Actions}, ModState, State2} ->
-            set_reply(Td, From, Reply),
-            {{noreply, Actions}, ModState, State2};
-        Other ->
-            Other
-    end.
 
 envelope_attempts({cast, _R, N}) -> N;
 envelope_attempts({call, _R, _F, _O, N}) -> N.
