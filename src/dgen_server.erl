@@ -540,7 +540,9 @@ dispatch_callback(_Td, ModState, Mod, Fn, Args, _State) ->
     {ok, ModState, CallbackResult}.
 
 %% Like invoke_tx_callback/4 but uses CurrentModState directly instead of reading from FDB.
-invoke_tx_callback_batch(Td, Callback, Args, CurrentModState, State=#state{mod = Mod, tuid = Tuid}) ->
+invoke_tx_callback_batch(
+    Td, Callback, Args, CurrentModState, State = #state{mod = Mod, tuid = Tuid}
+) ->
     T1 = erlang:monotonic_time(millisecond),
     Arity = length(Args) + 1,
     TxCallback = tx_callback_name(Callback),
