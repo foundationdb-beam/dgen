@@ -1,4 +1,4 @@
-defmodule DGenServer.StopTest do
+defmodule DGen.Server.StopTest do
   use DGen.Case, async: true
 
   alias DGen.DStopper
@@ -62,7 +62,7 @@ defmodule DGenServer.StopTest do
       mref = Process.monitor(pid)
 
       try do
-        DGenServer.priority_call(pid, {:stop_me_with_action, self()}, 10_000)
+        DGen.Server.priority_call(pid, {:stop_me_with_action, self()}, 10_000)
       catch
         :exit, _ -> :ok
       end
@@ -91,7 +91,7 @@ defmodule DGenServer.StopTest do
       {:ok, pid} = DStopper.start_link(tenant, {"stop_persist_action"})
 
       # Increment state first so we can verify the action receives updated state
-      DGenServer.cast(pid, {:incr, 5})
+      DGen.Server.cast(pid, {:incr, 5})
       Process.sleep(200)
       assert 5 = DStopper.get(pid)
 

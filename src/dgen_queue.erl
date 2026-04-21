@@ -123,7 +123,8 @@ consume_peeked({Tx, Dir}, KVs, Quid) ->
     N = length(KVs),
     [{FirstKey, _} | _] = KVs,
     {LastKey, _} = lists:last(KVs),
-    B:clear_range(Tx, FirstKey, B:key_strinc(LastKey)),
+    EndKey = B:key_strinc(LastKey),
+    B:clear_range(Tx, FirstKey, EndKey),
     PopKey = get_pop_key(Quid),
     B:add(Tx, B:dir_pack(Dir, PopKey), N).
 

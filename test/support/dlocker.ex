@@ -4,30 +4,30 @@ defmodule DGen.DLocker do
 
   State is an integer counter. Certain operations acquire a lock,
   do long-running work outside the transaction, then commit the
-  result via handle_locked/3.
+  result via handle_locked/4.
   """
-  use DGenServer
+  use DGen.Server
 
   def start_link(tenant, tuid),
-    do: DGenServer.start_link(__MODULE__, [tuid], tenant: tenant)
+    do: DGen.Server.start_link(__MODULE__, [tuid], tenant: tenant)
 
   def start_link_opts(tenant, tuid, opts),
-    do: DGenServer.start_link(__MODULE__, [tuid], [{:tenant, tenant} | opts])
+    do: DGen.Server.start_link(__MODULE__, [tuid], [{:tenant, tenant} | opts])
 
-  def get(pid), do: DGenServer.priority_call(pid, :get)
-  def incr(pid), do: DGenServer.cast(pid, :incr)
+  def get(pid), do: DGen.Server.priority_call(pid, :get)
+  def incr(pid), do: DGen.Server.cast(pid, :incr)
 
   @doc "Cast that acquires a lock, does async work, then commits"
   def lock_incr(pid, notify_pid),
-    do: DGenServer.cast(pid, {:lock_incr, notify_pid})
+    do: DGen.Server.cast(pid, {:lock_incr, notify_pid})
 
   @doc "Call that acquires a lock, does async work, then replies"
   def lock_get(pid, notify_pid),
-    do: DGenServer.call(pid, {:lock_get, notify_pid}, 15_000)
+    do: DGen.Server.call(pid, {:lock_get, notify_pid}, 15_000)
 
   @doc "Priority call that acquires a lock"
   def priority_lock_get(pid, notify_pid),
-    do: DGenServer.priority_call(pid, {:lock_get, notify_pid}, 15_000)
+    do: DGen.Server.priority_call(pid, {:lock_get, notify_pid}, 15_000)
 
   @impl true
   def init([tuid]), do: {:ok, tuid, 0}
@@ -47,7 +47,8 @@ defmodule DGen.DLocker do
   end
 
   @impl true
-  def handle_locked(event_type, {tag, notify_pid}, state) when tag in [:lock_get, :lock_incr] do
+  def handle_locked(_db_ctx, event_type, {tag, notify_pid}, state)
+      when tag in [:lock_get, :lock_incr] do
     # Signal that we've entered the locked section
     send(notify_pid, {:locked_entered, self()})
 

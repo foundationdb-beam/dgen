@@ -1,11 +1,11 @@
-defmodule DGenServer.CacheTest do
+defmodule DGen.Server.CacheTest do
   use DGen.Case, async: true
 
   alias DGen.DCounter
 
   defp kill(pid) do
     mref = Process.monitor(pid)
-    DGenServer.kill(pid, :normal)
+    DGen.Server.kill(pid, :normal)
 
     receive do
       {:DOWN, ^mref, :process, ^pid, :normal} -> :ok

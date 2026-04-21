@@ -75,21 +75,44 @@ argument is the
 -type noreply_ret() :: {noreply, state()} | {noreply, state(), [action()]}.
 -type stop_ret() :: {stop, term(), state()} | {stop, term(), state(), [action()]}.
 
+%% Passed as the first argument to `_tx` callback variants.
+%% `td` is the current backend transaction+directory pair; `tuid` is the server's
+%% tenant-unique identifier.  Both may be used to read or write arbitrary keys
+%% within the same atomic transaction as the callback.
+-type tx_ctx() :: #{td := dgen_backend:tenant(), tuid := tuid()}.
+
+%% Passed as the first argument to `handle_locked/4`.
+%% `db` is the DB-level tenant (not a transaction); `tuid` is the server's
+%% tenant-unique identifier.  Use `dgen_backend:transactional/2` to open
+%% explicit transactions within the locked section.
+-type db_ctx() :: #{db := dgen_backend:tenant(), tuid := tuid()}.
+
 -callback init(Args :: term()) -> init_ret().
 -callback handle_cast(Msg :: term(), State :: state()) -> noreply_ret() | lock_ret() | stop_ret().
+-callback handle_cast_tx(TxCtx :: tx_ctx(), Msg :: term(), State :: state()) ->
+    noreply_ret() | lock_ret() | stop_ret().
 -callback handle_call(Request :: term(), From :: from(), State :: state()) ->
     reply_ret() | lock_ret() | stop_ret().
+-callback handle_call_tx(TxCtx :: tx_ctx(), Request :: term(), From :: from(), State :: state()) ->
+    reply_ret() | lock_ret() | stop_ret().
 -callback handle_info(Info :: term(), State :: state()) -> noreply_ret() | stop_ret().
--callback handle_locked(EventType :: event_type(), Msg :: term(), State :: state()) ->
+-callback handle_info_tx(TxCtx :: tx_ctx(), Info :: term(), State :: state()) ->
+    noreply_ret() | stop_ret().
+-callback handle_locked(
+    DbCtx :: db_ctx(), EventType :: event_type(), Msg :: term(), State :: state()
+) ->
     reply_ret() | noreply_ret() | stop_ret().
 
 -callback handle_dead_letter(Msg :: term(), AttemptCount :: non_neg_integer()) -> any().
 
 -optional_callbacks([
     handle_cast/2,
+    handle_cast_tx/3,
     handle_call/3,
+    handle_call_tx/4,
     handle_info/2,
-    handle_locked/3,
+    handle_info_tx/3,
+    handle_locked/4,
     handle_dead_letter/2
 ]).
 
@@ -106,7 +129,21 @@ argument is the
 -type options() :: [option()].
 -type start_ret() :: gen_server:start_ret().
 
--export_type([server/0, option/0, options/0]).
+-export_type([
+    server/0,
+    option/0,
+    options/0,
+    tx_ctx/0,
+    db_ctx/0,
+    tuid/0,
+    from/0,
+    event_type/0,
+    lock_ret/0,
+    reply_ret/0,
+    noreply_ret/0,
+    init_ret/0,
+    stop_ret/0
+]).
 
 -define(DefaultTuid(Mod), {<<"dgen_server">>, atom_to_binary(Mod)}).
 -define(TxCallbackTimeout, 5000).
@@ -125,7 +162,8 @@ argument is the
         undefined
         | {dgen_backend:versionstamp() | dgen_backend:future(), {ok, term()} | {error, not_found}},
     cache_misses = 0 :: non_neg_integer(),
-    dead_letter_threshold = infinity :: pos_integer() | infinity
+    dead_letter_threshold = infinity :: pos_integer() | infinity,
+    consume_k = 1 :: pos_integer()
 }).
 
 -type internalstate() :: #state{}.
@@ -139,8 +177,8 @@ See `start_link/3` for details on `Mod`, `Arg`, and `Opts`.
 -endif.
 -spec start(module(), term(), options()) -> start_ret().
 start(Mod, Arg, Opts) ->
-    {Tenant, Consume, Reset, Cache, DLT} = parse_opts(Opts),
-    gen_server:start(?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT}, Opts).
+    {Tenant, Consume, Reset, Cache, DLT, ConsumeK} = parse_opts(Opts),
+    gen_server:start(?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT, ConsumeK}, Opts).
 
 -if(?DOCATTRS).
 -doc """
@@ -151,8 +189,8 @@ See `start_link/3` for details on `Mod`, `Arg`, and `Opts`.
 -endif.
 -spec start(gen_server:server_name(), module(), term(), options()) -> start_ret().
 start(Reg, Mod, Arg, Opts) ->
-    {Tenant, Consume, Reset, Cache, DLT} = parse_opts(Opts),
-    gen_server:start(Reg, ?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT}, Opts).
+    {Tenant, Consume, Reset, Cache, DLT, ConsumeK} = parse_opts(Opts),
+    gen_server:start(Reg, ?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT, ConsumeK}, Opts).
 
 -if(?DOCATTRS).
 -doc """
@@ -166,8 +204,8 @@ Starts a dgen_server process linked to the calling process.
 -endif.
 -spec start_link(module(), term(), options()) -> start_ret().
 start_link(Mod, Arg, Opts) ->
-    {Tenant, Consume, Reset, Cache, DLT} = parse_opts(Opts),
-    gen_server:start_link(?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT}, Opts).
+    {Tenant, Consume, Reset, Cache, DLT, ConsumeK} = parse_opts(Opts),
+    gen_server:start_link(?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT, ConsumeK}, Opts).
 
 -if(?DOCATTRS).
 -doc """
@@ -178,8 +216,10 @@ See `start_link/3` for details on `Mod`, `Arg`, and `Opts`.
 -endif.
 -spec start_link(gen_server:server_name(), module(), term(), options()) -> start_ret().
 start_link(Reg, Mod, Arg, Opts) ->
-    {Tenant, Consume, Reset, Cache, DLT} = parse_opts(Opts),
-    gen_server:start_link(Reg, ?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT}, Opts).
+    {Tenant, Consume, Reset, Cache, DLT, ConsumeK} = parse_opts(Opts),
+    gen_server:start_link(
+        Reg, ?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT, ConsumeK}, Opts
+    ).
 
 -if(?DOCATTRS).
 -doc "Sends an asynchronous cast request to the dgen_server's durable queue.".
@@ -308,10 +348,11 @@ parse_opts(Opts) ->
     Reset = proplists:get_value(reset, Opts, false),
     Cache = proplists:get_value(cache, Opts, true),
     DeadLetterThreshold = proplists:get_value(dead_letter_threshold, Opts, infinity),
-    {Tenant, Consume, Reset, Cache, DeadLetterThreshold}.
+    ConsumeK = proplists:get_value(consume_k, Opts, 1),
+    {Tenant, Consume, Reset, Cache, DeadLetterThreshold, ConsumeK}.
 
 -spec init(term()) -> {ok, internalstate()} | {error, term()}.
-init({Tenant, Mod, Arg, Consume, Reset, Cache, DeadLetterThreshold}) ->
+init({Tenant, Mod, Arg, Consume, Reset, Cache, DeadLetterThreshold, ConsumeK}) ->
     case init_tuid(Mod, Arg) of
         {ok, Tuid, InitialState} ->
             State = #state{
@@ -319,7 +360,8 @@ init({Tenant, Mod, Arg, Consume, Reset, Cache, DeadLetterThreshold}) ->
                 mod = Mod,
                 tuid = Tuid,
                 cache = Cache,
-                dead_letter_threshold = DeadLetterThreshold
+                dead_letter_threshold = DeadLetterThreshold,
+                consume_k = ConsumeK
             },
             {_, State1} = init_mod_state(Tenant, InitialState, Reset, State),
             [gen_server:cast(self(), consume) || Consume],
@@ -405,9 +447,7 @@ finalize_inline_call(Result, GsFrom, Tenant) ->
 
 -spec handle_cast(term(), internalstate()) ->
     {noreply, internalstate()} | {stop, term(), internalstate()}.
-handle_cast(consume, State = #state{tenant = Tenant, tuid = Tuid}) ->
-    % 1 at a time because we are limited to 5 seconds per transaction
-    K = 1,
+handle_cast(consume, State = #state{tenant = Tenant, tuid = Tuid, consume_k = K}) ->
     Ret = handle_consume(Tenant, K, Tuid, State),
     case Ret of
         {noreply, #state{watch = undefined, cache_misses = Misses}} when Misses > 0 ->
@@ -456,22 +496,28 @@ terminate(_Reason, _State) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
-invoke_tx_callback(Td, Callback, Args, State = #state{mod = Mod}) ->
+%% Dispatches a callback, preferring the `_tx` variant (which receives a
+%% `tx_ctx()` as its first argument) when the callback module exports it.
+%%
+%% Resolution order for a callback named `handle_foo/N`:
+%%   1. `handle_foo_tx/(N+1)` — receives `#{td, tuid}` prepended to Args
+%%   2. `handle_foo/N`        — standard variant, no tx context
+invoke_tx_callback(Td, Callback, Args, State = #state{mod = Mod, tuid = Tuid}) ->
     T1 = erlang:monotonic_time(millisecond),
     Arity = length(Args) + 1,
+    TxCallback = tx_callback_name(Callback),
+    TxCtx = #{td => Td, tuid => Tuid},
     Result =
-        case erlang:function_exported(Mod, Callback, Arity) of
+        case erlang:function_exported(Mod, TxCallback, Arity + 1) of
             true ->
-                case get_mod_state(Td, State) of
-                    {{ok, ModState}, State1} ->
-                        Args2 = modify_args_for_callback(Callback, Args, ModState),
-                        CallbackResult = erlang:apply(Mod, Callback, Args2),
-                        {ok, ModState, CallbackResult, State1};
-                    {{error, not_found}, _State1} ->
-                        {error, {mod_state_not_found, Mod}}
-                end;
+                dispatch_callback(Td, undefined, Mod, TxCallback, [TxCtx | Args], State);
             false ->
-                {error, {function_not_exported, {Mod, Callback, Arity}}}
+                case erlang:function_exported(Mod, Callback, Arity) of
+                    true ->
+                        dispatch_callback(Td, undefined, Mod, Callback, Args, State);
+                    false ->
+                        {error, {function_not_exported, {Mod, Callback, Arity}}}
+                end
         end,
     T2 = erlang:monotonic_time(millisecond),
     if
@@ -481,17 +527,60 @@ invoke_tx_callback(Td, Callback, Args, State = #state{mod = Mod}) ->
             Result
     end.
 
-invoke_handle_locked_callback(EventType, Msg, ModState, State = #state{mod = Mod}) ->
-    case erlang:function_exported(Mod, handle_locked, 3) of
+dispatch_callback(Td, undefined, Mod, Fn, Args, State) ->
+    case get_mod_state(Td, State) of
+        {{ok, ModState}, State1} when ModState =/= undefined ->
+            {ok, _ModState, CallbackResult} = dispatch_callback(Td, ModState, Mod, Fn, Args, State),
+            {ok, ModState, CallbackResult, State1};
+        {{error, not_found}, _} ->
+            {error, {mod_state_not_found, Mod}}
+    end;
+dispatch_callback(_Td, ModState, Mod, Fn, Args, _State) ->
+    CallbackResult = erlang:apply(Mod, Fn, Args ++ [ModState]),
+    {ok, ModState, CallbackResult}.
+
+%% Like invoke_tx_callback/4 but uses CurrentModState directly instead of reading from FDB.
+invoke_tx_callback_batch(
+    Td, Callback, Args, CurrentModState, State = #state{mod = Mod, tuid = Tuid}
+) ->
+    T1 = erlang:monotonic_time(millisecond),
+    Arity = length(Args) + 1,
+    TxCallback = tx_callback_name(Callback),
+    TxCtx = #{td => Td, tuid => Tuid},
+    Result =
+        case erlang:function_exported(Mod, TxCallback, Arity + 1) of
+            true ->
+                dispatch_callback(Td, CurrentModState, Mod, TxCallback, [TxCtx | Args], State);
+            false ->
+                case erlang:function_exported(Mod, Callback, Arity) of
+                    true ->
+                        dispatch_callback(Td, CurrentModState, Mod, Callback, Args, State);
+                    false ->
+                        {error, {function_not_exported, {Mod, Callback, Arity}}}
+                end
+        end,
+    T2 = erlang:monotonic_time(millisecond),
+    if
+        T2 - T1 > ?TxCallbackTimeout ->
+            erlang:error(tooslow);
         true ->
-            CallbackResult = erlang:apply(Mod, handle_locked, [EventType, Msg, ModState]),
-            {ok, ModState, CallbackResult, State};
-        false ->
-            {error, {function_not_exported, {Mod, handle_locked, 3}}}
+            Result
     end.
 
-modify_args_for_callback(_, Args, ModState) ->
-    Args ++ [ModState].
+tx_callback_name(Callback) ->
+    list_to_atom(atom_to_list(Callback) ++ "_tx").
+
+invoke_handle_locked_callback(
+    EventType, Msg, ModState, State = #state{mod = Mod, tenant = Tenant, tuid = Tuid}
+) ->
+    case erlang:function_exported(Mod, handle_locked, 4) of
+        true ->
+            DbCtx = #{db => Tenant, tuid => Tuid},
+            CallbackResult = erlang:apply(Mod, handle_locked, [DbCtx, EventType, Msg, ModState]),
+            {ok, ModState, CallbackResult, State};
+        false ->
+            {error, {function_not_exported, {Mod, handle_locked, 4}}}
+    end.
 
 delete(Tenant, Tuid) ->
     dgen_backend:transactional(Tenant, fun(Td = {Tx, Dir}) ->
@@ -591,6 +680,32 @@ handle_callback_result(
     {_, State1} = set_mod_state(Td, OrigModState, ModState, State),
     {{stop, Reason, Actions}, ModState, State1}.
 
+%% Batch variant of handle_callback_result: does NOT write mod state to the backend.
+%% consume_batch is responsible for a single set_mod_state call at each exit point.
+%% The lock case still sets the lock key within the transaction, as it must be
+%% atomic with the mod state write and queue consume.
+handle_callback_result_batch(_Td, _EventType, _Msg, {noreply, ModState}, _OrigModState, State) ->
+    {{noreply, []}, ModState, State};
+handle_callback_result_batch(
+    _Td, _EventType, _Msg, {noreply, ModState, Actions}, _OrigModState, State
+) ->
+    {{noreply, Actions}, ModState, State};
+handle_callback_result_batch(_Td, _EventType, _Msg, {reply, Reply, ModState}, _OrigModState, State) ->
+    {{reply, Reply, []}, ModState, State};
+handle_callback_result_batch(
+    _Td, _EventType, _Msg, {reply, Reply, ModState, Actions}, _OrigModState, State
+) ->
+    {{reply, Reply, Actions}, ModState, State};
+handle_callback_result_batch(Td, EventType, Msg, {lock, ModState}, _OrigModState, State) ->
+    State1 = set_lock(Td, State),
+    {{lock, EventType, Msg}, ModState, State1};
+handle_callback_result_batch(_Td, _EventType, _Msg, {stop, Reason, ModState}, _OrigModState, State) ->
+    {{stop, Reason, []}, ModState, State};
+handle_callback_result_batch(
+    _Td, _EventType, _Msg, {stop, Reason, ModState, Actions}, _OrigModState, State
+) ->
+    {{stop, Reason, Actions}, ModState, State}.
+
 finalize({{noreply, Actions}, ModState, State}) ->
     State1 = resolve_version(State),
     _ = handle_actions(Actions, [], ModState),
@@ -633,11 +748,44 @@ handle_consume(Tenant, K, Tuid, State = #state{dead_letter_threshold = Threshold
     case Result of
         {reraise, Class, Reason, Stack} ->
             erlang:raise(Class, Reason, Stack);
+        {lock_batch, PriorActions, EventType, Msg, ModState, State2} ->
+            State3 = resolve_version(State2),
+            _ = handle_actions(PriorActions, [], ModState),
+            consume_locked(EventType, Msg, ModState, false, State3);
         {{lock, EventType, Msg}, ModState, State2} ->
             State3 = resolve_version(State2),
             consume_locked(EventType, Msg, ModState, false, State3);
         _ ->
             finalize(Result)
+    end.
+
+consume_cast_batch(Td, Request, CurrentModState, State) ->
+    case invoke_tx_callback_batch(Td, handle_cast, [Request], CurrentModState, State) of
+        {error, Reason} ->
+            erlang:error(Reason);
+        {ok, OrigModState, CallbackResult} ->
+            handle_callback_result_batch(Td, cast, Request, CallbackResult, OrigModState, State)
+    end.
+
+consume_call_batch(Td, Request, From, CurrentModState, State) ->
+    case invoke_tx_callback_batch(Td, handle_call, [Request, From], CurrentModState, State) of
+        {error, Reason} ->
+            erlang:error(Reason);
+        {ok, OrigModState, CallbackResult} ->
+            handle_callback_result_batch(
+                Td, {call, From}, Request, CallbackResult, OrigModState, State
+            )
+    end.
+
+invoke_queued_msg_batch(Td, {cast, Request, _N}, CurrentModState, State) ->
+    consume_cast_batch(Td, Request, CurrentModState, State);
+invoke_queued_msg_batch(Td, {call, Request, From, _Opts, _N}, CurrentModState, State) ->
+    case consume_call_batch(Td, Request, From, CurrentModState, State) of
+        {{reply, Reply, Actions}, ModState, State2} ->
+            set_reply(Td, From, Reply),
+            {{noreply, Actions}, ModState, State2};
+        Other ->
+            Other
     end.
 
 consume_queued(Td, K, Quid, Threshold, State) ->
@@ -646,36 +794,101 @@ consume_queued(Td, K, Quid, Threshold, State) ->
             Watch = dgen_queue:watch_push(Td, Quid),
             {{noreply, []}, undefined, State#state{watch = Watch}};
         {ok, KVs} ->
-            [{RawKey, RawBin}] = KVs,
-            Envelope = normalize_message(binary_to_term(RawBin)),
-            N = envelope_attempts(Envelope),
-            State1 = State#state{watch = undefined},
-            case is_dead_letter(N, Threshold) of
-                true ->
-                    dgen_queue:consume_peeked(Td, KVs, Quid),
-                    handle_dead_letter_internal(Td, to_dl_envelope(Envelope), N, State1);
-                false ->
-                    try
-                        R = invoke_queued_msg(Td, Envelope, State1),
-                        dgen_queue:consume_peeked(Td, KVs, Quid),
-                        R
-                    catch
-                        Class:Reason:Stack ->
-                            dgen_queue:update_peeked(Td, RawKey, increment_envelope(Envelope)),
-                            {reraise, Class, Reason, Stack}
-                    end
+            case get_mod_state(Td, State) of
+                {{error, not_found}, _} ->
+                    #state{mod = Mod} = State,
+                    erlang:error({mod_state_not_found, Mod});
+                {{ok, InitModState}, State1} ->
+                    consume_batch(
+                        Td,
+                        KVs,
+                        Quid,
+                        Threshold,
+                        State1#state{watch = undefined},
+                        [],
+                        [],
+                        InitModState,
+                        InitModState
+                    )
             end
     end.
 
-invoke_queued_msg(Td, {cast, Request, _N}, State) ->
-    consume_cast(Td, Request, State);
-invoke_queued_msg(Td, {call, Request, From, _Opts, _N}, State) ->
-    case consume_call(Td, Request, From, State) of
-        {{reply, Reply, Actions}, ModState, State2} ->
-            set_reply(Td, From, Reply),
-            {{noreply, Actions}, ModState, State2};
-        Other ->
-            Other
+%% Processes peeked KVs one at a time, carrying mod state in memory.
+%% Mod state is read once (in consume_queued) and written once at each exit point,
+%% avoiding repeated FDB reads/writes due to set_versionstamped_value not being
+%% visible in read-your-own-writes within the same transaction.
+%%
+%% Parameters:
+%%   8th — CurrentModState: mod state produced by the last successfully invoked callback
+%%   9th — InitModState: mod state at the start of the batch, used for diff-based writes
+consume_batch(Td, [], Quid, _Threshold, State, AccActions, AccKVs, CurrentModState, InitModState) ->
+    {_, State1} = set_mod_state(Td, InitModState, CurrentModState, State),
+    dgen_queue:consume_peeked(Td, lists:reverse(AccKVs), Quid),
+    FinalActions = lists:append(lists:reverse(AccActions)),
+    {{noreply, FinalActions}, CurrentModState, State1#state{cache_misses = 0}};
+consume_batch(
+    Td,
+    [{RawKey, RawBin} | Rest],
+    Quid,
+    Threshold,
+    State,
+    AccActions,
+    AccKVs,
+    CurrentModState,
+    InitModState
+) ->
+    Envelope = normalize_message(binary_to_term(RawBin)),
+    N = envelope_attempts(Envelope),
+    case is_dead_letter(N, Threshold) of
+        true ->
+            AllKVs = lists:reverse([{RawKey, RawBin} | AccKVs]),
+            {_, State1} = set_mod_state(Td, InitModState, CurrentModState, State),
+            dgen_queue:consume_peeked(Td, AllKVs, Quid),
+            handle_dead_letter_internal(Td, to_dl_envelope(Envelope), N, State1);
+        false ->
+            try invoke_queued_msg_batch(Td, Envelope, CurrentModState, State) of
+                {{noreply, Actions}, NewModState, State1} ->
+                    consume_batch(
+                        Td,
+                        Rest,
+                        Quid,
+                        Threshold,
+                        State1,
+                        [Actions | AccActions],
+                        [{RawKey, RawBin} | AccKVs],
+                        NewModState,
+                        InitModState
+                    );
+                {{lock, EventType, Msg}, ModState, State1} ->
+                    AllKVs = lists:reverse([{RawKey, RawBin} | AccKVs]),
+                    {_, State2} = set_mod_state(Td, InitModState, ModState, State1),
+                    dgen_queue:consume_peeked(Td, AllKVs, Quid),
+                    PriorActions = lists:append(lists:reverse(AccActions)),
+                    State3 = State2#state{cache_misses = 0},
+                    case PriorActions of
+                        [] -> {{lock, EventType, Msg}, ModState, State3};
+                        _ -> {lock_batch, PriorActions, EventType, Msg, ModState, State3}
+                    end;
+                {{stop, Reason, Actions}, ModState, State1} ->
+                    AllKVs = lists:reverse([{RawKey, RawBin} | AccKVs]),
+                    {_, State2} = set_mod_state(Td, InitModState, ModState, State1),
+                    dgen_queue:consume_peeked(Td, AllKVs, Quid),
+                    All = lists:append(lists:reverse([Actions | AccActions])),
+                    {{stop, Reason, All}, ModState, State2#state{cache_misses = 0}}
+            catch
+                Class:Reason:Stack ->
+                    case AccKVs of
+                        [] ->
+                            ok;
+                        _ ->
+                            % Write mod state for successfully processed prior messages
+                            % before committing their dequeues.
+                            set_mod_state(Td, InitModState, CurrentModState, State),
+                            dgen_queue:consume_peeked(Td, lists:reverse(AccKVs), Quid)
+                    end,
+                    dgen_queue:update_peeked(Td, RawKey, increment_envelope(Envelope)),
+                    {reraise, Class, Reason, Stack}
+            end
     end.
 
 envelope_attempts({cast, _R, N}) -> N;
@@ -837,7 +1050,8 @@ set_lock({Tx, Dir}, State = #state{tuid = Tuid}) ->
 clear_lock(Td = {Tx, Dir}, #state{tuid = Tuid}) ->
     B = dgen_config:backend(),
     LockKey = B:dir_pack(Dir, get_lock_key(Tuid)),
-    B:clear_range(Tx, LockKey, B:key_strinc(LockKey)),
+    LockEnd = B:key_strinc(LockKey),
+    B:clear_range(Tx, LockKey, LockEnd),
     dgen_queue:notify(Td, get_quid(Tuid)).
 
 get_lock_key(Tuid) ->

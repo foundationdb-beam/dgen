@@ -1,12 +1,12 @@
-defmodule DGenServer.Test do
+defmodule DGen.Server.Test do
   use DGen.Case, async: true
-  doctest DGenServer
+  doctest DGen.Server
 
   alias DGen.DCounter
 
   defp kill(pid) do
     mref = Process.monitor(pid)
-    DGenServer.kill(pid, :normal)
+    DGen.Server.kill(pid, :normal)
 
     receive do
       {:DOWN, ^mref, :process, ^pid, :normal} -> :ok
@@ -82,7 +82,7 @@ defmodule DGenServer.Test do
       {:ok, pid} = DCounter.start_link(tenant, {"a"})
       assert 0 = DCounter.get(pid)
 
-      cast = DGenServer.outbox_cast(pid)
+      cast = DGen.Server.outbox_cast(pid)
 
       :erlfdb.transactional(db, fn tx ->
         cast.(tx, {:incr, 5})

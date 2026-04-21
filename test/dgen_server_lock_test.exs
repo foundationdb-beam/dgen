@@ -1,11 +1,11 @@
-defmodule DGenServer.LockTest do
+defmodule DGen.Server.LockTest do
   use DGen.Case, async: true
 
   alias DGen.DLocker
 
   defp kill(pid) do
     mref = Process.monitor(pid)
-    DGenServer.kill(pid, :normal)
+    DGen.Server.kill(pid, :normal)
 
     receive do
       {:DOWN, ^mref, :process, ^pid, :normal} -> :ok

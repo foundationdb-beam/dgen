@@ -62,16 +62,16 @@ dgen_server:stop(Pid),
 
 ### Elixir
 
-The simplest distributed server is just a regular GenServer with `use DGenServer`:
+The simplest distributed server is just a regular GenServer with `use DGen.Server`:
 
 ```elixir
 defmodule Counter do
-  use DGenServer
+  use DGen.Server
 
-  def start(tenant), do: DGenServer.start(__MODULE__, [], tenant: tenant)
+  def start(tenant), do: DGen.Server.start(__MODULE__, [], tenant: tenant)
 
-  def increment(pid), do: DGenServer.cast(pid, :increment)
-  def value(pid), do: DGenServer.call(pid, :value)
+  def increment(pid), do: DGen.Server.cast(pid, :increment)
+  def value(pid), do: DGen.Server.call(pid, :value)
 
   @impl true
   def init([]), do: {:ok, 0}
@@ -147,7 +147,7 @@ A callback may return `{lock, State}` to enter locked mode. When locked:
 
 - Standard `call` and `cast` messages are queued but not processed
 - Priority messages and `handle_info` continue to execute
-- The `handle_locked/3` callback is invoked outside of a transaction
+- The `handle_locked/4` callback is invoked outside of a transaction
   - Not subject to FDB transaction limits
   - Side effects are permitted
   - Can modify state, which is written back to the database
@@ -203,7 +203,7 @@ The cache is invalidated when the process detects that another consumer has modi
 
 ### Crashing
 
-DGenServer has well-defined behavior during crashes.
+DGen.Server has well-defined behavior during crashes.
 
 **Key guarantee:** Standard `call` and `cast` messages are processed **exactly-once** under normal operation. In the event of a crash before the transaction commits, the message will be retried — so in crash scenarios, delivery is **at-least-once**. When `dead_letter_threshold` is set, retries are bounded by that limit. Design your callbacks to be idempotent when possible.
 
@@ -240,7 +240,7 @@ dgen_server:start(MyMod, [], [{tenant, Tenant}, {dead_letter_threshold, 3}])
 ### Elixir
 
 ```elixir
-DGenServer.start_link(MyMod, [], tenant: tenant, dead_letter_threshold: 3)
+DGen.Server.start_link(MyMod, [], tenant: tenant, dead_letter_threshold: 3)
 ```
 
 <!-- tabs-close -->

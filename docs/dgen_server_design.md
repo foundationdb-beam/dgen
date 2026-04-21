@@ -1,4 +1,4 @@
-# Design Details
+# dgen_server Design
 
 A dgen_server is an abstract entity that is composed of (i) state and (ii) operations on state. The state is
 stored in a durable fashion in a distributed key-value store, such as FoundationDB. The operations are defined
@@ -12,8 +12,10 @@ strict serializability to guarantee that your operations yield consistent result
 
 ## API Terms
 
-- **tenant**: A pairing of the database object (`erlfdb_database`) and a directory (`erlfdb_directory`) that
-  defines a subspace of the keyset that is partitioned for some purpose as defined by the developer.
+- **backend**: A dgen backend implementation will interface with a database. The provided backend is for FoundationDB
+  using `erlfdb`. We are hopeful that other compatible backends can be contributed eventually.
+- **tenant**: A pairing of a database handle and a directory handle, as provided by the backend,
+  that defines a subspace of the keyset partitioned for some purpose as defined by the developer.
 - **key-tuple**: A tuple that is to be encoded into a binary for storage as a key in a key-value pair
   inside a tenant subspace. Any key-tuple may be further extended by inserting a new item at the end
   of the tuple. In such a case, the original key-tuple becomes a prefix key-tuple, and can be thought
@@ -41,7 +43,7 @@ strict serializability to guarantee that your operations yield consistent result
 - **waiting-key**: A prefix key-tuple that contains all entities waiting on the result of some call-request.
 - **reply-sentinel-key**: The first chunk key of the reply term under the from-key. The reply is stored
   using chunked term encoding (`{From, <<"t">>, 0}`, `{From, <<"t">>, 1}`, ...) so that replies
-  can exceed the FDB single-value size limit. The FDB watch is placed on the reply-sentinel-key
+  can exceed the backend's single-value size limit. The backend watch is placed on the reply-sentinel-key
   (chunk 0). The client reads the reply via `get_range` and clears it via `clear_range`.
 - **quid**: Unique tuple identifier for the queue. It is a prefix key-tuple that contains all key-values for the message-queue.
 - **item-key**: A key-tuple that identifies an item in the queue (i.e. a call-request or cast-request).
@@ -78,3 +80,25 @@ reply key is eliminated.
 6. The consumer updates the state.
 7. The consumer commits the transaction.
 8. The consumer executes the side-effects.
+
+## Lock Flow
+
+A callback may return `{lock, NewState}` instead of `{noreply, NewState}` or `{reply, …}`.
+This is useful when a state change requires synchronous post-commit coordination before
+the next queue message can be safely processed.
+
+1. The callback returns `{lock, NewState}`.
+2. The consumer commits `NewState` to the DB **and** writes a lock key (`{Tuid, <<"k">>}`) in
+   the same transaction.
+3. Any other consumer that tries to consume from the queue reads `is_locked = true`
+   and parks itself on a DB watch instead of processing.
+4. The consumer that set the lock calls `handle_locked/4` with the **same** event type and
+   message that triggered the lock, plus the committed `NewState`.  This is the synchronous
+   coordination window.
+5. After `handle_locked/4` returns (regardless of its return value), the lock key is cleared
+   and the queue watch is notified in an `after` block — always, even on exception.
+6. Parked consumers wake up, see `is_locked = false`, and resume normal queue consumption.
+
+The lock therefore guarantees that between committing a state change and resuming queue
+consumption, one designated node performs a synchronous coordination step with no risk of
+another node racing ahead.
