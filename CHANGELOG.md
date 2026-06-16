@@ -12,15 +12,32 @@
   or write arbitrary keys atomically alongside the module-state commit.  The new
   `tx_ctx/0` type is exported from `dgen_server`.
 
-- **`dgen_registry`** — an OTP-compatible process registry backed by the configured
-  storage backend.  Implements the four-function `{via, dgen_registry, {Name, LogicalName}}`
-  contract so standard OTP processes (`gen_server`, `gen_statem`, etc.) can be started
-  and addressed by name across an Erlang cluster.  Writes and consistent reads go through
-  an elected leader; `whereis_name/1` (used by OTP via-tuple routing) is a snapshot read
-  from the local member's in-memory map with no backend round-trip.  The leader monitors
-  registered pids and propagates `{name_unregistered}` to followers on process exit.
-  Start with `dgen_registry:start_link(Name, Tenant)` and supply a supervisor name as
-  the first argument to `start_link/3` to embed it in an existing supervision tree.
+- **`lock_timeout` option for `dgen_server`** — Sets the maximum milliseconds a
+  distributed lock may be held before other consumers treat it as stale and
+  clear it.  Previously a consumer killed (SIGKILL / VM abort) while holding
+  the lock would block all other consumers permanently if no new messages
+  arrived to trigger a re-check.  With `lock_timeout` set, a backstop timer is
+  scheduled whenever a live lock is observed: after the remaining timeout the
+  consumer re-evaluates staleness and clears the lock if the holder has not
+  done so.  `infinity` (the default) preserves the previous behaviour.
+  `dgen_registry` uses `lock_timeout: 6_000`.
+
+- **`dgen_registry`** — Experimental. An OTP-compatible process registry backed by the
+  configured storage backend.  Implements the four-function
+  `{via, dgen_registry, {Name, LogicalName}}` contract so standard OTP
+  processes (`gen_server`, `gen_statem`, etc.) can be started and addressed by
+  name across an Erlang cluster.  Writes and consistent reads go through an
+  elected leader; `whereis_name/1` (used by OTP via-tuple routing) is a
+  snapshot read from the local member's in-memory map with no backend
+  round-trip.  The leader monitors registered pids and propagates
+  `{name_unregistered}` to followers on process exit.  Start with
+  `dgen_registry:start_link(Name, Tenant)` and supply a supervisor name as the
+  first argument to `start_link/3` to embed it in an existing supervision tree.
+
+  Partition recovery is reliable: each join carries a unique token so stale
+  `member_down` messages from before a reconnect are discarded rather than
+  undoing the rejoin.  Leader transitions during a partition no longer
+  trigger automatic distribution reconnect.
 
 ### Breaking changes
 

@@ -33,6 +33,18 @@ The following options may be passed via the `Opts` proplist:
   `handle_dead_letter/2` callback is invoked. `infinity` (the default) disables
   dead-lettering entirely.
 
+- `lock_timeout` (default `infinity`) - maximum number of milliseconds a
+  distributed lock may be held before other consumers treat it as stale.  When
+  a callback returns `{lock, State}`, `dgen_server` sets a timestamped lock key
+  in the backend that pauses all other consumers while `handle_locked/4` runs.
+  Under normal operation the lock holder clears the key itself before
+  `handle_locked` returns.  If the holder is killed (SIGKILL, VM abort) the
+  lock persists until another consumer detects staleness: it re-checks
+  `lock_timeout` ms after the lock was set and clears it if that deadline has
+  passed.  `infinity` (the default) disables stale-lock detection entirely —
+  a dead holder will permanently block all consumers.  Set this to a value
+  safely larger than the worst-case `handle_locked` duration for your callback.
+
 ## Callbacks
 
 - `init/1` - return `{ok, State}` or `{ok, Tuid, State}`.
@@ -486,6 +498,11 @@ handle_info({Ref, ready}, State = #state{watch = ?FUTURE(Ref)}) ->
     handle_cast(consume, State#state{watch = undefined});
 handle_info(consume_after_penalty, State) ->
     handle_cast(consume, State);
+handle_info(recheck_lock, State) ->
+    %% Fired by the timer scheduled in handle_consume when the lock was not yet
+    %% stale.  Re-enter the consume loop so check_lock is re-evaluated; if
+    %% the lock holder died without clearing the lock, it will now be stale.
+    handle_cast(consume, State);
 handle_info(Info, State = #state{tenant = Tenant}) ->
     Result = dgen_backend:transactional(Tenant, fun(Td) ->
         consume_info(Td, Info, State)
@@ -741,18 +758,29 @@ get_state_key(Tuple) ->
 handle_consume(Tenant, K, Tuid, State = #state{dead_letter_threshold = Threshold}) ->
     Quid = get_quid(Tuid),
     Result = dgen_backend:transactional(Tenant, fun(Td) ->
-        case is_locked(Td, State) of
-            true ->
-                case is_stale_lock(Td, State) of
-                    true ->
-                        clear_lock(Td, State),
-                        consume_queued(Td, K, Quid, Threshold, State);
-                    false ->
-                        Watch = dgen_queue:watch_push(Td, Quid),
-                        {{noreply, []}, undefined, State#state{watch = Watch}}
-                end;
-            false ->
-                consume_queued(Td, K, Quid, Threshold, State)
+        case check_lock(Td, State) of
+            not_locked ->
+                consume_queued(Td, K, Quid, Threshold, State);
+            stale ->
+                clear_lock(Td, State),
+                consume_queued(Td, K, Quid, Threshold, State);
+            {live, Remaining} ->
+                %% Lock is held but not yet stale.  Set a queue watch
+                %% for the fast path (lock cleared normally fires
+                %% notify → push key changes → watch fires).  Also
+                %% schedule a timer so that if the lock holder is
+                %% killed without clearing the lock and no new messages
+                %% arrive, we still re-evaluate staleness after the
+                %% remaining timeout — guaranteeing recovery even on a
+                %% perfectly quiet queue.
+                Watch = dgen_queue:watch_push(Td, Quid),
+                Action = fun(_) ->
+                    case Remaining of
+                        infinity -> ok;
+                        Ms -> erlang:send_after(Ms, self(), recheck_lock)
+                    end
+                end,
+                {{noreply, [Action]}, undefined, State#state{watch = Watch}}
         end
     end),
     case Result of
@@ -1057,23 +1085,33 @@ set_lock({Tx, Dir}, State = #state{tuid = Tuid}) ->
     B:set(Tx, B:dir_pack(Dir, get_lock_key(Tuid)), term_to_binary(erlang:system_time(millisecond))),
     State.
 
-is_stale_lock(_Td, #state{lock_timeout = infinity}) ->
-    false;
-is_stale_lock({Tx, Dir}, #state{tuid = Tuid, lock_timeout = Timeout}) ->
+%% Single read of the lock key — returns not_locked | stale | {live, infinity | Ms}.
+%% Used by handle_consume to decide in one pass whether to clear, sleep, or proceed.
+check_lock({Tx, Dir}, #state{tuid = Tuid, lock_timeout = Timeout}) ->
     B = dgen_config:backend(),
     case B:wait(B:get(Tx, B:dir_pack(Dir, get_lock_key(Tuid)))) of
         not_found ->
-            false;
+            not_locked;
         <<>> ->
-            % backward compatibility: v0.2.0 used empty binary in lock's value
-            false;
+            %% backward compat: v0.2.0 used empty binary (no timestamp) — treat
+            %% as live with no timeout so we never falsely clear a legitimate lock.
+            {live, infinity};
         Value ->
-            % v0.3.0 introduced the lock timestamp for detecting the lock_timeout
-            case binary_to_term(Value) of
+            %% v0.3.0+ stores the set-time as a millisecond timestamp so we can
+            %% compute both staleness and the remaining wait in one decode.
+            case (catch binary_to_term(Value)) of
                 Ts when is_integer(Ts) ->
-                    erlang:system_time(millisecond) - Ts > Timeout;
+                    Elapsed = erlang:system_time(millisecond) - Ts,
+                    case Timeout of
+                        infinity ->
+                            {live, infinity};
+                        _ when Elapsed > Timeout ->
+                            stale;
+                        _ ->
+                            {live, Timeout - Elapsed}
+                    end;
                 _ ->
-                    false
+                    {live, infinity}
             end
     end.
 
@@ -1087,14 +1125,8 @@ clear_lock(Td = {Tx, Dir}, #state{tuid = Tuid}) ->
 get_lock_key(Tuid) ->
     dgen_key:extend(Tuid, <<"k">>).
 
-is_locked({Tx, Dir}, #state{tuid = Tuid}) ->
-    B = dgen_config:backend(),
-    case B:wait(B:get(Tx, B:dir_pack(Dir, get_lock_key(Tuid)))) of
-        not_found ->
-            false;
-        _ ->
-            true
-    end.
+is_locked(Td, State) ->
+    check_lock(Td, State) =/= not_locked.
 
 get_quid(Tuple) ->
     dgen_key:extend(Tuple, <<"q">>).

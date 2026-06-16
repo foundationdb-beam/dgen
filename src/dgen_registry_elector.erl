@@ -39,8 +39,6 @@ sequence before the lock clears:
    cross-node calls in `handle_locked/4`.  An Erlang `after` block
    guarantees the lock is cleared even if `handle_locked` raises; only a
    hard process kill (SIGKILL / VM abort) can leave it permanently set.
-   TODO - this still isn't good enough, need the timeout to allow deadlock recovery in all cases
-
 2. **Snapshot acquisition** — `handle_locked/4` decides what names snapshot
    the new leader starts with:
    - If the new leader is a brand-new member with no prior follower state
