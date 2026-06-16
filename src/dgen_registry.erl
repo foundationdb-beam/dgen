@@ -81,6 +81,7 @@ follower members.
     %% Convenience queries
     get_leader/1,
     get_members/1,
+    get_epoch/1,
     %% Name derivation helpers (exported for tests / introspection)
     elector_name/1,
     member_name/1
@@ -205,6 +206,13 @@ get_leader(Name) ->
     dgen_server:priority_call(elector_name(Name), get_leader).
 
 -if(?DOCATTRS).
+-doc "Returns the current leader epoch. Increments each time a new leader is elected.".
+-endif.
+-spec get_epoch(Name :: atom()) -> non_neg_integer().
+get_epoch(Name) ->
+    dgen_server:priority_call(elector_name(Name), get_epoch).
+
+-if(?DOCATTRS).
 -doc "Returns the list of all current member ids in the registry.".
 -endif.
 -spec get_members(Name :: atom()) -> [dgen_registry_elector:member_id()].
@@ -249,7 +257,7 @@ init({Name, Tenant}) ->
                 {local, ElectorName},
                 dgen_registry_elector,
                 #{name => Name},
-                [{tenant, Tenant}, {consume_k, 50}]
+                [{tenant, Tenant}, {consume_k, 50}, {lock_timeout, 6000}]
             ]},
         restart => permanent,
         shutdown => 5000,

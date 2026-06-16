@@ -125,6 +125,7 @@ argument is the
     | {reset, boolean()}
     | {cache, boolean()}
     | {dead_letter_threshold, pos_integer() | infinity}
+    | {lock_timeout, pos_integer() | infinity}
     | gen_server:start_opt().
 -type options() :: [option()].
 -type start_ret() :: gen_server:start_ret().
@@ -163,7 +164,8 @@ argument is the
         | {dgen_backend:versionstamp() | dgen_backend:future(), {ok, term()} | {error, not_found}},
     cache_misses = 0 :: non_neg_integer(),
     dead_letter_threshold = infinity :: pos_integer() | infinity,
-    consume_k = 1 :: pos_integer()
+    consume_k = 1 :: pos_integer(),
+    lock_timeout = infinity :: pos_integer() | infinity
 }).
 
 -type internalstate() :: #state{}.
@@ -177,8 +179,8 @@ See `start_link/3` for details on `Mod`, `Arg`, and `Opts`.
 -endif.
 -spec start(module(), term(), options()) -> start_ret().
 start(Mod, Arg, Opts) ->
-    {Tenant, Consume, Reset, Cache, DLT, ConsumeK} = parse_opts(Opts),
-    gen_server:start(?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT, ConsumeK}, Opts).
+    {Tenant, Consume, Reset, Cache, DLT, ConsumeK, LockTimeout} = parse_opts(Opts),
+    gen_server:start(?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT, ConsumeK, LockTimeout}, Opts).
 
 -if(?DOCATTRS).
 -doc """
@@ -189,8 +191,8 @@ See `start_link/3` for details on `Mod`, `Arg`, and `Opts`.
 -endif.
 -spec start(gen_server:server_name(), module(), term(), options()) -> start_ret().
 start(Reg, Mod, Arg, Opts) ->
-    {Tenant, Consume, Reset, Cache, DLT, ConsumeK} = parse_opts(Opts),
-    gen_server:start(Reg, ?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT, ConsumeK}, Opts).
+    {Tenant, Consume, Reset, Cache, DLT, ConsumeK, LockTimeout} = parse_opts(Opts),
+    gen_server:start(Reg, ?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT, ConsumeK, LockTimeout}, Opts).
 
 -if(?DOCATTRS).
 -doc """
@@ -204,8 +206,8 @@ Starts a dgen_server process linked to the calling process.
 -endif.
 -spec start_link(module(), term(), options()) -> start_ret().
 start_link(Mod, Arg, Opts) ->
-    {Tenant, Consume, Reset, Cache, DLT, ConsumeK} = parse_opts(Opts),
-    gen_server:start_link(?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT, ConsumeK}, Opts).
+    {Tenant, Consume, Reset, Cache, DLT, ConsumeK, LockTimeout} = parse_opts(Opts),
+    gen_server:start_link(?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT, ConsumeK, LockTimeout}, Opts).
 
 -if(?DOCATTRS).
 -doc """
@@ -216,9 +218,9 @@ See `start_link/3` for details on `Mod`, `Arg`, and `Opts`.
 -endif.
 -spec start_link(gen_server:server_name(), module(), term(), options()) -> start_ret().
 start_link(Reg, Mod, Arg, Opts) ->
-    {Tenant, Consume, Reset, Cache, DLT, ConsumeK} = parse_opts(Opts),
+    {Tenant, Consume, Reset, Cache, DLT, ConsumeK, LockTimeout} = parse_opts(Opts),
     gen_server:start_link(
-        Reg, ?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT, ConsumeK}, Opts
+        Reg, ?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT, ConsumeK, LockTimeout}, Opts
     ).
 
 -if(?DOCATTRS).
@@ -349,10 +351,11 @@ parse_opts(Opts) ->
     Cache = proplists:get_value(cache, Opts, true),
     DeadLetterThreshold = proplists:get_value(dead_letter_threshold, Opts, infinity),
     ConsumeK = proplists:get_value(consume_k, Opts, 1),
-    {Tenant, Consume, Reset, Cache, DeadLetterThreshold, ConsumeK}.
+    LockTimeout = proplists:get_value(lock_timeout, Opts, infinity),
+    {Tenant, Consume, Reset, Cache, DeadLetterThreshold, ConsumeK, LockTimeout}.
 
 -spec init(term()) -> {ok, internalstate()} | {error, term()}.
-init({Tenant, Mod, Arg, Consume, Reset, Cache, DeadLetterThreshold, ConsumeK}) ->
+init({Tenant, Mod, Arg, Consume, Reset, Cache, DeadLetterThreshold, ConsumeK, LockTimeout}) ->
     case init_tuid(Mod, Arg) of
         {ok, Tuid, InitialState} ->
             State = #state{
@@ -361,7 +364,8 @@ init({Tenant, Mod, Arg, Consume, Reset, Cache, DeadLetterThreshold, ConsumeK}) -
                 tuid = Tuid,
                 cache = Cache,
                 dead_letter_threshold = DeadLetterThreshold,
-                consume_k = ConsumeK
+                consume_k = ConsumeK,
+                lock_timeout = LockTimeout
             },
             {_, State1} = init_mod_state(Tenant, InitialState, Reset, State),
             [gen_server:cast(self(), consume) || Consume],
@@ -739,8 +743,14 @@ handle_consume(Tenant, K, Tuid, State = #state{dead_letter_threshold = Threshold
     Result = dgen_backend:transactional(Tenant, fun(Td) ->
         case is_locked(Td, State) of
             true ->
-                Watch = dgen_queue:watch_push(Td, Quid),
-                {{noreply, []}, undefined, State#state{watch = Watch}};
+                case is_stale_lock(Td, State) of
+                    true ->
+                        clear_lock(Td, State),
+                        consume_queued(Td, K, Quid, Threshold, State);
+                    false ->
+                        Watch = dgen_queue:watch_push(Td, Quid),
+                        {{noreply, []}, undefined, State#state{watch = Watch}}
+                end;
             false ->
                 consume_queued(Td, K, Quid, Threshold, State)
         end
@@ -1044,8 +1054,28 @@ resolve_version(State) ->
 
 set_lock({Tx, Dir}, State = #state{tuid = Tuid}) ->
     B = dgen_config:backend(),
-    B:set(Tx, B:dir_pack(Dir, get_lock_key(Tuid)), <<>>),
+    B:set(Tx, B:dir_pack(Dir, get_lock_key(Tuid)), term_to_binary(erlang:system_time(millisecond))),
     State.
+
+is_stale_lock(_Td, #state{lock_timeout = infinity}) ->
+    false;
+is_stale_lock({Tx, Dir}, #state{tuid = Tuid, lock_timeout = Timeout}) ->
+    B = dgen_config:backend(),
+    case B:wait(B:get(Tx, B:dir_pack(Dir, get_lock_key(Tuid)))) of
+        not_found ->
+            false;
+        <<>> ->
+            % backward compatibility: v0.2.0 used empty binary in lock's value
+            false;
+        Value ->
+            % v0.3.0 introduced the lock timestamp for detecting the lock_timeout
+            case binary_to_term(Value) of
+                Ts when is_integer(Ts) ->
+                    erlang:system_time(millisecond) - Ts > Timeout;
+                _ ->
+                    false
+            end
+    end.
 
 clear_lock(Td = {Tx, Dir}, #state{tuid = Tuid}) ->
     B = dgen_config:backend(),

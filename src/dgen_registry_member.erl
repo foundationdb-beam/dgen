@@ -68,6 +68,21 @@ The leader is the sole writer for the name table. It:
 On relinquishing leadership the member demonitors all registered Pids and
 clears the leader-only state.  The `names` map is kept intact (it still
 serves snapshot reads).
+
+## Failure model
+
+Name-to-pid mappings are intentionally not stored in the backend.  As a
+result:
+
+- **Leader crash**: the new leader starts with `self_snapshot` — its own
+  in-memory follower replica.  Any registrations the dead leader committed
+  to its map but had not yet broadcast to followers are silently lost.
+  A caller that received `yes` from `register_name/2` may find the name
+  absent after a leader failover.  Re-registration after detecting the loss
+  is the caller's responsibility.
+
+- **Full cluster restart**: all registered names are lost.  Applications
+  must re-register on startup.
 """.
 -endif.
 
@@ -86,7 +101,18 @@ serves snapshot reads).
     monitors :: #{reference() => dgen_registry_elector:member_id()},
     %% Registered-process monitors (leader only)
     name_to_ref :: #{term() => reference()},
-    ref_to_name :: #{reference() => term()}
+    ref_to_name :: #{reference() => term()},
+    %% Token used in our own {join, Self, Token} announcement.  Refreshed on
+    %% each nodeup so any stale {member_down, Self, OldToken} in the queue is
+    %% discarded by the elector.
+    join_token :: reference(),
+    %% Tokens received from the elector via snapshots, keyed by peer MemberId.
+    %% Echoed back in {member_down, PeerId, Token} so the elector can distinguish
+    %% a stale DOWN (from before a re-join) from a fresh one.
+    peer_tokens :: #{dgen_registry_elector:member_id() => reference()},
+    %% Monotonically increasing leader term counter set by the elector.
+    %% Broadcasts from a prior leader carry a smaller epoch and are discarded.
+    epoch :: non_neg_integer()
 }).
 
 %% ---------------------------------------------------------------------------
@@ -107,9 +133,10 @@ start_link(Name, Args) ->
 init(#{elector := Elector, member_name := MemberName}) ->
     MemberId = {node(), MemberName},
     net_kernel:monitor_nodes(true),
+    Token = make_ref(),
     %% Announce presence; the elector will call {elector_assume_and_distribute}
     %% on the new leader, which then sends {apply_names_snapshot} to this member.
-    dgen_server:cast(Elector, {join, MemberId}),
+    dgen_server:cast(Elector, {join, MemberId, Token}),
     {ok, #state{
         member_id = MemberId,
         elector = Elector,
@@ -118,7 +145,10 @@ init(#{elector := Elector, member_name := MemberName}) ->
         members = #{},
         monitors = #{},
         name_to_ref = #{},
-        ref_to_name = #{}
+        ref_to_name = #{},
+        join_token = Token,
+        peer_tokens = #{},
+        epoch = 0
     }}.
 
 %% ---------------------------------------------------------------------------
@@ -131,7 +161,7 @@ init(#{elector := Elector, member_name := MemberName}) ->
 handle_call(
     {register, LogicalName, Pid},
     _From,
-    State = #state{leader = Leader, member_id = Leader}
+    State = #state{leader = Leader, member_id = Leader, epoch = Epoch}
 ) ->
     #state{names = Names, members = Members, name_to_ref = NTR, ref_to_name = RTN} = State,
     case maps:is_key(LogicalName, Names) of
@@ -139,7 +169,7 @@ handle_call(
             {reply, no, State};
         false ->
             Ref = erlang:monitor(process, Pid),
-            broadcast_to_peers(Members, {name_registered, LogicalName, Pid}),
+            broadcast_to_peers(Members, {name_registered, LogicalName, Pid, Epoch}),
             {reply, yes, State#state{
                 names = Names#{LogicalName => Pid},
                 name_to_ref = NTR#{LogicalName => Ref},
@@ -232,7 +262,7 @@ handle_call(
 %% to every follower from its own process (maintaining FIFO ordering with
 %% subsequent `{name_registered}` broadcasts).
 handle_call(
-    {elector_assume_and_distribute, Snapshot, MemberId, AllIds},
+    {elector_assume_and_distribute, Snapshot, MemberId, AllIds, Tokens, Epoch},
     _From,
     State = #state{member_id = Self, leader = OldLeader}
 ) ->
@@ -243,16 +273,20 @@ handle_call(
             NamesList -> State1#state{names = maps:from_list(NamesList)}
         end,
     State3 = add_member_monitors(extra_member_ids(MemberId, AllIds, Self), State2),
-    Names = maps:to_list(State3#state.names),
+    State4 = merge_peer_tokens(Tokens, State3),
+    State5 = State4#state{epoch = Epoch},
+    Names = maps:to_list(State5#state.names),
     lists:foreach(
         fun(Id) ->
             cast_to_member(
-                Id, {apply_names_snapshot, Names, Self, extra_member_ids(MemberId, AllIds, Id)}
+                Id,
+                {apply_names_snapshot, Names, Self, extra_member_ids(MemberId, AllIds, Id), Tokens,
+                    Epoch}
             )
         end,
         lists:delete(Self, AllIds)
     ),
-    {reply, ok, State3};
+    {reply, ok, State5};
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
 
@@ -260,25 +294,45 @@ handle_call(_Request, _From, State) ->
 %% handle_cast/2
 %% ---------------------------------------------------------------------------
 
-handle_cast({name_registered, LogicalName, Pid}, State = #state{names = Names}) ->
-    {noreply, State#state{names = Names#{LogicalName => Pid}}};
-handle_cast({name_unregistered, LogicalName}, State = #state{names = Names}) ->
-    {noreply, State#state{names = maps:remove(LogicalName, Names)}};
+handle_cast(
+    {name_registered, LogicalName, Pid, Epoch},
+    State = #state{names = Names, epoch = CurrentEpoch}
+) ->
+    case Epoch >= CurrentEpoch of
+        true -> {noreply, State#state{names = Names#{LogicalName => Pid}}};
+        false -> {noreply, State}
+    end;
+handle_cast(
+    {name_unregistered, LogicalName, Epoch},
+    State = #state{names = Names, epoch = CurrentEpoch}
+) ->
+    case Epoch >= CurrentEpoch of
+        true -> {noreply, State#state{names = maps:remove(LogicalName, Names)}};
+        false -> {noreply, State}
+    end;
 %% Leadership transition snapshot sent by the new leader to all followers.
 %% Applies the leader transition, the names update, and extra member monitors
 %% atomically within a single cast — no other message can interleave.
 handle_cast(
-    {apply_names_snapshot, NamesList, NewLeader, ExtraMembers},
-    State = #state{member_id = Self, leader = OldLeader}
+    {apply_names_snapshot, NamesList, NewLeader, ExtraMembers, Tokens, Epoch},
+    State = #state{member_id = Self, leader = OldLeader, epoch = CurrentEpoch}
 ) ->
-    State1 = do_leader_changed(NewLeader, OldLeader, Self, State),
-    State2 = State1#state{names = maps:from_list(NamesList)},
-    {noreply, add_member_monitors(ExtraMembers, State2)};
+    case Epoch >= CurrentEpoch of
+        true ->
+            State1 = do_leader_changed(NewLeader, OldLeader, Self, State),
+            State2 = State1#state{names = maps:from_list(NamesList), epoch = Epoch},
+            State3 = add_member_monitors(ExtraMembers, State2),
+            {noreply, merge_peer_tokens(Tokens, State3)};
+        false ->
+            {noreply, State}
+    end;
 %% Leader: handle unregister directly.
-handle_cast({unregister, LogicalName}, State = #state{leader = Leader, member_id = Leader}) ->
+handle_cast(
+    {unregister, LogicalName}, State = #state{leader = Leader, member_id = Leader, epoch = Epoch}
+) ->
     #state{names = Names, members = Members, name_to_ref = NTR, ref_to_name = RTN} = State,
     {NTR1, RTN1} = demonitor_name(LogicalName, NTR, RTN),
-    broadcast_to_peers(Members, {name_unregistered, LogicalName}),
+    broadcast_to_peers(Members, {name_unregistered, LogicalName, Epoch}),
     {noreply, State#state{
         names = maps:remove(LogicalName, Names),
         name_to_ref = NTR1,
@@ -305,7 +359,8 @@ handle_info({'DOWN', Ref, process, _Pid, _Reason}, State) ->
         ref_to_name = RefToName,
         elector = Elector,
         member_id = Self,
-        members = Members
+        members = Members,
+        epoch = Epoch
     } = State,
     case maps:get(Ref, Monitors, undefined) of
         undefined ->
@@ -314,7 +369,7 @@ handle_info({'DOWN', Ref, process, _Pid, _Reason}, State) ->
                 undefined ->
                     {noreply, State};
                 LogicalName ->
-                    broadcast_to_peers(Members, {name_unregistered, LogicalName}),
+                    broadcast_to_peers(Members, {name_unregistered, LogicalName, Epoch}),
                     NTR = maps:remove(LogicalName, State#state.name_to_ref),
                     RTN = maps:remove(Ref, RefToName),
                     {noreply, State#state{
@@ -327,15 +382,20 @@ handle_info({'DOWN', Ref, process, _Pid, _Reason}, State) ->
             %% Stale self-monitor — should not happen, ignore.
             {noreply, State};
         DeadMemberId ->
-            dgen_server:cast(Elector, {member_down, DeadMemberId}),
+            %% Include the token we last received for this peer so the elector can
+            %% reject the message if the peer has already rejoined with a new token.
+            Token = maps:get(DeadMemberId, State#state.peer_tokens, undefined),
+            dgen_server:cast(Elector, {member_down, DeadMemberId, Token}),
             {noreply, remove_member(DeadMemberId, State)}
     end;
 handle_info({nodeup, _Node}, State = #state{elector = Elector, member_id = Self}) ->
     %% Re-announce to the elector — this member may have been removed from the
-    %% member set while the node was unreachable (partition).  The elector handles
-    %% duplicate joins idempotently; this is a no-op if already a current member.
-    dgen_server:cast(Elector, {join, Self}),
-    {noreply, State};
+    %% member set while the node was unreachable (partition).  A fresh token is
+    %% generated so any stale {member_down, Self, OldToken} already in the queue
+    %% is discarded by the elector when it is eventually processed.
+    NewToken = make_ref(),
+    dgen_server:cast(Elector, {join, Self, NewToken}),
+    {noreply, State#state{join_token = NewToken}};
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -433,6 +493,13 @@ demonitor_name(LogicalName, NTR, RTN) ->
 extra_member_ids(undefined, _AllIds, _Id) -> [];
 extra_member_ids(MemberId, AllIds, MemberId) -> AllIds;
 extra_member_ids(MemberId, _AllIds, _Id) -> [MemberId].
+
+%% Merge incoming token map into local peer_tokens, taking the newer token when
+%% both sides know about the same member (higher value = more recent make_ref
+%% within a single BEAM session, but refs are opaque so we always overwrite —
+%% the elector is the authoritative source and always sends current tokens).
+merge_peer_tokens(Tokens, State = #state{peer_tokens = PeerTokens}) ->
+    State#state{peer_tokens = maps:merge(PeerTokens, Tokens)}.
 
 broadcast_to_peers(Members, Msg) ->
     maps:foreach(fun(MemberId, _) -> cast_to_member(MemberId, Msg) end, Members).

@@ -329,78 +329,140 @@ defmodule DGen.RegistryClusterTest do
   # Partition recovery
   # ---------------------------------------------------------------------------
 
-  # @todo: (#11) this test keeps failing randomly... have no leads yet
-  # describe "partition recovery via nodeup" do
-  #  test "cluster reconstitutes after Erlang distribution disconnects and reconnects", %{
-  #    reg: reg,
-  #    peer_node: peer_node
-  #  } do
-  #    # Capture before disconnect — erpc won't work across the partition.
-  #    peer_member = :erpc.call(peer_node, :dgen_registry, :member_name, [reg])
+  describe "partition recovery via nodeup" do
+    test "cluster reconstitutes after Erlang distribution disconnects and reconnects", %{
+      reg: reg,
+      peer_node: peer_node
+    } do
+      # Capture before disconnect — erpc won't work across the partition.
+      peer_member = :erpc.call(peer_node, :dgen_registry, :member_name, [reg])
 
-  #    # Sever Erlang distribution between primary and peer.  Both erlang:monitor/2
-  #    # references fire DOWN with :noconnection; each member submits {member_down,
-  #    # other} to the elector via FDB, which remains accessible to both nodes.
-  #    :net_kernel.disconnect(peer_node)
+      # Sever Erlang distribution between primary and peer.  Both erlang:monitor/2
+      # references fire DOWN with :noconnection; each member submits {member_down,
+      # other, token} to the elector via FDB, which remains accessible to both nodes.
+      :net_kernel.disconnect(peer_node)
 
-  #    # The primary must detect the peer's departure and remove it from the
-  #    # elector's member set.
-  #    assert eventually(
-  #             fn ->
-  #               not Enum.any?(:dgen_registry.get_members(reg), fn {n, _} -> n == peer_node end)
-  #             end,
-  #             5_000
-  #           ),
-  #           "primary did not remove peer from member set after disconnect"
+      # The primary must detect the peer's departure and remove it from the
+      # elector's member set.
+      assert eventually(
+               fn ->
+                 not Enum.any?(:dgen_registry.get_members(reg), fn {n, _} -> n == peer_node end)
+               end,
+               5_000
+             ),
+             "primary did not remove peer from member set after disconnect"
 
-  #    # Reconnect.  Both members receive {nodeup, _} and re-cast {join, Self}
-  #    # to the elector, which reconstitutes the full member set and re-elects
-  #    # a leader.
-  #    Node.connect(peer_node)
+      # Reconnect.  Both members receive {nodeup, _} and re-cast {join, Self, FreshToken}
+      # to the elector, which reconstitutes the full member set and re-elects a leader.
+      # Each fresh token ensures that any stale {member_down, ..., OldToken} still in the
+      # FDB queue is discarded by the elector when it is eventually consumed.
+      Node.connect(peer_node)
 
-  #    # Primary: both members and a leader must reappear.
-  #    assert eventually(
-  #             fn ->
-  #               members = :dgen_registry.get_members(reg)
+      # Primary: both members and a leader must reappear.
+      assert eventually(
+               fn ->
+                 members = :dgen_registry.get_members(reg)
 
-  #               :dgen_registry.get_leader(reg) != :undefined and
-  #                 {peer_node, peer_member} in members
-  #             end,
-  #             5_000
-  #           ),
-  #           "primary did not reconstitute cluster after reconnect"
+                 :dgen_registry.get_leader(reg) != :undefined and
+                   {peer_node, peer_member} in members
+               end,
+               5_000
+             ),
+             "primary did not reconstitute cluster after reconnect"
 
-  #    # Peer: leader must reappear.  Wrap in try/catch because distribution
-  #    # may briefly be in the process of reconnecting when we first poll.
-  #    assert eventually(
-  #             fn ->
-  #               try do
-  #                 :erpc.call(peer_node, :dgen_registry, :get_leader, [reg]) != :undefined
-  #               catch
-  #                 :exit, _ -> false
-  #               end
-  #             end,
-  #             5_000
-  #           ),
-  #           "peer did not see a leader after reconnect"
+      # Peer: leader must reappear.  Wrap in try/catch because distribution
+      # may briefly be in the process of reconnecting when we first poll.
+      assert eventually(
+               fn ->
+                 try do
+                   :erpc.call(peer_node, :dgen_registry, :get_leader, [reg]) != :undefined
+                 catch
+                   :exit, _ -> false
+                 end
+               end,
+               5_000
+             ),
+             "peer did not see a leader after reconnect"
 
-  #    # Registry must be fully functional: register on primary, replicate to peer.
-  #    pid = spawn(fn -> Process.sleep(:infinity) end)
-  #    on_exit(fn -> Process.exit(pid, :kill) end)
+      # Registry must be fully functional: register on primary, replicate to peer.
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
 
-  #    assert eventually(
-  #             fn -> :dgen_registry.register_name({reg, :post_partition}, pid) == :yes end,
-  #             5_000
-  #           ),
-  #           "could not register name after partition recovery"
+      assert eventually(
+               fn -> :dgen_registry.register_name({reg, :post_partition}, pid) == :yes end,
+               5_000
+             ),
+             "could not register name after partition recovery"
 
-  #    assert eventually(
-  #             fn -> remote_whereis(peer_node, reg, :post_partition) == pid end,
-  #             5_000
-  #           ),
-  #           "name not replicated to peer after partition recovery"
-  #  end
-  # end
+      assert eventually(
+               fn -> remote_whereis(peer_node, reg, :post_partition) == pid end,
+               5_000
+             ),
+             "name not replicated to peer after partition recovery"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Epoch fencing across nodes
+  # ---------------------------------------------------------------------------
+
+  describe "epoch fencing" do
+    test "stale name_registered broadcast from a fake leader is rejected by the peer", %{
+      reg: reg,
+      peer_node: peer_node
+    } do
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+
+      epoch = :dgen_registry.get_epoch(reg)
+      assert epoch > 0
+
+      peer_member = :erpc.call(peer_node, :dgen_registry, :member_name, [reg])
+
+      # Inject a broadcast carrying a stale epoch (epoch - 1) directly into
+      # the peer member's mailbox, bypassing the real leader.
+      :erpc.call(peer_node, :gen_server, :cast, [
+        peer_member,
+        {:name_registered, :ghost_name, pid, epoch - 1}
+      ])
+
+      # A call to the same process serialises after the cast.
+      :erpc.call(peer_node, :dgen_registry, :whereis_name, [{reg, :__barrier__}])
+
+      assert :undefined == remote_whereis(peer_node, reg, :ghost_name)
+    end
+
+    test "name_registered broadcast with current epoch is accepted by the peer", %{
+      reg: reg,
+      peer_node: peer_node
+    } do
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+
+      epoch = :dgen_registry.get_epoch(reg)
+      peer_member = :erpc.call(peer_node, :dgen_registry, :member_name, [reg])
+
+      :erpc.call(peer_node, :gen_server, :cast, [
+        peer_member,
+        {:name_registered, :valid_name, pid, epoch}
+      ])
+
+      assert pid == :erpc.call(peer_node, :dgen_registry, :whereis_name, [{reg, :valid_name}])
+    end
+
+    test "epoch increments when a new leader is elected after the peer joins", %{
+      reg: reg,
+      peer_node: peer_node
+    } do
+      # The initial join of the peer already triggered at least one election,
+      # so epoch must be > 0 on both nodes.
+      local_epoch = :dgen_registry.get_epoch(reg)
+      remote_epoch = :erpc.call(peer_node, :dgen_registry, :get_epoch, [reg])
+
+      assert local_epoch > 0
+      assert local_epoch == remote_epoch
+    end
+  end
 
   # ---------------------------------------------------------------------------
   # Via-tuple across nodes

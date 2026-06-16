@@ -305,6 +305,72 @@ defmodule DGen.RegistryTest do
     end
   end
 
+  describe "get_epoch/1" do
+    test "epoch is positive after initial election", %{reg: reg} do
+      assert :dgen_registry.get_epoch(reg) > 0
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Epoch fencing — stale leader broadcasts are discarded
+  # ---------------------------------------------------------------------------
+
+  describe "epoch fencing" do
+    test "name_registered with stale epoch is discarded", %{reg: reg} do
+      member = :dgen_registry.member_name(reg)
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+
+      epoch = :dgen_registry.get_epoch(reg)
+      # Simulate a broadcast from a stale leader carrying a smaller epoch.
+      GenServer.cast(member, {:name_registered, :stale_name, pid, epoch - 1})
+      # A call to the same member serialises after the cast, acting as a barrier.
+      :dgen_registry.whereis_name({reg, :__barrier__})
+
+      assert :undefined == :dgen_registry.whereis_name({reg, :stale_name})
+    end
+
+    test "name_registered with current epoch is applied", %{reg: reg} do
+      member = :dgen_registry.member_name(reg)
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+
+      epoch = :dgen_registry.get_epoch(reg)
+      GenServer.cast(member, {:name_registered, :current_name, pid, epoch})
+
+      assert pid == :dgen_registry.whereis_name({reg, :current_name})
+    end
+
+    test "name_unregistered with stale epoch is discarded", %{reg: reg} do
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+
+      :yes = :dgen_registry.register_name({reg, :persisted_name}, pid)
+      epoch = :dgen_registry.get_epoch(reg)
+      member = :dgen_registry.member_name(reg)
+
+      GenServer.cast(member, {:name_unregistered, :persisted_name, epoch - 1})
+      :dgen_registry.whereis_name({reg, :__barrier__})
+
+      assert pid == :dgen_registry.whereis_name({reg, :persisted_name})
+    end
+
+    test "name_unregistered with current epoch is applied", %{reg: reg} do
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+
+      :yes = :dgen_registry.register_name({reg, :to_remove}, pid)
+      epoch = :dgen_registry.get_epoch(reg)
+      member = :dgen_registry.member_name(reg)
+
+      GenServer.cast(member, {:name_unregistered, :to_remove, epoch})
+
+      assert :undefined == :dgen_registry.whereis_name({reg, :to_remove})
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+
   describe "elector_name/1 and member_name/1" do
     test "elector process is alive after start", %{reg: reg} do
       assert reg |> :dgen_registry.elector_name() |> Process.whereis() |> is_pid()
