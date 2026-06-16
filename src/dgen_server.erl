@@ -192,7 +192,9 @@ See `start_link/3` for details on `Mod`, `Arg`, and `Opts`.
 -spec start(module(), term(), options()) -> start_ret().
 start(Mod, Arg, Opts) ->
     {Tenant, Consume, Reset, Cache, DLT, ConsumeK, LockTimeout} = parse_opts(Opts),
-    gen_server:start(?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT, ConsumeK, LockTimeout}, Opts).
+    gen_server:start(
+        ?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT, ConsumeK, LockTimeout}, Opts
+    ).
 
 -if(?DOCATTRS).
 -doc """
@@ -204,7 +206,9 @@ See `start_link/3` for details on `Mod`, `Arg`, and `Opts`.
 -spec start(gen_server:server_name(), module(), term(), options()) -> start_ret().
 start(Reg, Mod, Arg, Opts) ->
     {Tenant, Consume, Reset, Cache, DLT, ConsumeK, LockTimeout} = parse_opts(Opts),
-    gen_server:start(Reg, ?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT, ConsumeK, LockTimeout}, Opts).
+    gen_server:start(
+        Reg, ?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT, ConsumeK, LockTimeout}, Opts
+    ).
 
 -if(?DOCATTRS).
 -doc """
@@ -219,7 +223,9 @@ Starts a dgen_server process linked to the calling process.
 -spec start_link(module(), term(), options()) -> start_ret().
 start_link(Mod, Arg, Opts) ->
     {Tenant, Consume, Reset, Cache, DLT, ConsumeK, LockTimeout} = parse_opts(Opts),
-    gen_server:start_link(?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT, ConsumeK, LockTimeout}, Opts).
+    gen_server:start_link(
+        ?MODULE, {Tenant, Mod, Arg, Consume, Reset, Cache, DLT, ConsumeK, LockTimeout}, Opts
+    ).
 
 -if(?DOCATTRS).
 -doc """

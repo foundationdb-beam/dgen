@@ -260,8 +260,7 @@ handle_locked(_DbCtx, cast, {member_down, _MemberId, _Token}, State) ->
             try
                 call_to_member(
                     Leader,
-                    {elector_assume_and_distribute, self_snapshot, undefined, AllIds, Tokens,
-                        Epoch}
+                    {elector_assume_and_distribute, self_snapshot, undefined, AllIds, Tokens, Epoch}
                 )
             catch
                 exit:_ -> ok
