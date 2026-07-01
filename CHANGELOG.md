@@ -1,5 +1,90 @@
 # Changelog
 
+## v0.4.0 (TBD)
+
+### Enhancements
+
+- **`dgen_registry` — a defined consistency model (Still considered experimental).** The
+  registry now has a precise, documented contract; see `docs/dgen_registry_design.md`
+  for the full design, guarantees, and non-goals. In brief:
+
+  - **CP and fenced.** Leadership is an emergent property of the backend: the elected
+    leader is fenced on a leader key, so a node that has lost leadership physically
+    cannot commit a registration — there is no split-brain dual-accept, and the
+    minority side of a partition refuses writes rather than inventing a second owner.
+  - **Single-fault singleton uniqueness.** At most one live process holds a name,
+    preserved across the failure of any single member. Pids are never persisted; the
+    durable footprint is ~2 keys per registry (a leader key and a version
+    counter), independent of how many names are registered.
+  - **Two-holder addressability.** A registration acknowledged `yes` is held by at
+    least two members (a forwarded registration by the leader and the forwarding
+    follower; a direct one by replicate-before-ack), so it survives any single node
+    loss. Tunable per registry via `register_replicas` / `replicate_timeout` /
+    `strict_replication` (default: one replica, degrade-open on timeout with
+    telemetry).
+  - **Dynamic membership with an automatic mesh.** Nodes join by starting the
+    registry and leave by stopping it — no node list to maintain. The registry keeps
+    Erlang distribution in step with membership: given nodes that *can* connect
+    (shared cookie, reachability), `nodes()` converges to every member without an
+    external discovery library.
+  - **Lock-free snapshot reads.** Each member keeps its local name replica in a
+    `protected` ETS table, so `whereis_name/1` resolves a name with an `ets:lookup/2`
+    directly in the *calling* process — no round-trip through the member's mailbox.
+    Many processes read concurrently without queuing behind the member, and the
+    semantics are unchanged (a still-snapshot, eventually-consistent read). The table
+    is recreated empty whenever a member (re)starts, so a read in that brief window
+    returns `undefined`.
+  - **Per-registration metadata.** A registration can carry metadata — an `index` map
+    and an opaque `data` payload — attached at register time (`register_name/3`) or
+    replaced later (`set_metadata/2`), and read back lock-free in the caller
+    (`get_metadata/1`) or authoritatively through the leader
+    (`get_metadata_consistent/1`). Metadata rides the same fenced group-commit pipeline
+    as names, replicates to followers, survives a leadership handoff (freshest wins),
+    and is removed automatically when the process exits or is unregistered — its
+    lifetime is exactly the registration's. See §4.7 of the design doc.
+  - **Indexed metadata queries.** Each member maintains an inverted index over the
+    registrations' `index` maps, so `query/2` (local snapshot) and `query_consistent/2`
+    (leader-authoritative) find every registration matching a conjunction of exact
+    equalities (AND-equal) over indexed attributes, returning `#{name, pid, index, data}`
+    matches. Queries run on the member's mailbox, so they observe a batch-consistent
+    snapshot (never a half-applied commit) at the cost of serialising — a deliberate
+    trade, since single-key reads stay lock-free. An empty constraint map is rejected;
+    `data` is not queryable.
+
+- **`dgen_transaction` (new behaviour).** Owns a single backend transaction in its
+  own process (create → body → commit → retry, with caller-controlled retry
+  semantics), delivering the outcome to an owner. It is the substrate for the
+  registry's non-blocking, cached-GRV group commit.
+
+- **`dgen_server` — `consume_k` fully documented, and inlining disabled when
+  `consume_k > 1`.** The `consume_k` batch-size option is now documented (batch
+  semantics, the throughput/transaction-size trade-off, the single-consumer
+  property). When `consume_k > 1`, opportunistic inline handling of `call`s is
+  disabled so every call rides the durable queue and the batched consume loop —
+  keeping `consume_k` always in effect (and, for the registry, a stable consumer and
+  leader). `priority_call`/`priority_cast` still bypass the queue, as before.
+
+### Behavioral notes
+
+- **The registry may forcibly terminate a registered process to enforce uniqueness.**
+  Register only processes that can withstand being forcibly killed — supervised and
+  restart-safe, or transient by design. This is intentional (a singleton registry)
+  and configurable (`terminate_on_conflict`, default `true`). See §5.6 of the design
+  doc.
+
+### Breaking changes
+
+- **`dgen_registry:start_link/3` (the `SupName`-embedding variant) is removed.** It
+  was unused and is superseded by the "zero atoms created per registry" change above:
+  the registry's own supervisor is never registered under a name (embedding it under
+  a caller-chosen name doesn't fit a nameless-by-design supervisor). `start_link/2`
+  and the options-map `start_link/3` (`Name, Tenant, Opts`) are unaffected. Callers
+  should hold onto the returned supervisor pid instead of a name.
+- **`dgen_registry:elector_name/1` is removed** in favor of `elector_pid/1`, which
+  returns the elector's current pid via supervisor lookup rather than a registered
+  name (the elector no longer has one). `member_name/1` and `names_table/1` are kept
+  for compatibility but are now identity functions (`member_name(Name) =:= Name`).
+
 ## v0.3.0 (2026-06-17)
 
 ### Enhancements

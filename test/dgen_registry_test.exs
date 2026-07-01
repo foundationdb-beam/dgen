@@ -16,9 +16,9 @@ defmodule DGen.RegistryTest do
 
   setup %{tenant: tenant} do
     reg = :"reg_#{:erlang.unique_integer([:positive])}"
-    {:ok, _} = :dgen_registry.start_link(reg, tenant)
+    {:ok, sup} = :dgen_registry.start_link(reg, tenant)
     await_leader!(reg)
-    on_exit(fn -> stop_registry(reg) end)
+    on_exit(fn -> stop_registry(sup) end)
     %{reg: reg}
   end
 
@@ -66,20 +66,36 @@ defmodule DGen.RegistryTest do
     end
   end
 
+  # Spawn a process that lives until the test ends (auto-killed on exit).
+  defp spawn_live do
+    pid = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> Process.exit(pid, :kill) end)
+    pid
+  end
+
+  # Register processes with the given index maps, returning %{name => pid}.
+  defp register_indexed(reg, entries) do
+    Map.new(entries, fn {name, index} ->
+      pid = spawn_live()
+      :yes = :dgen_registry.register_name({reg, name}, pid, %{index: index})
+      {name, pid}
+    end)
+  end
+
+  # Sort query matches by name for order-independent comparison.
+  defp names(matches), do: matches |> Enum.map(& &1.name) |> Enum.sort()
+
   # Supervisors exit with :shutdown (not :normal) when their parent process
   # dies, which has already happened by the time on_exit callbacks run.
-  # Use :shutdown as the stop reason and catch any race.
-  defp stop_registry(reg) do
-    case Process.whereis(reg) do
-      nil ->
-        :ok
-
-      pid ->
-        try do
-          Supervisor.stop(pid, :shutdown)
-        catch
-          :exit, _ -> :ok
-        end
+  # Use :shutdown as the stop reason and catch any race. Takes the supervisor's
+  # own pid directly (start_link/2,3 returns it) — the registry name now
+  # resolves to the *member*, not the supervisor, so a by-name lookup would
+  # stop the wrong process.
+  defp stop_registry(sup) do
+    try do
+      Supervisor.stop(sup, :shutdown)
+    catch
+      :exit, _ -> :ok
     end
   end
 
@@ -146,14 +162,44 @@ defmodule DGen.RegistryTest do
 
       :dgen_registry.unregister_name({reg, :bar})
 
-      # unregister_name is a cast; whereis_name is a call — both go to the
-      # same member from the same process, so Erlang per-pair ordering ensures
-      # the cast is processed first.
+      # unregister_name is a cast; whereis_name now reads the member's ETS table in
+      # the caller (no member round-trip), so it no longer serialises behind the cast.
+      # Flush the member's mailbox with get_state to ensure the local delete is applied
+      # before the read.
+      :sys.get_state(:dgen_registry.member_name(reg))
       assert :undefined = :dgen_registry.whereis_name({reg, :bar})
     end
 
     test "is idempotent — unregistering an unknown name is a no-op", %{reg: reg} do
       assert :ok = :dgen_registry.unregister_name({reg, :no_such})
+    end
+
+    # Guards the *durable* side: since §4.4 the registry stores no per-name keys, only
+    # a per-registry version counter bumped once per fenced commit.  Both register and
+    # unregister must drive a real fenced commit (advancing the counter) — not just an
+    # in-memory map edit.  If unregister only touched memory, whereis_name would look
+    # correct while no commit fenced the change against a concurrent leadership swap.
+    test "register and unregister each drive a fenced version-key commit", %{
+      reg: reg,
+      tenant: tenant
+    } do
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+
+      tuid = {"dgen_registry.", Atom.to_string(reg)}
+      v0 = :dgen_registry_names.read_version(tenant, tuid)
+
+      :yes = :dgen_registry.register_name({reg, :durable_bar}, pid)
+
+      assert eventually(fn -> :dgen_registry_names.read_version(tenant, tuid) > v0 end),
+             "register did not bump the durable version key"
+
+      v1 = :dgen_registry_names.read_version(tenant, tuid)
+
+      :dgen_registry.unregister_name({reg, :durable_bar})
+
+      assert eventually(fn -> :dgen_registry_names.read_version(tenant, tuid) > v1 end),
+             "unregister did not bump the durable version key"
     end
   end
 
@@ -184,6 +230,278 @@ defmodule DGen.RegistryTest do
 
       assert :dgen_registry.whereis_name({reg, :agree}) ==
                :dgen_registry.whereis_name_consistent({reg, :agree})
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Registration metadata (single-node)
+  # ---------------------------------------------------------------------------
+
+  describe "metadata" do
+    test "a plain registration has empty default metadata", %{reg: reg} do
+      pid = spawn_live()
+      :yes = :dgen_registry.register_name({reg, :m_plain}, pid)
+
+      assert {:ok, %{pid: ^pid, index: %{}, data: :undefined}} =
+               :dgen_registry.get_metadata({reg, :m_plain})
+    end
+
+    test "get_metadata returns undefined for an unknown name", %{reg: reg} do
+      assert :undefined = :dgen_registry.get_metadata({reg, :m_unknown})
+    end
+
+    test "register_name/3 attaches index and data atomically", %{reg: reg} do
+      pid = spawn_live()
+      spec = %{index: %{role: :worker, shard: 7}, data: %{note: "hi"}}
+      :yes = :dgen_registry.register_name({reg, :m_reg3}, pid, spec)
+
+      assert {:ok, %{pid: ^pid, index: %{role: :worker, shard: 7}, data: %{note: "hi"}}} =
+               :dgen_registry.get_metadata({reg, :m_reg3})
+    end
+
+    test "set_metadata replaces the metadata of a registration", %{reg: reg} do
+      pid = spawn_live()
+      :yes = :dgen_registry.register_name({reg, :m_set}, pid, %{index: %{a: 1}, data: :first})
+
+      assert :ok = :dgen_registry.set_metadata({reg, :m_set}, %{index: %{b: 2}, data: :second})
+
+      assert eventually(fn ->
+               :dgen_registry.get_metadata({reg, :m_set}) ==
+                 {:ok, %{pid: pid, index: %{b: 2}, data: :second}}
+             end),
+             "metadata was not replaced"
+    end
+
+    test "set_metadata omitting a field resets it to the empty default", %{reg: reg} do
+      pid = spawn_live()
+      :yes = :dgen_registry.register_name({reg, :m_reset}, pid, %{index: %{a: 1}, data: :keep})
+
+      # Replace (not merge): omitting :data clears it back to :undefined.
+      assert :ok = :dgen_registry.set_metadata({reg, :m_reset}, %{index: %{a: 2}})
+
+      assert eventually(fn ->
+               :dgen_registry.get_metadata({reg, :m_reset}) ==
+                 {:ok, %{pid: pid, index: %{a: 2}, data: :undefined}}
+             end),
+             "omitted field was not reset"
+    end
+
+    test "set_metadata on an unknown name returns not_registered", %{reg: reg} do
+      assert {:error, :not_registered} =
+               :dgen_registry.set_metadata({reg, :m_absent}, %{index: %{a: 1}})
+    end
+
+    test "get_metadata_consistent agrees with the snapshot read", %{reg: reg} do
+      pid = spawn_live()
+      :yes = :dgen_registry.register_name({reg, :m_consistent}, pid, %{index: %{k: :v}})
+
+      assert {:ok, %{pid: ^pid, index: %{k: :v}}} =
+               :dgen_registry.get_metadata_consistent({reg, :m_consistent})
+    end
+
+    test "metadata is removed when the process exits", %{reg: reg} do
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      :yes = :dgen_registry.register_name({reg, :m_dies}, pid, %{index: %{a: 1}})
+      assert {:ok, _} = :dgen_registry.get_metadata({reg, :m_dies})
+
+      Process.exit(pid, :kill)
+
+      assert eventually(fn -> :dgen_registry.get_metadata({reg, :m_dies}) == :undefined end),
+             "metadata outlived the process"
+    end
+
+    test "metadata is removed on unregister", %{reg: reg} do
+      pid = spawn_live()
+      :yes = :dgen_registry.register_name({reg, :m_unreg}, pid, %{index: %{a: 1}})
+
+      :dgen_registry.unregister_name({reg, :m_unreg})
+      :sys.get_state(:dgen_registry.member_name(reg))
+
+      assert :undefined = :dgen_registry.get_metadata({reg, :m_unreg})
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Indexed AND-equal queries (single-node)
+  # ---------------------------------------------------------------------------
+
+  describe "query" do
+    test "single-clause query returns all matching registrations", %{reg: reg} do
+      pids =
+        register_indexed(reg, %{
+          q_a: %{role: :worker, shard: 1},
+          q_b: %{role: :worker, shard: 2},
+          q_c: %{role: :admin, shard: 1}
+        })
+
+      matches = :dgen_registry.query(reg, %{role: :worker})
+      assert names(matches) == [:q_a, :q_b]
+
+      # Each match carries the full record.
+      a = Enum.find(matches, &(&1.name == :q_a))
+      assert a.pid == pids[:q_a]
+      assert a.index == %{role: :worker, shard: 1}
+    end
+
+    test "multi-clause query is an AND of exact equalities", %{reg: reg} do
+      register_indexed(reg, %{
+        q_a: %{role: :worker, shard: 1},
+        q_b: %{role: :worker, shard: 2},
+        q_c: %{role: :admin, shard: 1}
+      })
+
+      assert names(:dgen_registry.query(reg, %{role: :worker, shard: 1})) == [:q_a]
+      assert :dgen_registry.query(reg, %{role: :worker, shard: 9}) == []
+    end
+
+    test "query reflects set_metadata changes", %{reg: reg} do
+      register_indexed(reg, %{q_x: %{role: :worker}})
+
+      assert names(:dgen_registry.query(reg, %{role: :worker})) == [:q_x]
+
+      :ok = :dgen_registry.set_metadata({reg, :q_x}, %{index: %{role: :admin}})
+      :sys.get_state(:dgen_registry.member_name(reg))
+
+      # No longer a worker; now an admin.
+      assert :dgen_registry.query(reg, %{role: :worker}) == []
+      assert names(:dgen_registry.query(reg, %{role: :admin})) == [:q_x]
+    end
+
+    test "query drops entries whose process has died", %{reg: reg} do
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      :yes = :dgen_registry.register_name({reg, :q_dead}, pid, %{index: %{role: :worker}})
+      assert names(:dgen_registry.query(reg, %{role: :worker})) == [:q_dead]
+
+      Process.exit(pid, :kill)
+
+      assert eventually(fn -> :dgen_registry.query(reg, %{role: :worker}) == [] end),
+             "dead process still returned by query"
+    end
+
+    test "an empty constraints map is rejected", %{reg: reg} do
+      assert {:error, :empty_query} = :dgen_registry.query(reg, %{})
+      assert {:error, :empty_query} = :dgen_registry.query_consistent(reg, %{})
+    end
+
+    test "query_consistent agrees with the snapshot query", %{reg: reg} do
+      register_indexed(reg, %{q_a: %{role: :worker}, q_b: %{role: :worker}})
+
+      assert names(:dgen_registry.query_consistent(reg, %{role: :worker})) == [:q_a, :q_b]
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # §5.6 conflict-detection predicate (pure, unit-tested in isolation)
+  #
+  # The full partition-heal scenario that produces a genuine conflict needs a
+  # multi-node, leadership-orchestrated setup (a follower holds a binding the leader
+  # drops on reconstruction and re-issues); that lives in the cluster suite. Here we
+  # pin the safety-critical predicate itself: which gathered states count as a
+  # conflict, and — crucially — which do not (so we never false-kill a live process).
+  # ---------------------------------------------------------------------------
+
+  describe "detect_conflicts/3" do
+    test "two different live pids for one name is a conflict" do
+      p1 = spawn_live()
+      p2 = spawn_live()
+
+      assert [{:n, ^p1, [^p2]}] =
+               :dgen_registry_member.detect_conflicts(%{n: p1}, [%{n: p1}, %{n: p2}], %{})
+    end
+
+    test "a recently-released divergent pid is suppressed (lag, not conflict)" do
+      p1 = spawn_live()
+      p2 = spawn_live()
+      released = %{p2 => System.system_time(:millisecond)}
+
+      assert [] =
+               :dgen_registry_member.detect_conflicts(%{n: p1}, [%{n: p1}, %{n: p2}], released)
+    end
+
+    test "a dead divergent pid is not a conflict" do
+      p1 = spawn_live()
+      p2 = spawn(fn -> :ok end)
+      Process.exit(p2, :kill)
+      eventually(fn -> not Process.alive?(p2) end)
+
+      assert [] = :dgen_registry_member.detect_conflicts(%{n: p1}, [%{n: p1}, %{n: p2}], %{})
+    end
+
+    test "agreement across all maps is not a conflict" do
+      p1 = spawn_live()
+
+      assert [] = :dgen_registry_member.detect_conflicts(%{n: p1}, [%{n: p1}, %{n: p1}], %{})
+    end
+
+    test "a name with no authority (absent from the freshest map) is not a conflict" do
+      p1 = spawn_live()
+
+      assert [] = :dgen_registry_member.detect_conflicts(%{}, [%{n: p1}], %{})
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # plan_batch/4 batch-local overlay (pure, unit-tested in isolation)
+  #
+  # A group commit's plan is built *before* anything lands in the member's ETS
+  # table, so an op must still see an earlier op's not-yet-committed decision if
+  # both touch the same name within one batch. plan_batch resolves this lazily
+  # (seed_lookup/3: the batch's own overlay first, a point ETS lookup otherwise)
+  # rather than needing a full pre-seeded map of the registry. These tests pin
+  # that overlay directly — in particular the `removed` marker it uses to mean
+  # "an earlier op in this batch explicitly cleared this name", which matters
+  # because `retract`/`down` (unlike `unregister`) never touch ETS until the
+  # whole batch commits, so bare absence from the overlay cannot be made to mean
+  # "cleared" without also meaning "untouched".
+  # ---------------------------------------------------------------------------
+
+  describe "plan_batch/4 (batch-local overlay)" do
+    setup do
+      # No on_exit cleanup needed: the table is owned by (and dies with) this
+      # test process; on_exit callbacks run in a separate runner process after
+      # the test process has already exited, so the table would already be
+      # gone by the time an on_exit tried to delete it.
+      %{tab: :ets.new(:plan_batch_test, [:set, :protected])}
+    end
+
+    test "a down followed by a re-add for the same name in one batch resurrects it", %{
+      tab: tab
+    } do
+      old_pid = spawn_live()
+      new_pid = spawn_live()
+      ref = make_ref()
+      origin = {:local, {self(), make_ref()}}
+
+      # Pre-batch ETS state: old_pid is still registered there. A `down` only
+      # takes effect when its batch commits (unlike unregister's optimistic
+      # delete), so ETS does not yet know old_pid's binding is gone.
+      :ets.insert(tab, {:n, old_pid, %{}, nil})
+
+      ops = [{:down, :n, ref}, {:add, :n, new_pid, {%{}, nil}, origin}]
+      plan = :dgen_registry_member.plan_batch(ops, tab, %{n: ref}, 1)
+
+      # Without the `removed` marker, the add's ETS fallback would still see
+      # old_pid bound (ETS hasn't been told about the down yet) and wrongly
+      # reject new_pid's registration as "already taken".
+      assert %{dbop: %{n: {:set, _node}}, replies: replies} = plan
+      assert {origin, :yes} in replies
+    end
+
+    test "a plain add then remove for the same name in one batch nets to a durable clear", %{
+      tab: tab
+    } do
+      pid = spawn_live()
+      add_origin = {:local, {self(), make_ref()}}
+
+      # The name was never registered before this batch (ETS is empty), so the
+      # remove's ReleasedPid is :undefined — only the overlay (from the earlier
+      # add, still in this same batch) tells the remove there is something to
+      # durably clear.
+      ops = [{:add, :n, pid, {%{}, nil}, add_origin}, {:remove, :n, :undefined}]
+      plan = :dgen_registry_member.plan_batch(ops, tab, %{}, 1)
+
+      assert %{dbop: %{n: :clear}, replies: replies} = plan
+      assert {add_origin, :yes} in replies
     end
   end
 
@@ -281,6 +599,32 @@ defmodule DGen.RegistryTest do
       assert eventually(fn -> :dgen_registry.whereis_name({reg, :mortal}) == :undefined end),
              "name was not unregistered after GenServer.stop"
     end
+
+    # Exercises the group-commit removal path under load: a burst of deaths (as
+    # when a node is killed) must all be reaped, coalesced into few commits.
+    test "a burst of simultaneous process deaths releases every name", %{reg: reg} do
+      n = 100
+
+      pids =
+        for i <- 1..n do
+          pid = spawn(fn -> Process.sleep(:infinity) end)
+          assert :yes = :dgen_registry.register_name({reg, {:burst, i}}, pid)
+          {i, pid}
+        end
+
+      # Kill them all at once, then expect every name to be released.
+      Enum.each(pids, fn {_i, pid} -> Process.exit(pid, :kill) end)
+
+      assert eventually(
+               fn ->
+                 Enum.all?(1..n, fn i ->
+                   :dgen_registry.whereis_name({reg, {:burst, i}}) == :undefined
+                 end)
+               end,
+               5_000
+             ),
+             "not all names were released after a burst of deaths"
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -323,9 +667,12 @@ defmodule DGen.RegistryTest do
 
       epoch = :dgen_registry.get_epoch(reg)
       # Simulate a broadcast from a stale leader carrying a smaller epoch.
-      GenServer.cast(member, {:name_registered, :stale_name, pid, epoch - 1})
-      # A call to the same member serialises after the cast, acting as a barrier.
-      :dgen_registry.whereis_name({reg, :__barrier__})
+      # Shape: {name_registered, Name, Pid, Index, Data, Epoch, Version}; the trailing 0
+      # is the applied-version stamp (irrelevant here).
+      GenServer.cast(member, {:name_registered, :stale_name, pid, %{}, :undefined, epoch - 1, 0})
+      # whereis_name now reads ETS in the caller (no member round-trip), so it can no
+      # longer act as a mailbox barrier — flush the member's mailbox with get_state.
+      :sys.get_state(member)
 
       assert :undefined == :dgen_registry.whereis_name({reg, :stale_name})
     end
@@ -336,7 +683,9 @@ defmodule DGen.RegistryTest do
       on_exit(fn -> Process.exit(pid, :kill) end)
 
       epoch = :dgen_registry.get_epoch(reg)
-      GenServer.cast(member, {:name_registered, :current_name, pid, epoch})
+      GenServer.cast(member, {:name_registered, :current_name, pid, %{}, :undefined, epoch, 0})
+      # Barrier: ensure the member has processed the cast before the caller-side read.
+      :sys.get_state(member)
 
       assert pid == :dgen_registry.whereis_name({reg, :current_name})
     end
@@ -349,8 +698,9 @@ defmodule DGen.RegistryTest do
       epoch = :dgen_registry.get_epoch(reg)
       member = :dgen_registry.member_name(reg)
 
-      GenServer.cast(member, {:name_unregistered, :persisted_name, epoch - 1})
-      :dgen_registry.whereis_name({reg, :__barrier__})
+      GenServer.cast(member, {:name_unregistered, :persisted_name, epoch - 1, 0})
+      # Barrier: ensure the member has processed (and discarded) the stale cast.
+      :sys.get_state(member)
 
       assert pid == :dgen_registry.whereis_name({reg, :persisted_name})
     end
@@ -363,7 +713,9 @@ defmodule DGen.RegistryTest do
       epoch = :dgen_registry.get_epoch(reg)
       member = :dgen_registry.member_name(reg)
 
-      GenServer.cast(member, {:name_unregistered, :to_remove, epoch})
+      GenServer.cast(member, {:name_unregistered, :to_remove, epoch, 0})
+      # Barrier: ensure the member has processed the cast before the caller-side read.
+      :sys.get_state(member)
 
       assert :undefined == :dgen_registry.whereis_name({reg, :to_remove})
     end
@@ -371,21 +723,33 @@ defmodule DGen.RegistryTest do
 
   # ---------------------------------------------------------------------------
 
-  describe "elector_name/1 and member_name/1" do
-    test "elector process is alive after start", %{reg: reg} do
-      assert reg |> :dgen_registry.elector_name() |> Process.whereis() |> is_pid()
-    end
-
+  describe "member_name/1, names_table/1, and elector_pid/1" do
     test "member process is alive after start", %{reg: reg} do
       assert reg |> :dgen_registry.member_name() |> Process.whereis() |> is_pid()
     end
 
-    test "elector_name/1 appends the _elector suffix" do
-      assert :my_reg_elector = :dgen_registry.elector_name(:my_reg)
+    test "member_name/1 is the identity — the member is registered as the registry name" do
+      assert :my_reg = :dgen_registry.member_name(:my_reg)
     end
 
-    test "member_name/1 appends the _member suffix" do
-      assert :my_reg_member = :dgen_registry.member_name(:my_reg)
+    test "names_table/1 is the identity — the ETS table is named after the registry", %{
+      reg: reg
+    } do
+      assert reg == :dgen_registry.names_table(reg)
+    end
+
+    test "elector process is alive after start, discovered with no registered name", %{
+      reg: reg
+    } do
+      elector = :dgen_registry.elector_pid(reg)
+      assert is_pid(elector)
+      assert Process.alive?(elector)
+      # The elector itself has no atom — Process.whereis/1 must not find it.
+      refute elector == Process.whereis(reg)
+    end
+
+    test "elector_pid/1 returns undefined for a registry that was never started" do
+      assert :undefined = :dgen_registry.elector_pid(:no_such_registry_at_all)
     end
   end
 end

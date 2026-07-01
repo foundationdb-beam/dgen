@@ -3,33 +3,33 @@
 -define(DOCATTRS, ?OTP_RELEASE >= 27).
 
 -if(?DOCATTRS).
--moduledoc """
-Encoder/decoder for dgen_server mod_state.
-
-Stores structured Erlang terms across FDB key-value pairs using a recursive
-encoding scheme. Three encoding types are supported:
-
-- **term** (fallback) - `term_to_binary`, chunked into 100KB values.
-- **assigns map** - map with all atom keys; each entry stored at a
-  separate FDB key using `atom_to_binary(Key)` in the path.
-- **component list** - list of maps where every item has an atom `id`
-  key with a binary value; each item stored separately, ordered by a
-  fractional index embedded in the FDB key.
-
-The encoding is applied recursively. For example, an assigns map whose value
-is a component list will nest both encodings in the key path.
-
-### Key structure
-
-```
-term:  {BaseKey, <<"t">>, ChunkIndex}
-map:   {BaseKey, <<"m">>}                       (marker)
-       {BaseKey, <<"m">>, KeyBin, ...}           (recursive)
-list:  {BaseKey, <<"l">>}                        (marker, holds Id => FracIndex map)
-       {BaseKey, <<"l">>, FracIndex, Id, ...}    (recursive)
-```
-""".
+-moduledoc false.
 -endif.
+
+%% Encoder/decoder for dgen_server mod_state.
+%%
+%% Stores structured Erlang terms across FDB key-value pairs using a recursive
+%% encoding scheme. Three encoding types are supported:
+%%
+%% - **term** (fallback) - `term_to_binary`, chunked into 100KB values.
+%% - **assigns map** - map with all atom keys; each entry stored at a
+%%   separate FDB key using `atom_to_binary(Key)` in the path.
+%% - **component list** - list of maps where every item has an atom `id`
+%%   key with a binary value; each item stored separately, ordered by a
+%%   fractional index embedded in the FDB key.
+%%
+%% The encoding is applied recursively. For example, an assigns map whose value
+%% is a component list will nest both encodings in the key path.
+%%
+%% ### Key structure
+%%
+%% ```
+%% term:  {BaseKey, <<"t">>, ChunkIndex}
+%% map:   {BaseKey, <<"m">>}                       (marker)
+%%        {BaseKey, <<"m">>, KeyBin, ...}           (recursive)
+%% list:  {BaseKey, <<"l">>}                        (marker, holds Id => FracIndex map)
+%%        {BaseKey, <<"l">>, FracIndex, Id, ...}    (recursive)
+%% ```
 
 -export([
     get/2,

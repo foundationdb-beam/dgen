@@ -9,6 +9,14 @@
     clear_range/3,
     get_range/4,
     add/3,
+    add_read_conflict_key/2,
+    get_read_version/1,
+    set_read_version/2,
+    get_committed_version/1,
+    create_transaction/1,
+    commit/1,
+    on_error/2,
+    error_code/1,
     get_next_tx_id/1,
     set_versionstamped_key/3,
     set_versionstamped_value/3,
@@ -60,6 +68,42 @@ get_range(Tx, StartKey, EndKey, Opts) ->
 -spec add(dgen_backend:tx(), dgen_backend:key(), integer()) -> ok.
 add(Tx, Key, Value) ->
     erlfdb:add(Tx, Key, Value).
+
+%% Conflict ranges and read-version control
+
+-spec add_read_conflict_key(dgen_backend:tx(), dgen_backend:key()) -> ok.
+add_read_conflict_key(Tx, Key) ->
+    erlfdb:add_read_conflict_key(Tx, Key).
+
+-spec get_read_version(dgen_backend:tx()) -> dgen_backend:future().
+get_read_version(Tx) ->
+    erlfdb:get_read_version(Tx).
+
+-spec set_read_version(dgen_backend:tx(), integer()) -> ok.
+set_read_version(Tx, Version) ->
+    erlfdb:set_read_version(Tx, Version).
+
+-spec get_committed_version(dgen_backend:tx()) -> integer().
+get_committed_version(Tx) ->
+    erlfdb:get_committed_version(Tx).
+
+%% Transaction lifecycle (process-model form)
+
+-spec create_transaction(dgen_backend:db()) -> dgen_backend:tx().
+create_transaction(Db) ->
+    erlfdb:create_transaction(Db).
+
+-spec commit(dgen_backend:tx()) -> dgen_backend:future().
+commit(Tx) ->
+    erlfdb:commit(Tx).
+
+-spec on_error(dgen_backend:tx(), integer()) -> dgen_backend:future().
+on_error(Tx, ErrorCode) ->
+    erlfdb:on_error(Tx, ErrorCode).
+
+-spec error_code(term()) -> integer() | error.
+error_code({erlfdb_error, Code}) -> Code;
+error_code(_) -> error.
 
 %% Versionstamp operations
 
