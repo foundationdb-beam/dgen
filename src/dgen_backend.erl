@@ -85,6 +85,40 @@ when
     [{key(), binary()}].
 -callback add(Tx :: tx(), Key :: key(), Value :: integer()) -> ok.
 
+%% Conflict ranges and read-version control.
+%%
+%% `add_read_conflict_key/2` records a read-conflict on `Key` *without* reading
+%% it: the commit fails if another transaction wrote `Key` between this
+%% transaction's read version and its commit version.  Used by the registry to
+%% fence a registration commit against a concurrent leadership change without
+%% paying a storage read for the leader key's value.
+%%
+%% `set_read_version/2` pins the read version (e.g. to a prior commit version)
+%% so a fenced write-only batch need not pay a GRV; `get_committed_version/1`
+%% returns that prior commit version after a successful commit.
+-callback add_read_conflict_key(Tx :: tx(), Key :: key()) -> ok.
+-callback get_read_version(Tx :: tx()) -> future().
+-callback set_read_version(Tx :: tx(), Version :: integer()) -> ok.
+-callback get_committed_version(Tx :: tx()) -> integer().
+
+%% Transaction lifecycle (explicit, process-model form).
+%%
+%% `transactional/2` runs and auto-retries a closure; these callbacks instead
+%% expose the underlying steps so a caller (`dgen_transaction`) can own a single
+%% transaction across messages, decide when to commit, and control retries.
+%%
+%% `create_transaction/1` opens a fresh transaction against a database handle.
+%% `commit/1` returns a future; waiting it yields `ok` or **raises** the backend's
+%% transaction error.  `on_error/2` takes the FDB error code and returns a future
+%% whose wait succeeds (after backoff, transaction reset for retry) iff the error
+%% is retryable, and raises otherwise.  `error_code/1` maps a caught exception
+%% reason to its integer Backend error code, or `error` if it is not one — so
+%% callers never match the backend-specific error tuple directly.
+-callback create_transaction(Db :: db()) -> tx().
+-callback commit(Tx :: tx()) -> future().
+-callback on_error(Tx :: tx(), ErrorCode :: integer()) -> future().
+-callback error_code(Reason :: term()) -> integer() | error.
+
 %% Versionstamp operations
 -callback get_next_tx_id(Tx :: tx()) -> non_neg_integer().
 -callback set_versionstamped_key(Tx :: tx(), Key :: key(), Value :: binary()) -> ok.

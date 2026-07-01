@@ -1,0 +1,104 @@
+# DGen Registry Introduction
+
+```elixir
+Mix.install([
+  {:erlfdb, "~> 1.0"},
+  {:dgen, path: "/Users/jstimpson/dev/dgen"}
+])
+```
+
+## Intro
+
+`DGen.Registry` is a distributed Elixir process registry that is built to gracefully and automatically handle nodes joining and leaving your cluster.
+
+If you're already running `DGen`, all you have to do to use the registry is
+
+1. Ensure your nodes are capable of communication (e.g. VM config, network, cookie)
+2. Add a new child to your supervision tree
+
+As long as you do this, `DGen.Registry` will take care of clustering the Elixir VMs with each other and will ensure that the dataset they share (namely process registrations) is consistent across the cluster.
+
+Nodes can join and leave at your will. `DGen.Registry` keeps everything up-to-date.
+
+> **Reminder:** The `DGen` project is a set of OTP utilities that inherit their distributed consensus from a backend database. As of the time of writing, the single supported backend is FoundationDB. Thus, `DGen.Registry` requires that your application connects to a running FoundationDB cluster.
+
+## What this document covers
+
+This document, an interactive Livebook, covers the "Getting Started" of `DGen.Registry`, including how to register processes and metadata and how to query them.
+
+For a discussion of the consistency guarantees of `DGen.Registry`, please see the [:dgen_registry Design Doc](dgen_registry_design.html)
+
+## Getting Started
+
+```elixir
+tenant = :dgen_erlfdb.sandbox_open("lb", "acme_corp")
+```
+
+```elixir
+DGen.Registry.start_link(:my_registry, tenant)
+```
+
+```elixir
+defmodule Player do
+  use GenServer
+
+  def start_link(name) do
+    GenServer.start_link(__MODULE__, %{}, name: {:via, DGen.Registry, {:my_registry, name}})
+  end
+
+  def move_to_room(name, room) do
+    :dgen_registry.set_metadata(
+      {:my_registry, name},
+      %{index: %{room: room}, data: %{}}
+    )
+  end
+
+  @impl true
+  def init(_) do
+    {:ok, %{}}
+  end
+end
+
+defmodule Room do
+  def list_players(room) do
+    :dgen_registry.query(:my_registry, %{room: room})
+    |> Enum.map(fn %{name: name, pid: pid} -> {name, pid} end)
+  end
+end
+```
+
+```elixir
+Player.start_link("alice")
+```
+
+```elixir
+GenServer.whereis({:via, DGen.Registry, {:my_registry, "alice"}})
+```
+
+```elixir
+Player.move_to_room("alice", 37)
+```
+
+```elixir
+Room.list_players(37)
+```
+
+```elixir
+Player.start_link("bob")
+```
+
+```elixir
+Player.move_to_room("bob", 37)
+```
+
+```elixir
+Room.list_players(37)
+```
+
+```elixir
+GenServer.stop({:via, DGen.Registry, {:my_registry, "bob"}})
+```
+
+```elixir
+Room.list_players(37)
+```

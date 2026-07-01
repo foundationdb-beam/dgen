@@ -3,7 +3,10 @@ defmodule DGen.ClusterHelper do
 
   @doc """
   Starts a `dgen_registry` on the calling node, connecting to the same FDB
-  keyspace described by `cluster_file` and `dir_path`.
+  keyspace described by `cluster_file` and `dir_path`. Returns the registry
+  supervisor's pid — the supervisor has no registered name (see
+  `dgen_registry`'s "Process identity" moduledoc note), so this is the only
+  way to get a handle on it (e.g. to `Supervisor.stop/2` it later).
 
   Intended to be invoked on a peer node via `:erpc.call/4`.
 
@@ -40,11 +43,8 @@ defmodule DGen.ClusterHelper do
     end)
 
     receive do
-      {^ref, {:ok, _}} ->
-        :ok
-
-      {^ref, {:error, {:already_started, _}}} ->
-        :ok
+      {^ref, {:ok, sup}} ->
+        sup
 
       {^ref, {:error, reason}} ->
         raise "start_registry failed: #{inspect(reason)}"
@@ -139,6 +139,43 @@ defmodule DGen.ClusterHelper do
   def stop_peer(peer_pid) do
     try do
       :peer.stop(peer_pid)
+    catch
+      :exit, _ -> :ok
+    end
+  end
+
+  @doc """
+  Boots a peer BEAM node reachable via Erlang distribution, with code paths
+  propagated and `:erlfdb`/`:dgen` started. Returns `{peer_pid, peer_node}`.
+
+  Does not start a registry on it — callers decide the join order (e.g. to
+  arrange for a peer, rather than the primary, to become leader) via
+  `start_registry/3`.
+  """
+  def boot_peer!(name_prefix) do
+    peer_name = :"#{name_prefix}#{:erlang.unique_integer([:positive])}@127.0.0.1"
+    {:ok, peer_pid, peer_node} = :peer.start_link(%{name: peer_name, connection: :standard_io})
+
+    :erpc.call(peer_node, :code, :add_paths, [:code.get_path()])
+    {:ok, _} = :erpc.call(peer_node, Application, :ensure_all_started, [:erlfdb])
+    {:ok, _} = :erpc.call(peer_node, Application, :ensure_all_started, [:dgen])
+
+    {peer_pid, peer_node}
+  end
+
+  @doc """
+  Stops a registry supervisor `sup` (its pid, as returned by `start_registry/3`)
+  cleanly — the node itself keeps running and stays connected.
+
+  Used to simulate a *graceful* leader shutdown (its member and elector
+  processes exit normally, observed by peers as an ordinary process `DOWN`),
+  as opposed to losing the whole node (see `stop_peer/1`). Intended to be
+  invoked on a peer node via `:erpc.call/4`, passing the pid `start_registry/3`
+  returned for that node.
+  """
+  def stop_registry(sup) do
+    try do
+      Supervisor.stop(sup, :shutdown)
     catch
       :exit, _ -> :ok
     end

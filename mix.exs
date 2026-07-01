@@ -44,8 +44,14 @@ defmodule Dgen.MixProject do
       extras: [
         "README.md",
         "CHANGELOG.md",
-        "docs/dgen_server_design.md",
-        "docs/dgen_registry_design.md"
+        "docs/design/dgen_server_design.md",
+        "docs/design/dgen_registry_design.md",
+        "docs/getting_started/dgen-intro.livemd",
+        "docs/getting_started/dgen-registry-intro.livemd"
+      ],
+      groups_for_extras: [
+        "Getting Started": ~r/getting_started/,
+        Design: ~r/design/
       ]
     ]
   end
@@ -73,7 +79,8 @@ defmodule Dgen.MixProject do
         "format --check-formatted",
         "cmd rebar3 fmt --check",
         "deps.unlock --check-unused",
-        "dialyzer"
+        "dialyzer",
+        "docs --warnings-as-errors"
       ]
     ]
   end

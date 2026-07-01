@@ -58,7 +58,7 @@ defmodule DGen.RegistryClusterTest do
     {:ok, _} = :erpc.call(peer_node, Application, :ensure_all_started, [:dgen])
 
     # Start the registry on the peer, connected to the same FDB keyspace.
-    :ok =
+    _peer_sup =
       :erpc.call(peer_node, DGen.ClusterHelper, :start_registry, [
         reg,
         abs_cluster_file,
@@ -105,6 +105,71 @@ defmodule DGen.RegistryClusterTest do
   # Uses :timer.sleep so no Elixir module is required on the peer.
   defp spawn_remote(node) do
     :erpc.call(node, :erlang, :spawn, [:timer, :sleep, [:infinity]])
+  end
+
+  # Boots a 3-member cluster where `leader_node` becomes leader *before* the
+  # primary or the second peer join — sticky leadership then keeps it in
+  # charge once they do — so a test can kill the leader without having to
+  # kill the test process itself (the primary always joins first otherwise,
+  # and would always be the leader). Returns `{reg, leader_node, leader_pid,
+  # leader_sup, other_node, other_pid}` — `leader_pid`/`other_pid` are the
+  # peer nodes' controlling pids (from `boot_peer!/1`, for `stop_peer/1`);
+  # `leader_sup` is the leader's registry supervisor pid (from
+  # `start_registry/3`, for `stop_registry/1`). Ignores the outer setup's own
+  # `reg`/`peer_node`; only the FDB connection details are reused, following
+  # the pattern already used by the "snapshot on join" and "lock-free
+  # handoff" tests.
+  defp start_peer_led_cluster!(%{
+         abs_cluster_file: abs_cluster_file,
+         dir_path: dir_path,
+         db: db,
+         case_dir: case_dir
+       }) do
+    suffix = :erlang.unique_integer([:positive])
+    reg = :"failover_reg_#{suffix}"
+
+    {leader_pid, leader_node} = DGen.ClusterHelper.boot_peer!("failoverleader")
+
+    leader_sup =
+      :erpc.call(leader_node, DGen.ClusterHelper, :start_registry, [
+        reg,
+        abs_cluster_file,
+        dir_path
+      ])
+
+    :erpc.call(leader_node, DGen.ClusterHelper, :await_leader!, [reg])
+
+    # Primary joins second — sticky leadership keeps leader_node in charge.
+    {:ok, _} = :dgen_registry.start_link(reg, {db, case_dir})
+    await_leader!(reg)
+
+    {other_pid, other_node} = DGen.ClusterHelper.boot_peer!("failoverother")
+
+    _other_sup =
+      :erpc.call(other_node, DGen.ClusterHelper, :start_registry, [
+        reg,
+        abs_cluster_file,
+        dir_path
+      ])
+
+    :erpc.call(other_node, DGen.ClusterHelper, :await_leader!, [reg])
+
+    # All three must agree leader_node is leader before a test proceeds.
+    assert eventually(
+             fn ->
+               leader = :dgen_registry.get_leader(reg)
+
+               match?({^leader_node, _}, leader) and
+                 :erpc.call(other_node, :dgen_registry, :get_leader, [reg]) == leader
+             end,
+             5_000
+           ),
+           "expected #{inspect(leader_node)} to be the elected leader"
+
+    on_exit(fn -> DGen.ClusterHelper.stop_peer(leader_pid) end)
+    on_exit(fn -> DGen.ClusterHelper.stop_peer(other_pid) end)
+
+    {reg, leader_node, leader_pid, leader_sup, other_node, other_pid}
   end
 
   # ---------------------------------------------------------------------------
@@ -213,6 +278,64 @@ defmodule DGen.RegistryClusterTest do
              ),
              "consistent read on primary did not return peer-registered pid"
     end
+
+    test "metadata registered on peer is eventually visible on primary", %{
+      reg: reg,
+      peer_node: peer_node
+    } do
+      remote_pid = spawn_remote(peer_node)
+      spec = %{index: %{role: :worker}, data: :payload}
+
+      :yes =
+        :erpc.call(peer_node, :dgen_registry, :register_name, [
+          {reg, :peer_meta},
+          remote_pid,
+          spec
+        ])
+
+      assert eventually(fn ->
+               :dgen_registry.get_metadata({reg, :peer_meta}) ==
+                 {:ok, %{pid: remote_pid, index: %{role: :worker}, data: :payload}}
+             end),
+             "peer-registered metadata was not replicated to primary"
+    end
+
+    test "set_metadata on primary is eventually visible on peer", %{
+      reg: reg,
+      peer_node: peer_node
+    } do
+      remote_pid = spawn_remote(peer_node)
+      :yes = :dgen_registry.register_name({reg, :meta_to_peer}, remote_pid)
+
+      :ok = :dgen_registry.set_metadata({reg, :meta_to_peer}, %{index: %{x: 1}, data: :d})
+
+      assert eventually(fn ->
+               :erpc.call(peer_node, :dgen_registry, :get_metadata, [{reg, :meta_to_peer}]) ==
+                 {:ok, %{pid: remote_pid, index: %{x: 1}, data: :d}}
+             end),
+             "metadata set on primary did not replicate to peer"
+    end
+
+    test "a query on the primary finds a peer-registered indexed registration", %{
+      reg: reg,
+      peer_node: peer_node
+    } do
+      remote_pid = spawn_remote(peer_node)
+      spec = %{index: %{role: :indexer}}
+
+      :yes =
+        :erpc.call(peer_node, :dgen_registry, :register_name, [{reg, :peer_q}, remote_pid, spec])
+
+      # The primary rebuilds its inverted index from the replication broadcast, so the
+      # local snapshot query eventually finds the peer's registration.
+      assert eventually(fn ->
+               case :dgen_registry.query(reg, %{role: :indexer}) do
+                 [%{name: :peer_q, pid: ^remote_pid}] -> true
+                 _ -> false
+               end
+             end),
+             "peer-registered indexed name not found by primary query"
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -255,7 +378,7 @@ defmodule DGen.RegistryClusterTest do
       {:ok, _} = :erpc.call(late_peer_node, Application, :ensure_all_started, [:erlfdb])
       {:ok, _} = :erpc.call(late_peer_node, Application, :ensure_all_started, [:dgen])
 
-      :ok =
+      _late_peer_sup =
         :erpc.call(late_peer_node, DGen.ClusterHelper, :start_registry, [
           late_reg,
           abs_cluster_file,
@@ -272,6 +395,83 @@ defmodule DGen.RegistryClusterTest do
                  ]) == pid
                end),
                "pre-join name #{inspect(name)} missing from late peer snapshot"
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Lock-free handoff (§5.7) — the distributed lock that used to serialize the
+  # handoff is gone; the leader-key commit fences the old leader instead, so the
+  # window is naturally quiescent. This guards the main worry of removing it:
+  # back-to-back membership changes the lock used to serialize must still each
+  # gather + distribute correctly, with no split-brain.
+  # ---------------------------------------------------------------------------
+
+  describe "lock-free handoff (§5.7)" do
+    test "back-to-back joins each receive the snapshot and all nodes agree on one leader",
+         %{abs_cluster_file: abs_cluster_file, dir_path: dir_path, db: db, case_dir: case_dir} do
+      suffix = :erlang.unique_integer([:positive])
+      reg = :"lockfree_reg_#{suffix}"
+
+      {:ok, _} = :dgen_registry.start_link(reg, {db, case_dir})
+      await_leader!(reg)
+
+      # Pre-register names so a joining member must receive them via the snapshot
+      # that the post-commit handoff action distributes.
+      pids =
+        for i <- 1..3 do
+          pid = spawn(fn -> Process.sleep(:infinity) end)
+          on_exit(fn -> Process.exit(pid, :kill) end)
+          name = :"lf_#{i}"
+          :yes = :dgen_registry.register_name({reg, name}, pid)
+          {name, pid}
+        end
+
+      # Boot two peers, then join them back-to-back so the elector processes two
+      # membership changes in quick succession — the case the distributed lock used
+      # to serialize. Without the lock each join's post-commit action still gathers
+      # and distributes; nothing pauses the other consumers.
+      peer_nodes =
+        for j <- 1..2 do
+          pname = :"lfpeer#{suffix}_#{j}@127.0.0.1"
+          {:ok, ppid, pnode} = :peer.start_link(%{name: pname, connection: :standard_io})
+          on_exit(fn -> DGen.ClusterHelper.stop_peer(ppid) end)
+          :erpc.call(pnode, :code, :add_paths, [:code.get_path()])
+          {:ok, _} = :erpc.call(pnode, Application, :ensure_all_started, [:erlfdb])
+          {:ok, _} = :erpc.call(pnode, Application, :ensure_all_started, [:dgen])
+          pnode
+        end
+
+      for pnode <- peer_nodes do
+        _sup =
+          :erpc.call(pnode, DGen.ClusterHelper, :start_registry, [
+            reg,
+            abs_cluster_file,
+            dir_path
+          ])
+      end
+
+      for pnode <- peer_nodes do
+        :erpc.call(pnode, DGen.ClusterHelper, :await_leader!, [reg])
+      end
+
+      # Every joined peer eventually holds the full pre-registration snapshot.
+      for pnode <- peer_nodes, {name, pid} <- pids do
+        assert eventually(fn ->
+                 :erpc.call(pnode, :dgen_registry, :whereis_name, [{reg, name}]) == pid
+               end),
+               "name #{inspect(name)} missing from #{inspect(pnode)} after back-to-back joins"
+      end
+
+      # All nodes agree on a single leader — no split-brain from the unlocked handoff.
+      leader = :dgen_registry.get_leader(reg)
+      assert leader != :undefined
+
+      for pnode <- peer_nodes do
+        assert eventually(fn ->
+                 :erpc.call(pnode, :dgen_registry, :get_leader, [reg]) == leader
+               end),
+               "#{inspect(pnode)} disagrees on the leader after back-to-back joins"
       end
     end
   end
@@ -403,6 +603,108 @@ defmodule DGen.RegistryClusterTest do
   end
 
   # ---------------------------------------------------------------------------
+  # Leader failure and failover (§5.1, §5.5, §5.7)
+  #
+  # Every other test in this file disconnects or reconnects the *peer* — the
+  # primary always keeps leadership (sticky, and it joins first). None of them
+  # exercise the registry's most distinctive claim: that the leader itself can
+  # die and the survivors elect a replacement without losing a two-holder
+  # binding. Testing that honestly requires a peer, not the primary, to hold
+  # leadership in the first place — see start_peer_led_cluster!/1.
+  # ---------------------------------------------------------------------------
+
+  describe "leader failure and failover" do
+    test "a graceful leader shutdown fails over without losing a registration", context do
+      {reg, leader_node, _leader_pid, leader_sup, other_node, _other_pid} =
+        start_peer_led_cluster!(context)
+
+      old_leader = :dgen_registry.get_leader(reg)
+
+      # Register from the primary — a *forwarded* registration, so it is
+      # two-holder for free (leader + the forwarding primary) the instant it
+      # acks `yes` (§5.5) — well before the leader is touched.
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+      :yes = :dgen_registry.register_name({reg, :survives_graceful}, pid)
+
+      # Stop just the leader's registry supervisor — its node stays up and
+      # connected, so peers observe an ordinary process DOWN, not a nodedown.
+      :ok = :erpc.call(leader_node, DGen.ClusterHelper, :stop_registry, [leader_sup])
+
+      assert eventually(
+               fn ->
+                 primary_leader = :dgen_registry.get_leader(reg)
+                 other_leader = :erpc.call(other_node, :dgen_registry, :get_leader, [reg])
+
+                 primary_leader not in [:undefined, old_leader] and
+                   primary_leader == other_leader
+               end,
+               20_000
+             ),
+             "primary and surviving peer did not agree on a new leader " <>
+               "after the graceful shutdown"
+
+      # The registration survives — held independently by the primary, which
+      # was reachable throughout, regardless of which survivor became leader.
+      assert eventually(fn ->
+               :dgen_registry.whereis_name_consistent({reg, :survives_graceful}) == pid
+             end),
+             "registration did not survive the graceful leader shutdown"
+
+      # The registry is writable again post-failover.
+      new_pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(new_pid, :kill) end)
+
+      assert eventually(fn ->
+               :dgen_registry.register_name({reg, :post_graceful_failover}, new_pid) == :yes
+             end),
+             "could not register a new name after the graceful failover"
+    end
+
+    test "abruptly losing the leader node fails over without losing a registration", context do
+      {reg, _leader_node, leader_pid, _leader_sup, other_node, _other_pid} =
+        start_peer_led_cluster!(context)
+
+      old_leader = :dgen_registry.get_leader(reg)
+
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+      :yes = :dgen_registry.register_name({reg, :survives_hard_kill}, pid)
+
+      # Pull the plug: the whole leader node disappears (unlike the graceful
+      # case above, where only its registry supervisor stopped). Survivors
+      # see this as a nodedown, not a clean process exit.
+      DGen.ClusterHelper.stop_peer(leader_pid)
+
+      assert eventually(
+               fn ->
+                 primary_leader = :dgen_registry.get_leader(reg)
+                 other_leader = :erpc.call(other_node, :dgen_registry, :get_leader, [reg])
+
+                 primary_leader not in [:undefined, old_leader] and
+                   primary_leader == other_leader
+               end,
+               8_000
+             ),
+             "primary and surviving peer did not agree on a new leader " <>
+               "after the leader node died"
+
+      assert eventually(fn ->
+               :dgen_registry.whereis_name_consistent({reg, :survives_hard_kill}) == pid
+             end),
+             "registration did not survive the abrupt leader failure"
+
+      new_pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(new_pid, :kill) end)
+
+      assert eventually(fn ->
+               :dgen_registry.register_name({reg, :post_hard_failover}, new_pid) == :yes
+             end),
+             "could not register a new name after the abrupt failover"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Epoch fencing across nodes
   # ---------------------------------------------------------------------------
 
@@ -423,11 +725,12 @@ defmodule DGen.RegistryClusterTest do
       # the peer member's mailbox, bypassing the real leader.
       :erpc.call(peer_node, :gen_server, :cast, [
         peer_member,
-        {:name_registered, :ghost_name, pid, epoch - 1}
+        {:name_registered, :ghost_name, pid, %{}, :undefined, epoch - 1, 0}
       ])
 
-      # A call to the same process serialises after the cast.
-      :erpc.call(peer_node, :dgen_registry, :whereis_name, [{reg, :__barrier__}])
+      # whereis_name now reads the member's ETS table in the caller, so it no longer
+      # serialises behind the cast — flush the peer member's mailbox with get_state.
+      :erpc.call(peer_node, :sys, :get_state, [peer_member])
 
       assert :undefined == remote_whereis(peer_node, reg, :ghost_name)
     end
@@ -444,8 +747,11 @@ defmodule DGen.RegistryClusterTest do
 
       :erpc.call(peer_node, :gen_server, :cast, [
         peer_member,
-        {:name_registered, :valid_name, pid, epoch}
+        {:name_registered, :valid_name, pid, %{}, :undefined, epoch, 0}
       ])
+
+      # Barrier: ensure the peer member processed the cast before the caller-side read.
+      :erpc.call(peer_node, :sys, :get_state, [peer_member])
 
       assert pid == :erpc.call(peer_node, :dgen_registry, :whereis_name, [{reg, :valid_name}])
     end

@@ -32,7 +32,24 @@ The following options may be passed via the `Opts` proplist:
   caller raises `{dead_letter, N}` (for `call` messages), and the optional
   `handle_dead_letter/2` callback is invoked. `infinity` (the default) disables
   dead-lettering entirely.
+- `consume_k` (default `1`) - the maximum number of queued messages a consumer
+  processes per transaction (the batch size). Each consume cycle peeks up to
+  `consume_k` messages, processes them one at a time while carrying the durable
+  state in memory, and commits the whole batch in a **single** transaction (the
+  state is read once and written once). It then immediately re-arms itself, so a
+  consumer that has work keeps draining batches.
 
+  Raising `consume_k` amortises the fixed per-transaction cost (read version,
+  state read/write, commit) across more messages, increasing throughput when the
+  per-message callback work is small. The cost is larger transactions and a
+  coarser unit of progress (a batch is all-or-nothing; on a conflict the whole
+  batch retries). Because a busy consumer keeps draining, a larger `consume_k`
+  also tends to keep a **single** node as the active consumer, which is useful
+  when the callback's identity matters — for example an election-style callback
+  where you want to minimise churn in who processes successive messages.
+
+  See "consume_k and inlining" below for how `consume_k > 1` changes call
+  handling.
 - `lock_timeout` (default `infinity`) - maximum number of milliseconds a
   distributed lock may be held before other consumers treat it as stale.  When
   a callback returns `{lock, State}`, `dgen_server` sets a timestamped lock key
@@ -44,6 +61,34 @@ The following options may be passed via the `Opts` proplist:
   passed.  `infinity` (the default) disables stale-lock detection entirely —
   a dead holder will permanently block all consumers.  Set this to a value
   safely larger than the worst-case `handle_locked` duration for your callback.
+
+## consume_k and inlining
+
+A message can reach a callback by two routes:
+
+1. **Through the durable queue.** `cast/2` and (normally) `call/2` enqueue the
+   message; a consumer later peeks it as part of a `consume_k`-sized batch and
+   processes it inside the batch's single transaction. This is the ordered,
+   durable path, and the only path when `consume_k > 1`.
+2. **Inline.** As a latency optimisation, when `consume_k =:= 1` a `call/2` whose
+   queue is currently empty and unlocked is processed *immediately*, in the
+   caller's own request transaction, instead of being enqueued and waited on.
+   The result is identical to processing it through the queue; it just skips the
+   enqueue/await round-trip.
+
+When **`consume_k > 1`, inlining is disabled**: every `call/2` goes through the
+queue and the batched consume loop, so `consume_k` is always in effect. Use this
+when you want all processing funnelled through the batched, single-consumer loop —
+for example to keep a stable consumer identity (an election-style callback that
+would otherwise see successive messages committed by different nodes). With the
+default `consume_k =:= 1`, inlining is enabled and a contention-free `call/2` is
+served on the fast path.
+
+Independently of `consume_k`, `priority_call/2` and `priority_cast/2` **always**
+bypass the queue (and locks) and are handled immediately. They are an explicit
+escape hatch for urgent, usually read-only work; they trade away ordering with
+respect to queued messages, so prefer `call/2`/`cast/2` for anything that must be
+ordered with the rest of the stream.
 
 ## Callbacks
 
@@ -58,6 +103,24 @@ The following options may be passed via the `Opts` proplist:
 
 `Actions` is a list of 1-arity funs executed after the transaction commits. The
 argument is the
+
+## Module State
+
+The module that implements the `dgen_server` behaviour may define any term to
+serve as the State. `dgen_server` will encode this state for writing to the
+database. We encourage you to structure your state to fit in with this
+encoding scheme, which will yield performance benefits.
+
+- **term** (fallback) - `term_to_binary`, chunked into 100KB values.
+- **assigns map** - map with all atom keys; each entry stored at a
+  separate DB key using `atom_to_binary(Key)` in the path.
+- **component list** - list of maps where every item has an atom `id`
+  key with a binary value; each item stored separately, ordered by a
+  fractional index embedded in the DB key.
+
+The encoding is applied recursively. For example, an assigns map whose value
+is a component list will nest both encodings in the key path.
+
 """.
 -endif.
 
@@ -425,26 +488,29 @@ handle_call({priority, Request}, _From, State = #state{tenant = Tenant}) ->
             finalize(Result)
     end.
 
-inline_or_push(Td, Request, LocalFrom, WatchTo, Options, Tuid, State) ->
+inline_or_push(Td, Request, LocalFrom, WatchTo, Options, Tuid, State = #state{consume_k = K}) ->
     Push = fun(Attempts) ->
         dgen:push_call(Td, Tuid, get_quid(Tuid), Request, WatchTo, Options, Attempts)
     end,
-    case dgen_queue:length(Td, get_quid(Tuid)) of
-        0 ->
-            case is_locked(Td, State) of
-                true ->
-                    {From, NewWatch} = Push(0),
-                    {push, From, NewWatch, State};
-                false ->
-                    try
-                        consume_call(Td, Request, LocalFrom, State)
-                    catch
-                        Class:Reason:Stack ->
-                            {From, NewWatch} = Push(1),
-                            {push_after_fail, From, NewWatch, State, Class, Reason, Stack}
-                    end
+    %% Inline handling — process the call immediately in this transaction instead of
+    %% enqueuing it and waiting for the consume loop — is attempted only when
+    %% consume_k =:= 1, and then only if the queue is empty and unlocked.  With
+    %% consume_k > 1 the server is configured for batched, single-consumer processing,
+    %% so inlining is disabled entirely: every call goes through the durable queue and
+    %% the consume loop, keeping consume_k always in effect.  See "consume_k and
+    %% inlining" in the moduledoc.  (`priority_call` always bypasses the queue,
+    %% independent of consume_k.)
+    InlineEligible = K =:= 1 andalso dgen_queue:length(Td, get_quid(Tuid)) =:= 0,
+    case InlineEligible andalso not is_locked(Td, State) of
+        true ->
+            try
+                consume_call(Td, Request, LocalFrom, State)
+            catch
+                Class:Reason:Stack ->
+                    {From, NewWatch} = Push(1),
+                    {push_after_fail, From, NewWatch, State, Class, Reason, Stack}
             end;
-        _ ->
+        false ->
             {From, NewWatch} = Push(0),
             {push, From, NewWatch, State}
     end.

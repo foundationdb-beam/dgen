@@ -3,31 +3,31 @@
 -define(DOCATTRS, ?OTP_RELEASE >= 27).
 
 -if(?DOCATTRS).
--moduledoc """
-Internal helpers for the dgen_server call/reply protocol.
-
-This module implements the client-side call flow: pushing a call request
-onto the durable queue, waiting for the reply via a watch, and
-cleaning up reply keys on timeout.
-
-Reply payloads are stored using the codec's chunked term encoding so that
-replies can exceed the single-value size limit. The watch is placed on
-the first chunk key; the client always reads via `get_range`.
-
-### Call Request Flow
-
-1. The caller invokes `dgen_server:call/3` which delegates to `call/4`.
-2. A call request is pushed onto the durable queue via `push_call/5`,
-   which writes `noreply` as a chunked term under the from-key and sets
-   a watch on the first chunk key.
-3. The caller blocks in `await_call_reply/4` until the watch fires or
-   the timeout expires.
-4. A consumer processes the request and writes `{reply, Reply}` as a
-   chunked term under the from-key.
-5. The watch fires, the caller reads and clears the chunked reply.
-6. On timeout the caller clears the chunked reply keys to avoid leaks.
-""".
+-moduledoc false.
 -endif.
+
+%% Internal helpers for the dgen_server call/reply protocol.
+%%
+%% This module implements the client-side call flow: pushing a call request
+%% onto the durable queue, waiting for the reply via a watch, and
+%% cleaning up reply keys on timeout.
+%%
+%% Reply payloads are stored using the codec's chunked term encoding so that
+%% replies can exceed the single-value size limit. The watch is placed on
+%% the first chunk key; the client always reads via `get_range`.
+%%
+%% ### Call Request Flow
+%%
+%% 1. The caller invokes `dgen_server:call/3` which delegates to `call/4`.
+%% 2. A call request is pushed onto the durable queue via `push_call/5`,
+%%    which writes `noreply` as a chunked term under the from-key and sets
+%%    a watch on the first chunk key.
+%% 3. The caller blocks in `await_call_reply/4` until the watch fires or
+%%    the timeout expires.
+%% 4. A consumer processes the request and writes `{reply, Reply}` as a
+%%    chunked term under the from-key.
+%% 5. The watch fires, the caller reads and clears the chunked reply.
+%% 6. On timeout the caller clears the chunked reply keys to avoid leaks.
 
 -export([get_waiting_key/1, get_from/2, call/4, push_call/6, push_call/7]).
 

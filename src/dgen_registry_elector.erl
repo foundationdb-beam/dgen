@@ -5,82 +5,74 @@
 -define(SnapshotTimeout, 2000).
 
 -if(?DOCATTRS).
--moduledoc """
-`dgen_server` callback module that tracks registry membership and elects a leader.
-
-The elector's state (member map + current leader) is stored durably in the
-backend and is shared across every node that runs the same named registry.
-Messages arrive via a durable FIFO queue, so membership changes are processed
-one at a time, serialised through the backend.
-
-## Leader election
-
-The incumbent leader is kept as long as it remains a member — leadership
-only changes when the incumbent leaves or no leader has been elected yet.
-This prevents thrashing when a non-leader node happens to win a backend
-transaction race.
-
-When a new leader must be chosen (no valid incumbent), the node that wins
-the backend transaction race is preferred: if `{node(), MemberName}` is a
-current member, that node becomes leader. If not (transient window during
-startup), `lists:min/1` over live member IDs is used as a deterministic
-fallback.
-
-## Replication on leadership change
-
-When `elect_leader/4` returns a leader different from the previous one,
-`handle_cast_tx` returns `{lock, NewState}`, triggering the following
-sequence before the lock clears:
-
-1. **Commit + lock** — the backend transaction commits the new member set
-   and leader key atomically, then sets a distributed lock key that pauses
-   all other elector consumers on all nodes.  The lock is held for at most
-   `?SnapshotTimeout × 2` ms — the worst-case duration of two synchronous
-   cross-node calls in `handle_locked/4`.  An Erlang `after` block
-   guarantees the lock is cleared even if `handle_locked` raises; only a
-   hard process kill (SIGKILL / VM abort) can leave it permanently set.
-2. **Snapshot acquisition** — `handle_locked/4` decides what names snapshot
-   the new leader starts with:
-   - If the new leader is a brand-new member with no prior follower state
-     (only possible when there is no valid incumbent, i.e. first join into
-     an existing cluster), the elector calls the old leader via
-     `{transfer_snapshot}`. The old leader flushes any pending registrations
-     from its mailbox, returns its authoritative names list, and sets its
-     own leader field to `undefined` — relinquishing leadership atomically
-     in a single gen_server call.
-   - Otherwise (an existing member takes over, or leader died and a follower
-     is promoted), the new leader uses `self_snapshot` — its own in-memory
-     names map, which is already a follower replica.
-
-3. **Leader assumption** — the elector calls the new leader via
-   `{elector_assume_and_distribute, Snapshot, MemberId, AllIds, Tokens, Epoch}`.
-   The new leader stores the epoch, applies the snapshot, sets up
-   `erlang:monitor/2` for every registered pid, and casts
-   `{apply_names_snapshot, ..., Epoch}` to every follower from its own process.
-
-4. **Follower sync** — each follower receives `{apply_names_snapshot}`,
-   overwrites its names map, and updates its leader field. Because these
-   casts originate from the same process as subsequent `{name_registered}`
-   broadcasts, Erlang's per-pair FIFO guarantee ensures every follower
-   sees the snapshot before any registration that post-dates the transition.
-
-5. **Lock clears** — `handle_locked` returns, the lock key is cleared, and
-   all waiting consumers resume.
-
-## Leader key in the backend
-
-```
-Key path: {Tuid, <<"leader">>}
-Value:    term_to_binary(MemberId | undefined)
-```
-""".
+-moduledoc false.
 -endif.
+
+%% `dgen_server` callback module that tracks registry membership and elects a leader.
+%%
+%% Section references (e.g. `§5.7`) point to `docs/dgen_registry_design.md`, the
+%% registry's design-and-guarantees document.
+%%
+%% The elector's state (member map + current leader) is stored durably in the
+%% backend and is shared across every node that runs the same named registry.
+%% Messages arrive via a durable FIFO queue, so membership changes are processed
+%% one at a time, serialised through the backend.
+%%
+%% ## Leader election
+%%
+%% The incumbent leader is kept as long as it remains a member — leadership
+%% only changes when the incumbent leaves or no leader has been elected yet.
+%% This prevents thrashing when a non-leader node happens to win a backend
+%% transaction race.
+%%
+%% When a new leader must be chosen (no valid incumbent), the node that wins
+%% the backend transaction race is preferred: if `{node(), MemberName}` is a
+%% current member, that node becomes leader. If not (transient window during
+%% startup), `lists:min/1` over live member IDs is used as a deterministic
+%% fallback.
+%%
+%% ## Replication on a membership change
+%%
+%% A membership change (`{join}` always; `{member_down}` when the leader itself
+%% departs) routes through the current leader so it reconstructs and fans out the
+%% names snapshot.  This runs as a **post-commit action** (the `Actions` list
+%% returned from `handle_cast_tx`, executed by `dgen_server` after the membership
+%% transaction commits) — **no distributed lock**:
+%%
+%% 1. **Commit** — the backend transaction commits the new member set and leader key
+%%    atomically.  This is the serialization point: the moment the new leader key is
+%%    committed, the *old* leader is fenced — its next batch commit conflicts on the
+%%    leader key and aborts (`dgen_registry_names`), so it can no longer accept a
+%%    registration.  The handoff window is therefore naturally quiescent; the
+%%    cross-consumer lock the registry formerly used is unnecessary (§5.7 of the
+%%    design doc).
+%% 2. **Leader assumption** — the action calls the leader via
+%%    `{elector_assume_and_distribute, TriggerMember, AllIds, Tokens, Epoch}`. The
+%%    leader reconstructs the names map itself by gathering every reachable member's
+%%    replica (`gather_maps/3`) and taking the freshest — no snapshot is passed, no
+%%    occupancy read, and no synchronous old-leader hand-off is needed. It resolves any
+%%    conflicts (§5.6), stores the epoch, sets up `erlang:monitor/2` for every
+%%    registered pid, and casts `{apply_names_snapshot, ..., Epoch}` to every follower
+%%    from its own process. The call is wrapped in `try/catch`: an unreachable leader
+%%    does not fail the action — the membership change is already committed and
+%%    affected members self-correct on the next membership event.
+%% 3. **Follower sync** — each follower receives `{apply_names_snapshot}`,
+%%    overwrites its names map, and updates its leader field. Because these
+%%    casts originate from the same process as subsequent `{name_registered}`
+%%    broadcasts, Erlang's per-pair FIFO guarantee ensures every follower
+%%    sees the snapshot before any registration that post-dates the transition.
+%%
+%% ## Leader key in the backend
+%%
+%% ```
+%% Key path: {Tuid, <<"leader">>}
+%% Value:    term_to_binary(MemberId | undefined)
+%% ```
 
 -export([
     init/1,
     handle_cast_tx/3,
     handle_call/3,
-    handle_locked/4,
     leader_db_key/2
 ]).
 
@@ -113,7 +105,9 @@ init(#{name := Name}) ->
 Processes membership change messages within a backend transaction.
 
 Handles `{join, MemberId, Token}` and `{member_down, MemberId, Token}`. Returns
-`{lock, NewState}` when leadership changes, `{noreply, NewState}` otherwise.
+`{noreply, NewState, Actions}` when the handoff must be routed through the leader
+(every join; a leader-changing member_down), else plain `{noreply, NewState}`. The
+`Actions` run after the transaction commits — no distributed lock (§5.7).
 
 Each `{join}` carries a unique token (a `reference()` generated by the member
 process before enqueuing).  The elector stores this token in `member_info`.
@@ -126,7 +120,7 @@ is processed after the subsequent `{join}` that heals the cluster.
 """.
 -endif.
 -spec handle_cast_tx(dgen_server:tx_ctx(), term(), registry_state()) ->
-    dgen_server:noreply_ret() | dgen_server:lock_ret().
+    dgen_server:noreply_ret().
 
 handle_cast_tx(TxCtx, {join, MemberId, Token}, State) ->
     #{name := Name, members := Members, leader := OldLeader, epoch := OldEpoch} = State,
@@ -134,24 +128,13 @@ handle_cast_tx(TxCtx, {join, MemberId, Token}, State) ->
     NewMembers = Members#{MemberId => MemberInfo},
     {NewLeader, NewEpoch} = elect_leader(TxCtx, Name, NewMembers, OldLeader, OldEpoch),
     NewState = State#{members => NewMembers, leader => NewLeader, epoch => NewEpoch},
-    if
-        NewLeader =/= OldLeader ->
-            %% Leadership changed — lock so handle_locked can set up replication paths.
-            {lock, NewState};
-        true ->
-            %% Leader unchanged — route through the leader so all follower messages
-            %% come from the same sender (FIFO with subsequent name broadcasts).
-            Actions = [
-                fun(#{members := All, leader := L, epoch := Epoch}) ->
-                    call_to_member(
-                        L,
-                        {elector_assume_and_distribute, self_snapshot, MemberId, maps:keys(All),
-                            member_tokens(All), Epoch}
-                    )
-                end
-            ],
-            {noreply, NewState, Actions}
-    end;
+    %% A join always routes through the leader so it gathers + distributes the names
+    %% snapshot (delivering it to the joiner, and, on a leadership change, having the
+    %% new leader assume).  All follower messages then share one sender (FIFO with
+    %% subsequent name broadcasts).  This runs as a post-commit action — the
+    %% leader-key commit fences the old leader, so the handoff window is naturally
+    %% quiescent and no distributed lock is needed (§5.7).
+    {noreply, NewState, [assume_distribute_action(MemberId)]};
 handle_cast_tx(TxCtx, {member_down, MemberId, Token}, State) ->
     #{name := Name, members := Members, leader := OldLeader, epoch := OldEpoch} = State,
     case maps:get(MemberId, Members, undefined) of
@@ -165,15 +148,43 @@ handle_cast_tx(TxCtx, {member_down, MemberId, Token}, State) ->
             NewMembers = maps:remove(MemberId, Members),
             {NewLeader, NewEpoch} = elect_leader(TxCtx, Name, NewMembers, OldLeader, OldEpoch),
             NewState = State#{members => NewMembers, leader => NewLeader, epoch => NewEpoch},
-            if
-                NewLeader =/= OldLeader ->
-                    %% Leadership changed — lock to set up new replication paths.
-                    {lock, NewState};
+            case NewLeader =/= OldLeader of
                 true ->
+                    %% Leadership changed (the leader itself went down) — the new
+                    %% leader must gather + distribute.  Post-commit action; the commit
+                    %% fences the old leader, so no distributed lock is needed (§5.7).
+                    {noreply, NewState, [assume_distribute_action(undefined)]};
+                false ->
                     %% Leader unchanged — each surviving member detected the death
                     %% via its own erlang:monitor DOWN signal; no broadcast needed.
                     {noreply, NewState}
             end
+    end.
+
+%% Build the post-commit action that routes a membership change through the current
+%% leader: it calls `{elector_assume_and_distribute, …}` so the leader gathers every
+%% reachable member's names map, resolves conflicts (§5.6), and fans the snapshot out
+%% to all followers.  Runs after the membership transaction commits (see the
+%% `dgen_server` `Actions` contract).  `TriggerMember` is the joining member, or
+%% `undefined` for a member_down.  A `try/catch` keeps an unreachable leader from
+%% failing the action — the membership change is already committed and affected
+%% members self-correct on the next membership event.
+assume_distribute_action(TriggerMember) ->
+    fun(#{members := All, leader := Leader, epoch := Epoch}) ->
+        case Leader of
+            undefined ->
+                ok;
+            _ ->
+                try
+                    call_to_member(
+                        Leader,
+                        {elector_assume_and_distribute, TriggerMember, maps:keys(All),
+                            member_tokens(All), Epoch}
+                    )
+                catch
+                    exit:_ -> ok
+                end
+        end
     end.
 
 %% ---------------------------------------------------------------------------
@@ -192,81 +203,6 @@ handle_call(get_members, _From, State) ->
     {reply, maps:keys(maps:get(members, State, #{})), State};
 handle_call(get_epoch, _From, State) ->
     {reply, maps:get(epoch, State, 0), State}.
-
--if(?DOCATTRS).
--doc """
-Executes the replication sequence after a leadership change, before the lock clears.
-
-See the module doc for the full step-by-step sequence.
-
-`transfer_snapshot` is called only when the new leader is a brand-new member
-with no prior follower state — i.e., `Leader =:= MemberId` (the joiner itself
-won) and at least one other member existed before it joined. With sticky
-leadership this only occurs when there is no valid incumbent (first join into
-an existing cluster). In all other cases `self_snapshot` is used.
-
-All calls to member processes are wrapped in `try/catch`. If a target is
-unreachable:
-
-- `transfer_snapshot` failure: falls back to `self_snapshot`. The new leader
-  starts with a potentially stale names map for that transition window.
-- `elector_assume_and_distribute` failure: the lock clears normally. The
-  membership change is already committed to the backend; affected members
-  self-correct on the next membership event.
-""".
--endif.
--spec handle_locked(dgen_server:db_ctx(), dgen_server:event_type(), term(), registry_state()) ->
-    dgen_server:noreply_ret().
-
-handle_locked(_DbCtx, cast, {join, MemberId, _Token}, State) ->
-    #{members := Members, leader := Leader, epoch := Epoch} = State,
-    AllIds = maps:keys(Members),
-    Tokens = member_tokens(Members),
-    ExistingIds = maps:keys(maps:remove(MemberId, Members)),
-    Snapshot =
-        if
-            Leader =:= MemberId, ExistingIds =/= [] ->
-                %% New member won the election but has no prior state.  Call the
-                %% old leader to atomically hand off its snapshot and relinquish —
-                %% any registration in its mailbox is flushed into the snapshot
-                %% before leadership transfers.
-                [SnapshotSource | _] = ExistingIds,
-                try
-                    call_to_member(SnapshotSource, {transfer_snapshot, Leader})
-                catch
-                    exit:_ -> self_snapshot
-                end;
-            true ->
-                %% Existing member is (or remains) the leader — use its own names.
-                self_snapshot
-        end,
-    try
-        call_to_member(
-            Leader,
-            {elector_assume_and_distribute, Snapshot, MemberId, AllIds, Tokens, Epoch}
-        )
-    catch
-        exit:_ -> ok
-    end,
-    {noreply, State};
-handle_locked(_DbCtx, cast, {member_down, _MemberId, _Token}, State) ->
-    #{members := Members, leader := Leader, epoch := Epoch} = State,
-    AllIds = maps:keys(Members),
-    Tokens = member_tokens(Members),
-    case Leader of
-        undefined ->
-            ok;
-        _ ->
-            try
-                call_to_member(
-                    Leader,
-                    {elector_assume_and_distribute, self_snapshot, undefined, AllIds, Tokens, Epoch}
-                )
-            catch
-                exit:_ -> ok
-            end
-    end,
-    {noreply, State}.
 
 %% ---------------------------------------------------------------------------
 %% Internal helpers
@@ -329,10 +265,11 @@ member_tokens(Members) ->
 call_to_member({Node, Name}, Msg) ->
     %% Guard against automatic distribution reconnect: if the target node is
     %% not currently connected, exit immediately rather than letting
-    %% gen_server:call trigger a reconnect.  An unintended reconnect during
-    %% handle_locked fires {nodeup} on both sides, causing the peer to re-join
-    %% with a new token — the old {member_down} is then discarded as stale and
-    %% the partition is never detected.
+    %% gen_server:call trigger a reconnect.  An unintended reconnect during the
+    %% handoff fires {nodeup} on both sides, causing the peer to re-join with a new
+    %% token — the old {member_down} is then discarded as stale and the partition is
+    %% never detected.  (This guard is independent of the now-removed distributed
+    %% lock; keep it regardless — §5.7.)
     case Node =:= node() orelse lists:member(Node, nodes()) of
         true -> gen_server:call({Name, Node}, Msg, ?SnapshotTimeout);
         false -> exit({nodedown, Node})
