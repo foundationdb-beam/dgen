@@ -101,6 +101,15 @@ defmodule DGen.RegistryClusterTest do
     :erpc.call(peer_node, :dgen_registry, :whereis_name_consistent, [{reg, name}])
   end
 
+  # The peer member's current applied version (via the same snapshot call the
+  # handoff gather uses), so a test can craft version-contiguous broadcasts.
+  defp peer_applied_version(peer_node, peer_member) do
+    {_records, version, _released} =
+      :erpc.call(peer_node, GenServer, :call, [peer_member, :get_names_snapshot])
+
+    version
+  end
+
   # Spawn a long-lived process on a remote node without Elixir dependency.
   # Uses :timer.sleep so no Elixir module is required on the peer.
   defp spawn_remote(node) do
@@ -719,13 +728,16 @@ defmodule DGen.RegistryClusterTest do
       epoch = :dgen_registry.get_epoch(reg)
       assert epoch > 0
 
+      leader = :dgen_registry.get_leader(reg)
       peer_member = :erpc.call(peer_node, :dgen_registry, :member_name, [reg])
+      v = peer_applied_version(peer_node, peer_member)
 
       # Inject a broadcast carrying a stale epoch (epoch - 1) directly into
-      # the peer member's mailbox, bypassing the real leader.
+      # the peer member's mailbox, bypassing the real leader.  The version stamps
+      # are contiguous, so only the stale epoch causes the discard.
       :erpc.call(peer_node, :gen_server, :cast, [
         peer_member,
-        {:name_registered, :ghost_name, pid, %{}, :undefined, epoch - 1, 0}
+        {:name_registered, :ghost_name, pid, %{}, :undefined, epoch - 1, v, v + 1, leader}
       ])
 
       # whereis_name now reads the member's ETS table in the caller, so it no longer
@@ -743,11 +755,13 @@ defmodule DGen.RegistryClusterTest do
       on_exit(fn -> Process.exit(pid, :kill) end)
 
       epoch = :dgen_registry.get_epoch(reg)
+      leader = :dgen_registry.get_leader(reg)
       peer_member = :erpc.call(peer_node, :dgen_registry, :member_name, [reg])
+      v = peer_applied_version(peer_node, peer_member)
 
       :erpc.call(peer_node, :gen_server, :cast, [
         peer_member,
-        {:name_registered, :valid_name, pid, %{}, :undefined, epoch, 0}
+        {:name_registered, :valid_name, pid, %{}, :undefined, epoch, v, v + 1, leader}
       ])
 
       # Barrier: ensure the peer member processed the cast before the caller-side read.

@@ -233,13 +233,40 @@
 %% reconnected at all); a `{nodeup, _}` clears the suppression early.
 -define(MESH_DOWN_COOLDOWN, 10000).
 
-%% How long a pid the leader *explicitly* released (an unregister of a live process)
-%% is remembered in `recently_released`.  This is the discriminator that keeps the
-%% conflict detector (§5.6) from false-killing a process that was legitimately
-%% unregistered-while-alive but is still reported by a lagging member: a real
-%% unregister leaves a trail here, a reconstruction-drop (the genuine conflict) does
-%% not.  It only needs to outlast normal broadcast lag, not a partition.
--define(RELEASED_TTL, 30000).
+%% After a node drops, this member reaps any registry member still stranded on that
+%% (still-disconnected) node from the elector's set — a backstop for the case where a
+%% member's own monitor `{member_down}` was fenced away as stale (e.g. a `{join}` the
+%% dead member enqueued on a nodeup just before its node vanished re-added it with a
+%% token this node never saw).  Each pass reads the elector and reports `member_down`
+%% for such members; it opens no distribution connection, so it cannot heal the very
+%% partition it is reacting to.  Retried a few times because the resurrecting `{join}`
+%% may not be processed until after the first pass; it stops early once the node
+%% reconnects (a live member re-announces and wins), leaves the set, or the attempts
+%% are exhausted.
+-define(REAP_INTERVAL, 1000).
+-define(REAP_ATTEMPTS, 6).
+
+%% How often the periodic maintenance pass runs: it prunes `recently_released`
+%% (the conflict-detector trail, §5.6 — TTL from `dgen_config:conflict_release_ttl/1`)
+%% and the per-name `kill_budget` timestamps.  Trail pruning is *suspended* while any
+%% current member is disconnected: a disconnected member misses unregister broadcasts
+%% entirely (they are dropped, not delayed), so its stale rows can surface at a rejoin
+%% gather arbitrarily later than any broadcast lag — the trail must outlive the
+%% partition, not just the lag.  The trail itself is also replicated (unregister
+%% broadcasts carry the released pid) and merged across members at a handoff gather,
+%% so it survives leadership changes.
+-define(PRUNE_INTERVAL, 30000).
+
+%% How long a follower waits after requesting a resync (it observed a gap in the
+%% leader's broadcast stream) before it may request again.
+-define(RESYNC_RETRY, 2000).
+
+%% Delay before re-driving the destructive ops (removes/retracts/downs) of a batch
+%% that failed to commit — a backend error, a fence, or a worker death.  Registrations
+%% are simply rejected (callers retry), but a lost unregister/retract would leave a
+%% permanent replica divergence, so those are re-enqueued (still leader) or forwarded
+%% to the current leader (deposed) after this delay.
+-define(REQUEUE_DELAY, 1000).
 
 %% Bound on the per-peer aliveness probe used when adjudicating a suspected conflict.
 -define(ALIVE_PROBE_TIMEOUT, 1000).
@@ -398,21 +425,45 @@
     %% version to skip a GRV (cached GRV).  A stale value is handled by the worker
     %% retrying with a fresh GRV.  Reset on losing leadership.
     last_version = undefined :: undefined | integer(),
-    %% The highest commit version this member has applied to `names` — bumped by
+    %% The highest commit version this member has applied to `names` — advanced by
     %% every name broadcast (which carries its batch's commit version) and set from
     %% the snapshot on a leadership change.  Globally monotonic (FDB commit versions),
     %% so on a handoff the new leader picks the member with the highest applied_version
     %% as the freshest source for the gather.  All members track it.
+    %%
+    %% Crucially, a broadcast advances it only when it is **contiguous**: each
+    %% broadcast carries its batch's predecessor version, and a follower that observes
+    %% a gap (it missed a batch — a dropped cast during a disconnect, a lost in-flight
+    %% message) does *not* apply past the gap; it requests a resync snapshot instead.
+    %% This is what makes "highest applied_version holds the freshest binding for
+    %% every name" actually true: every replica is a prefix of the leader's stream,
+    %% so freshest-wins reconstruction can never silently lose a binding a gathered
+    %% member holds, nor resurrect one it unregistered (§5.7 / Guarantee 4).
     applied_version = 0 :: non_neg_integer(),
+    %% Timer for an outstanding resync request (a gap was observed and a snapshot was
+    %% requested from the broadcast's leader); `undefined` when none is outstanding.
+    %% Cleared when any snapshot arrives; on expiry the next gap re-requests.
+    resync_timer = undefined :: undefined | reference(),
+    %% Whether this member has ever synced registry state (applied a snapshot or
+    %% assumed leadership).  Joins announce `fresh = not synced`; a fresh member holds
+    %% no bindings, so the leader's `degraded` computation ignores it when it is
+    %% unreachable at a gather (see dgen_registry_elector's member_info doc).  On the
+    %% first sync the member re-announces itself with `fresh = false`.
+    synced = false :: boolean(),
     %% Monotonically increasing leader term counter set by the elector.
     %% Broadcasts from a prior leader carry a smaller epoch and are discarded.
     epoch :: non_neg_integer(),
-    %% Leader-only conflict-detection trail (§5.6): pids the leader *explicitly*
+    %% Conflict-detection trail (§5.6), kept on *every* member: pids explicitly
     %% released (an unregister of a live process) → the wall-clock ms it happened.
-    %% A handoff gather suppresses a divergence on a pid still in here (it was
-    %% legitimately unregistered, a lagging member just has not caught up), so only a
-    %% reconstruction-drop divergence — which leaves no trail — is killed.  TTL-pruned
-    %% (?RELEASED_TTL) by a periodic self-message.
+    %% The leader records them at commit; followers record them from the released
+    %% pid carried on {name_unregistered} broadcasts; and at a handoff gather every
+    %% reachable member's trail is merged into the new leader's, so the trail
+    %% survives leadership changes.  A gather suppresses a divergence on a pid still
+    %% in here (it was legitimately unregistered, a lagging member just has not
+    %% caught up), so only a reconstruction-drop divergence — which leaves no trail —
+    %% is killed.  TTL-pruned (dgen_config:conflict_release_ttl/1) by a periodic
+    %% self-message, with pruning suspended while any member is disconnected (a
+    %% partition must not outlive the trail that protects against its lagging rows).
     recently_released = #{} :: #{pid() => integer()},
     %% Leader-only kill budget (§5.6): name → recent kill timestamps (ms).  Bounds
     %% kills to `conflict_kill_budget` per name per window so a regenerating conflict
@@ -461,8 +512,9 @@ init(#{name := Name, tenant := Tenant, tuid := Tuid} = Args) ->
         named_table, set, protected, {read_concurrency, true}
     ]),
     net_kernel:monitor_nodes(true),
-    %% Periodically expire the conflict-detection trail (§5.6).
-    erlang:send_after(?RELEASED_TTL, self(), prune_released),
+    %% Periodic maintenance: expire the conflict-detection trail (§5.6) and the
+    %% per-name kill-budget timestamps.
+    erlang:send_after(?PRUNE_INTERVAL, self(), prune_released),
     %% Everything that needs the elector's pid (announcing presence, kicking off the
     %% first mesh pass) is deferred to `discover_elector` below: the supervisor is
     %% still synchronously waiting on *this* init/1 to return when it runs (this
@@ -517,7 +569,9 @@ handle_continue(
     true = is_pid(Elector),
     %% Announce presence; the elector will call {elector_assume_and_distribute}
     %% on the new leader, which then sends {apply_names_snapshot} to this member.
-    dgen_server:cast(Elector, {join, MemberId, Token}),
+    %% `fresh = true`: this member has never synced (empty replica), so an
+    %% unreachable-at-gather window for it cannot be hiding any bindings.
+    dgen_server:cast(Elector, {join, MemberId, Token, true}),
     %% Proactively connect Erlang distribution to every member node, now and
     %% periodically, so the cluster converges to a full mesh (see mesh_connect).  The
     %% application only has to make the nodes *able* to connect (cookie, networking);
@@ -555,9 +609,17 @@ handle_call(
     From,
     State = #state{leader = Leader, member_id = Self, forwards = Forwards}
 ) when Leader =/= undefined, Leader =/= Self ->
-    Ref = make_ref(),
-    cast_to_member(Leader, {register_req, Ref, Self, LogicalName, Pid, Meta}),
-    {noreply, State#state{forwards = Forwards#{Ref => {LogicalName, Pid, Meta, From}}}};
+    %% An unreachable leader means the cast would be dropped and the caller would
+    %% stall until its own call timeout — answer the verdict (`no`) immediately
+    %% instead, the same fast-fail the consistent-read forwards apply.
+    case member_reachable(Leader) of
+        true ->
+            Ref = make_ref(),
+            cast_to_member(Leader, {register_req, Ref, Self, LogicalName, Pid, Meta}),
+            {noreply, State#state{forwards = Forwards#{Ref => {LogicalName, Pid, Meta, From}}}};
+        false ->
+            {reply, no, State}
+    end;
 %% No leader yet.
 handle_call({register, _LogicalName, _Pid, _Meta}, _From, State) ->
     {reply, no, State};
@@ -580,9 +642,15 @@ handle_call(
     From,
     State = #state{leader = Leader, member_id = Self, meta_forwards = MetaForwards}
 ) when Leader =/= undefined, Leader =/= Self ->
-    Ref = make_ref(),
-    cast_to_member(Leader, {set_meta_req, Ref, Self, LogicalName, Index, Data}),
-    {noreply, State#state{meta_forwards = MetaForwards#{Ref => From}}};
+    %% Same unreachable-leader fast-fail as the register forward above.
+    case member_reachable(Leader) of
+        true ->
+            Ref = make_ref(),
+            cast_to_member(Leader, {set_meta_req, Ref, Self, LogicalName, Index, Data}),
+            {noreply, State#state{meta_forwards = MetaForwards#{Ref => From}}};
+        false ->
+            {reply, {error, no_leader}, State}
+    end;
 %% No leader yet.
 handle_call({set_metadata, _LogicalName, _Index, _Data}, _From, State) ->
     {reply, {error, no_leader}, State};
@@ -590,10 +658,15 @@ handle_call({set_metadata, _LogicalName, _Index, _Data}, _From, State) ->
 
 handle_call(
     {get_metadata, LogicalName},
-    _From,
+    From,
     State = #state{leader = Leader, member_id = Leader, names_tab = Tab}
 ) ->
-    {reply, lookup_metadata(Tab, LogicalName), State};
+    %% Consistent reads are fenced (Guarantee 5): the row is captured here (at the
+    %% mailbox point) and the reply is sent only after a spawned helper verifies our
+    %% leadership against the durable leader key — a deposed leader that has not yet
+    %% heard about the handoff cannot serve a stale answer as authoritative.
+    reply_fenced(From, lookup_metadata(Tab, LogicalName), undefined, State),
+    {noreply, State};
 handle_call(
     {get_metadata, LogicalName},
     From,
@@ -601,8 +674,7 @@ handle_call(
 ) when Leader =/= undefined ->
     %% Forward to the leader, which answers `From` directly from its authoritative row
     %% (same non-blocking forward as {whereis}).  Unreachable leader → answer now.
-    {Node, _Name} = Leader,
-    case Node =:= node() orelse lists:member(Node, nodes()) of
+    case member_reachable(Leader) of
         true ->
             cast_to_member(Leader, {get_metadata_req, LogicalName, From}),
             {noreply, State};
@@ -620,19 +692,21 @@ handle_call(
     {query, Constraints}, _From, State = #state{names_tab = Tab, inv_index = Inv}
 ) ->
     {reply, run_query(Constraints, Tab, Inv), State};
-%% Consistent query: must run on the leader.  If we are the leader, run it here;
-%% otherwise forward (non-blocking) and let the leader answer the caller directly.
+%% Consistent query: must run on the leader.  If we are the leader, run it here
+%% (on the mailbox — batch-consistent) and fence the reply like the other
+%% consistent reads; otherwise forward (non-blocking) and let the leader answer
+%% the caller directly.
 handle_call(
     {query_consistent, Constraints},
-    _From,
+    From,
     State = #state{leader = Leader, member_id = Leader, names_tab = Tab, inv_index = Inv}
 ) ->
-    {reply, run_query(Constraints, Tab, Inv), State};
+    reply_fenced(From, run_query(Constraints, Tab, Inv), [], State),
+    {noreply, State};
 handle_call(
     {query_consistent, Constraints}, From, State = #state{leader = Leader}
 ) when Leader =/= undefined ->
-    {Node, _Name} = Leader,
-    case Node =:= node() orelse lists:member(Node, nodes()) of
+    case member_reachable(Leader) of
         true ->
             cast_to_member(Leader, {query_req, Constraints, From}),
             {noreply, State};
@@ -645,10 +719,12 @@ handle_call({query_consistent, _Constraints}, _From, State) ->
 
 handle_call(
     {whereis, LogicalName},
-    _From,
+    From,
     State = #state{leader = Leader, member_id = Leader}
 ) ->
-    {reply, lookup_name(State#state.names_tab, LogicalName), State};
+    %% Fenced consistent read — see the {get_metadata} leader clause.
+    reply_fenced(From, lookup_name(State#state.names_tab, LogicalName), undefined, State),
+    {noreply, State};
 handle_call(
     {whereis, LogicalName},
     From,
@@ -658,8 +734,7 @@ handle_call(
     %% follower never blocks its loop on a `gen_server:call` to the leader, so a
     %% consistent read can no longer head-of-line block the follower's other messages.
     %% If the leader's node is unreachable, answer now rather than hang the caller.
-    {Node, _Name} = Leader,
-    case Node =:= node() orelse lists:member(Node, nodes()) of
+    case member_reachable(Leader) of
         true ->
             cast_to_member(Leader, {whereis_req, LogicalName, From}),
             {noreply, State};
@@ -674,14 +749,18 @@ handle_call({whereis, _LogicalName}, _From, State) ->
 
 %% ---- Handoff gather (any member) -------------------------------------------
 
-%% Return our current records map (`#{Name => {Pid, Index, Data}}`) and the version we
-%% have applied up to, so a newly-assuming leader can reconstruct the bindings *and
-%% their metadata* from the freshest of every reachable member (the cross-member
-%% gather, §5.7 / §4.4).
+%% Return our current records map (`#{Name => {Pid, Index, Data}}`), the version we
+%% have applied up to, and our copy of the released-pid trail, so a newly-assuming
+%% leader can reconstruct the bindings *and their metadata* from the freshest of
+%% every reachable member (the cross-member gather, §5.7 / §4.4) and merge the
+%% conflict-detector trails (§5.6) so a legitimate unregister is not mistaken for a
+%% divergence just because leadership moved.
 handle_call(
-    get_names_snapshot, _From, State = #state{names_tab = Tab, applied_version = Version}
+    get_names_snapshot,
+    _From,
+    State = #state{names_tab = Tab, applied_version = Version, recently_released = Released}
 ) ->
-    {reply, {current_records(Tab), Version}, State};
+    {reply, {current_records(Tab), Version, Released}, State};
 %% ---- Elector calls (during lock period) ------------------------------------
 
 %% Called by the elector to atomically assume leadership and fan out the
@@ -703,28 +782,44 @@ handle_call(
 %% to every follower from its own process (maintaining FIFO ordering with
 %% subsequent `{name_registered}` broadcasts).
 handle_call(
-    {elector_assume_and_distribute, MemberId, AllIds, Tokens, Epoch},
+    {elector_assume_and_distribute, MemberId, AllIds, Tokens, FreshIds, Epoch},
     _From,
     State = #state{member_id = Self}
 ) ->
     %% Reconstruct the pid bindings from the freshest of every reachable member's
     %% names map (our own replica + an RPC to each peer).  The freshest map *is* the
     %% reconstructed state — its highest-version owner holds the freshest binding for
-    %% every name (broadcasts are totally ordered + FIFO).  A binding that reached no
-    %% surviving member (a crash gap on the lost holder) is simply absent and may be
-    %% re-issued: single-fault uniqueness, backstopped by termination (§5.6), not by a
-    %% durable taken-set.  MaxVersion (the freshest applied version) becomes our
-    %% applied_version and re-baselines the followers.
+    %% every name (broadcasts are totally ordered + FIFO, and gap detection ensures
+    %% every replica is a *prefix* of that stream — see applied_version).  A binding
+    %% that reached no surviving member (a crash gap on the lost holder) is simply
+    %% absent and may be re-issued: single-fault uniqueness, backstopped by
+    %% termination (§5.6), not by a durable taken-set.  MaxVersion (the freshest
+    %% applied version) becomes our applied_version and re-baselines the followers.
     Tab = State#state.names_tab,
     SelfRecords = current_records(Tab),
     OtherIds = lists:delete(Self, AllIds),
-    {FreshestRecords, MaxVersion, PeerRecordMaps} = gather_maps(
+    {FreshestRecords, MaxVersion, PeerResults} = gather_maps(
         SelfRecords, State#state.applied_version, OtherIds
     ),
+    PeerRecordMaps = [Recs || {Recs, _V, _Rel} <- maps:values(PeerResults)],
     %% The gather is *incomplete* if a committed member did not respond (unreachable):
     %% we may be missing its bindings, so the leader is `degraded` (§5.6).  Under
     %% reject_when_degraded it then refuses new names that could be that member's.
-    Degraded = length(PeerRecordMaps) =/= length(OtherIds),
+    %% Members the elector marked *fresh* (never synced — e.g. a brand-new joiner
+    %% whose join committed before it could connect) hold no bindings by definition
+    %% and are excluded, so a healthy scale-up does not flag a false degrade.
+    Unreachable = OtherIds -- maps:keys(PeerResults),
+    Degraded = lists:any(fun(Id) -> not lists:member(Id, FreshIds) end, Unreachable),
+    %% Merge every reachable member's released-pid trail into our own (§5.6): the
+    %% trail is what distinguishes "legitimately unregistered, reported by a lagging
+    %% member" from a genuine divergence, and it must survive leadership changes —
+    %% the previous leader (or any member that heard its unregister broadcasts) may
+    %% hold trail entries this new leader never recorded itself.
+    MergedReleased = lists:foldl(
+        fun({_Recs, _V, Rel}, Acc) -> maps:merge_with(fun(_P, A, B) -> max(A, B) end, Acc, Rel) end,
+        State#state.recently_released,
+        maps:values(PeerResults)
+    ),
     %% Resolve genuine uniqueness conflicts the gather exposes (§5.6): two different
     %% live pids for one name, which a partition can produce now that there is no
     %% durable taken-set.  Conflict detection is about *pid* uniqueness, so it runs over
@@ -736,10 +831,10 @@ handle_call(
         detect_conflicts(
             FreshestNames,
             [record_pids(SelfRecords) | [record_pids(M) || M <- PeerRecordMaps]],
-            State#state.recently_released
+            MergedReleased
         ),
         FreshestNames,
-        State
+        State#state{recently_released = MergedReleased}
     ),
     %% Carry metadata on the surviving bindings: resolve_conflicts only ever *drops*
     %% names, so the reconstructed records are the freshest records restricted to the
@@ -771,8 +866,10 @@ handle_call(
     ),
     %% We are the leader now: any registrations we forwarded as a follower will
     %% never be answered by the old leader — reject them so callers retry against
-    %% us.  Then commit anything buffered while we were assuming leadership.
-    {reply, ok, maybe_start_commit(reject_forwards(State4))};
+    %% us.  Then commit anything buffered while we were assuming leadership.  The
+    %% gather made us synced (we hold state), and any outstanding resync request is
+    %% moot.
+    {reply, ok, maybe_start_commit(reject_forwards(mark_synced(cancel_resync(State4))))};
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
 
@@ -823,34 +920,37 @@ handle_cast({set_meta_reply, Ref, Result}, State = #state{meta_forwards = MetaFo
             {noreply, State}
     end;
 %% Leader: a consistent metadata read forwarded by a follower.  Reply to the original
-%% caller's `From` directly from the authoritative row.
+%% caller's `From` directly from the authoritative row — fenced, like every
+%% consistent read (see reply_fenced).
 handle_cast(
     {get_metadata_req, LogicalName, From},
     State = #state{leader = Leader, member_id = Leader, names_tab = Tab}
 ) ->
-    gen_server:reply(From, lookup_metadata(Tab, LogicalName)),
+    reply_fenced(From, lookup_metadata(Tab, LogicalName), undefined, State),
     {noreply, State};
 handle_cast({get_metadata_req, _LogicalName, From}, State) ->
     gen_server:reply(From, undefined),
     {noreply, State};
 %% Leader: a consistent query forwarded by a follower.  Run it on our mailbox (between
-%% batches → batch-consistent) and answer the original caller's `From` directly.
+%% batches → batch-consistent) and answer the original caller's `From` directly —
+%% fenced, like every consistent read.
 handle_cast(
     {query_req, Constraints, From},
     State = #state{leader = Leader, member_id = Leader, names_tab = Tab, inv_index = Inv}
 ) ->
-    gen_server:reply(From, run_query(Constraints, Tab, Inv)),
+    reply_fenced(From, run_query(Constraints, Tab, Inv), [], State),
     {noreply, State};
 handle_cast({query_req, _Constraints, From}, State) ->
     gen_server:reply(From, []),
     {noreply, State};
 %% Leader: a consistent read forwarded by a follower (whereis_name_consistent).  Reply
-%% to the original caller's `From` directly from the authoritative map.
+%% to the original caller's `From` directly from the authoritative map — fenced,
+%% like every consistent read.
 handle_cast(
     {whereis_req, LogicalName, From},
     State = #state{leader = Leader, member_id = Leader, names_tab = Tab}
 ) ->
-    gen_server:reply(From, lookup_name(Tab, LogicalName)),
+    reply_fenced(From, lookup_name(Tab, LogicalName), undefined, State),
     {noreply, State};
 %% Not the leader (stale belief, raced a leadership change) — answer `undefined`; the
 %% caller can retry and reach the current leader.
@@ -875,10 +975,20 @@ handle_cast({register_reply, Ref, Result}, State = #state{forwards = Forwards}) 
             {noreply, State}
     end;
 %% Follower: the leader asks us to confirm we hold a batch's bindings.  This cast
-%% arrives (FIFO) after the batch's {name_registered} casts, so by now we have
-%% applied them and hold the bindings — ack back to the leader.
-handle_cast({replicate_sync, BatchRef, LeaderId}, State = #state{member_id = Self}) ->
-    cast_to_member(LeaderId, {replicate_ack, BatchRef, Self}),
+%% arrives (FIFO) after the batch's {name_registered} casts, so normally we have
+%% applied them and hold the bindings — ack back to the leader.  The ack is
+%% version-guarded: if we have *not* applied up to the batch's version (we observed
+%% a gap and are awaiting a resync, or the broadcasts were stale-epoch-dropped), we
+%% do not hold the bindings and must not claim to — the leader falls back to other
+%% followers' acks or its timeout policy.
+handle_cast(
+    {replicate_sync, BatchRef, LeaderId, Version},
+    State = #state{member_id = Self, applied_version = Applied}
+) ->
+    case Applied >= Version of
+        true -> cast_to_member(LeaderId, {replicate_ack, BatchRef, Self});
+        false -> ok
+    end,
     {noreply, State};
 %% Leader: a follower confirms it holds a batch's bindings.  Count *distinct*
 %% followers (a duplicate ack from the same one does not count); once
@@ -902,40 +1012,88 @@ handle_cast({replicate_ack, BatchRef, FollowerId}, State = #state{pending_acks =
             %% Already answered (enough acks or the timeout) — ignore.
             {noreply, State}
     end;
+%% Replication broadcasts.  Each carries `{Epoch, PrevVersion, Version, LeaderId}`:
+%% the leader's epoch, the commit version of the batch *before* this one (the
+%% leader's applied_version when the batch was applied), this batch's commit
+%% version, and the sender.  `apply_bcast/6` applies the row change only when the
+%% broadcast is contiguous with our replica (PrevVersion matches, or we are already
+%% mid-batch at Version); a gap means we missed a batch — we stop applying and
+%% request a resync snapshot instead, so our replica always remains a *prefix* of
+%% the leader's stream (see the applied_version field doc).
 handle_cast(
-    {name_registered, LogicalName, Pid, Index, Data, Epoch, Version},
-    State = #state{epoch = CurrentEpoch}
+    {name_registered, LogicalName, Pid, Index, Data, Epoch, PrevV, Version, LeaderId},
+    State
 ) ->
-    case Epoch >= CurrentEpoch of
-        true ->
-            {noreply, bump_applied(Version, row_insert(State, LogicalName, Pid, Index, Data))};
-        false ->
-            {noreply, State}
-    end;
+    Apply = fun(S) -> row_insert(S, LogicalName, Pid, Index, Data) end,
+    {noreply, apply_bcast(Epoch, PrevV, Version, LeaderId, Apply, State)};
 handle_cast(
-    {name_unregistered, LogicalName, Epoch, Version},
-    State = #state{epoch = CurrentEpoch}
+    {name_unregistered, LogicalName, ReleasedPid, Epoch, PrevV, Version, LeaderId},
+    State
 ) ->
-    case Epoch >= CurrentEpoch of
-        true ->
-            {noreply, bump_applied(Version, row_delete(State, LogicalName))};
-        false ->
-            {noreply, State}
-    end;
+    %% ReleasedPid is the live pid this unregister explicitly released (`undefined`
+    %% for a death-driven cleanup).  Recording it keeps every member's copy of the
+    %% conflict-detector trail (§5.6) in step, so the trail survives leadership
+    %% changes via the handoff gather merge.
+    Apply = fun(S0) ->
+        S1 = row_delete(S0, LogicalName),
+        case is_pid(ReleasedPid) of
+            true ->
+                Rel = S1#state.recently_released,
+                S1#state{
+                    recently_released = Rel#{ReleasedPid => erlang:system_time(millisecond)}
+                };
+            false ->
+                S1
+        end
+    end,
+    {noreply, apply_bcast(Epoch, PrevV, Version, LeaderId, Apply, State)};
 %% Follower: the leader replaced a registration's metadata.  Update the row's Index
 %% and Data, keeping its pid (a no-op if the row is absent — e.g. this member missed
-%% the registration; the next handoff reconciles it).  Epoch/version stamped like
-%% {name_registered}, so a stale leader's broadcast is dropped.
+%% the registration; the next handoff reconciles it).  Stamped and gap-guarded like
+%% {name_registered}, so a stale leader's broadcast is dropped and a gap resyncs.
 handle_cast(
-    {metadata_set, LogicalName, Index, Data, Epoch, Version},
-    State = #state{epoch = CurrentEpoch}
+    {metadata_set, LogicalName, Index, Data, Epoch, PrevV, Version, LeaderId},
+    State
 ) ->
-    case Epoch >= CurrentEpoch of
-        true ->
-            {noreply, bump_applied(Version, row_update_meta(State, LogicalName, Index, Data))};
-        false ->
-            {noreply, State}
-    end;
+    Apply = fun(S) -> row_update_meta(S, LogicalName, Index, Data) end,
+    {noreply, apply_bcast(Epoch, PrevV, Version, LeaderId, Apply, State)};
+%% Follower: a member that observed a gap asks the leader for a fresh snapshot.
+%% Answer with the same {apply_names_snapshot} shape the handoff fan-out uses —
+%% empty extra-member and token payloads (they merge as no-ops) — carrying our
+%% current epoch and applied version, which re-baselines the requester.
+handle_cast(
+    {resync_req, FollowerId},
+    State = #state{
+        leader = Leader,
+        member_id = Leader,
+        names_tab = Tab,
+        epoch = Epoch,
+        applied_version = Version
+    }
+) ->
+    RecordsOut = maps:to_list(current_records(Tab)),
+    cast_to_member(
+        FollowerId, {apply_names_snapshot, RecordsOut, Leader, [], #{}, Epoch, Version}
+    ),
+    {noreply, State};
+handle_cast({resync_req, _FollowerId}, State) ->
+    %% Not the leader (the requester's stream came from someone else, or leadership
+    %% has since moved) — ignore; the requester's retry/rejoin will find the leader.
+    {noreply, State};
+%% A pid-guarded remote retract (strict_replication fail-closed, §8): a member that
+%% failed to durably retract a binding — it lost leadership with the retract still
+%% buffered, or its retract batch failed — forwards it here so the binding whose
+%% caller was answered `no` cannot silently live on.  Guarded by pid, so a name
+%% since re-registered to someone else is never clobbered.
+handle_cast(
+    {retract_req, LogicalName, Pid}, State = #state{leader = Leader, member_id = Leader}
+) ->
+    {noreply, enqueue_op({retract, LogicalName, Pid}, State)};
+handle_cast({retract_req, LogicalName, Pid}, State = #state{leader = Leader}) when
+    Leader =/= undefined
+->
+    cast_to_member(Leader, {retract_req, LogicalName, Pid}),
+    {noreply, State};
 %% Leadership transition snapshot sent by the new leader to all followers.
 %% Applies the leader transition, the record update (pid + metadata per name), and
 %% extra member monitors atomically within a single cast — no other message can
@@ -950,14 +1108,16 @@ handle_cast(
             %% Overwrite the local replica and inverted index with the leader's snapshot
             %% before the leader transition: do_leader_changed -> assume_leadership (if we
             %% are becoming leader) reads the names back from the table to set up monitors.
-            State0 = records_replace(State, maps:from_list(RecordsList)),
+            %% The snapshot satisfies any outstanding resync request (cancel it) and makes
+            %% this member synced (its first snapshot re-announces `fresh = false`).
+            State0 = records_replace(cancel_resync(State), maps:from_list(RecordsList)),
             State1 = do_leader_changed(NewLeader, OldLeader, Self, State0),
             State2 = State1#state{epoch = Epoch, applied_version = Version},
             State3 = add_member_monitors(ExtraMembers, State2),
             State4 = merge_peer_tokens(Tokens, State3),
             %% Handle any buffered ops under the new leadership view: reject them
             %% if we are now a follower, or commit them if we remain leader.
-            {noreply, maybe_start_commit(State4)};
+            {noreply, maybe_start_commit(mark_synced(State4))};
         false ->
             {noreply, State}
     end;
@@ -1017,20 +1177,38 @@ handle_info({replicate_timeout, BatchRef}, State = #state{pending_acks = PA, con
 %% Result of an in-flight group commit (from the dgen_transaction worker).
 handle_info(
     {dgen_transaction, Ref, Reply},
-    State = #state{committing = #{ref := Ref, mref := MRef, plan := Plan}}
+    State = #state{
+        committing = #{ref := Ref, mref := MRef, plan := Plan},
+        member_id = Self,
+        leader = Leader,
+        epoch = Epoch
+    }
 ) ->
     %% Drop the worker monitor (and any DOWN already queued behind this result —
     %% signal ordering guarantees the result arrives before the DOWN).
     erlang:demonitor(MRef, [flush]),
+    PlanEpoch = maps:get(epoch, Plan),
     State1 =
         case Reply of
-            {committed, Version} ->
+            {committed, Version} when Leader =:= Self, PlanEpoch =:= Epoch ->
                 apply_committed_plan(Plan, Version, State);
+            {committed, _Version} ->
+                %% The commit landed, but this member's leadership view moved while
+                %% the worker was in flight (deposed, or a new epoch).  Applying an
+                %% old-term plan over new-term state — or broadcasting it stamped
+                %% with the old epoch — would diverge the replicas, so the plan is
+                %% discarded: nothing was applied or broadcast (the durable effect
+                %% of a commit is only the version bump), callers are answered as
+                %% rejected and retry against the current leader, and the batch's
+                %% destructive ops are salvaged below so no unregister is lost.
+                salvage_failed_plan(reject_plan(Plan, State), Plan);
             _Fenced_or_error ->
                 %% {aborted, fenced} (lost leadership) or {error, _} (backend
                 %% failure / retry exhausted): the batch did not commit.  Reject
-                %% every registration in it; callers retry.
-                reject_plan(Plan, State)
+                %% every registration in it (callers retry); re-drive the
+                %% destructive ops so a lost unregister/retract cannot leave a
+                %% permanent replica divergence.
+                salvage_failed_plan(reject_plan(Plan, State), Plan)
         end,
     %% Start the next batch if more ops have accumulated.
     {noreply, maybe_start_commit(State1#state{committing = undefined})};
@@ -1043,7 +1221,7 @@ handle_info(
     {'DOWN', MRef, process, _Pid, _Reason},
     State = #state{committing = #{mref := MRef, plan := Plan}}
 ) ->
-    State1 = reject_plan(Plan, State),
+    State1 = salvage_failed_plan(reject_plan(Plan, State), Plan),
     {noreply, maybe_start_commit(State1#state{committing = undefined})};
 handle_info({'DOWN', Ref, process, _Pid, _Reason}, State) ->
     #state{
@@ -1071,10 +1249,23 @@ handle_info({'DOWN', Ref, process, _Pid, _Reason}, State) ->
             %% Stale self-monitor — should not happen, ignore.
             {noreply, State};
         DeadMemberId ->
-            %% Include the token we last received for this peer so the elector can
-            %% reject the message if the peer has already rejoined with a new token.
-            Token = maps:get(DeadMemberId, State#state.peer_tokens, undefined),
-            dgen_server:cast(Elector, {member_down, DeadMemberId, Token}),
+            %% Fence the {member_down} with the token the elector *currently* holds for
+            %% this peer, read fresh from the durable elector state — not our locally
+            %% cached peer_tokens entry, which a dropped snapshot cast (e.g. the peer
+            %% re-announced a fresh token on a nodeup while our node was transiently
+            %% disconnected) may have left stale.  A stale token would make the elector
+            %% discard this DOWN as if the peer had rejoined, stranding a genuinely dead
+            %% member in the set and preventing failover (§5.7).  The fresh read still
+            %% correctly discards a true stale DOWN: if the peer really did rejoin, the
+            %% durable token has already advanced past what we send.
+            %%
+            %% The read + cast run in a short-lived helper, never inline: a synchronous
+            %% call from this loop to the elector could deadlock against the elector's
+            %% own post-commit `{elector_assume_and_distribute}` call back into this
+            %% member.  The helper falls back to the cached token if the elector read
+            %% fails (e.g. mid-shutdown).
+            Cached = maps:get(DeadMemberId, State#state.peer_tokens, undefined),
+            spawn_member_down(Elector, DeadMemberId, Cached),
             {noreply, remove_member(DeadMemberId, State)}
     end;
 handle_info({nodeup, Node}, State = #state{elector = Elector, member_id = Self}) ->
@@ -1083,7 +1274,7 @@ handle_info({nodeup, Node}, State = #state{elector = Elector, member_id = Self})
     %% generated so any stale {member_down, Self, OldToken} already in the queue
     %% is discarded by the elector when it is eventually processed.
     NewToken = make_ref(),
-    dgen_server:cast(Elector, {join, Self, NewToken}),
+    dgen_server:cast(Elector, {join, Self, NewToken, not State#state.synced}),
     %% The node is reachable again — clear any mesh suppression for it and re-run the
     %% mesh pass so we also reconnect to any other members we may have lost touch with.
     RD = maps:remove(Node, State#state.recently_down),
@@ -1091,30 +1282,140 @@ handle_info({nodeup, Node}, State = #state{elector = Elector, member_id = Self})
     {noreply, State#state{join_token = NewToken, recently_down = RD}};
 %% A node dropped: remember it briefly so the mesh does not immediately reconnect it
 %% (let the departure settle as a {member_down}).  Departure itself is driven by the
-%% per-member erlang:monitor DOWN, not here.
+%% per-member erlang:monitor DOWN; the delayed reap below is only a backstop for when
+%% that DOWN's {member_down} is fenced away as stale (see ?REAP_INTERVAL).
 handle_info({nodedown, Node}, State = #state{recently_down = RD}) ->
+    schedule_reap(Node, ?REAP_ATTEMPTS),
     {noreply, State#state{recently_down = RD#{Node => erlang:system_time(millisecond)}}};
+%% Backstop reap: while `Node` is still disconnected, report `member_down` for any member
+%% the elector still lists on it, then re-arm for a few attempts.  Stops as soon as the
+%% node reconnects (a live member re-announces and its `{join}` wins over our
+%% `{member_down}` regardless of ordering) or the attempts run out.  Reads the elector and
+%% casts only — it never opens a connection, so it is safe alongside partition detection.
+handle_info({reap_down, _Node, 0}, State) ->
+    {noreply, State};
+handle_info({reap_down, Node, N}, State = #state{elector = Elector, member_id = {SelfNode, _}}) ->
+    case Node =:= SelfNode orelse lists:member(Node, nodes()) of
+        true ->
+            ok;
+        false ->
+            spawn_reap(Elector, Node),
+            schedule_reap(Node, N - 1)
+    end,
+    {noreply, State};
 %% Converge Erlang distribution to a full mesh: read the authoritative member set
 %% from the elector (a DB-backed read, so it is the same on every node regardless of
 %% which one consumed the joins) and connect to every member node not currently
-%% suppressed (recently down).  Done off this process in a short-lived helper so the
-%% connect handshakes never block the member's loop.  A connect that succeeds fires
-%% `nodeup`, which drives the rejoin + snapshot so a freshly-meshed node is brought
-%% fully up to date.
-handle_info(mesh_connect, State = #state{elector = Elector, member_id = {SelfNode, _}}) ->
+%% suppressed (recently down).  The read runs in a short-lived helper so the
+%% (potentially slow, durable-queue) `get_members` call never blocks the member's
+%% loop; the helper reports the member set back as `{mesh_members, _}`, and the
+%% suppression decision + connect are made *there* — in this process's mailbox,
+%% strictly ordered after any `{nodedown, _}` — so an in-flight fetch cannot
+%% reconnect a node that went down while it was running (see the mesh_members
+%% clause).  A connect that succeeds fires `nodeup`, which drives the rejoin +
+%% snapshot so a freshly-meshed node is brought fully up to date.
+handle_info(mesh_connect, State = #state{elector = Elector}) ->
     erlang:send_after(?MESH_INTERVAL, self(), mesh_connect),
     Now = erlang:system_time(millisecond),
     RD = maps:filter(
         fun(_Node, Ts) -> Ts >= Now - ?MESH_DOWN_COOLDOWN end, State#state.recently_down
     ),
-    spawn_mesh_connect(Elector, SelfNode, maps:keys(RD)),
+    spawn_mesh_fetch(Elector, self()),
     {noreply, State#state{recently_down = RD}};
-%% Expire stale entries from the conflict-detection trail (§5.6) and re-arm.
-handle_info(prune_released, State = #state{recently_released = Rel}) ->
-    erlang:send_after(?RELEASED_TTL, self(), prune_released),
-    Cutoff = erlang:system_time(millisecond) - ?RELEASED_TTL,
-    Rel1 = maps:filter(fun(_Pid, Ts) -> Ts >= Cutoff end, Rel),
-    {noreply, State#state{recently_released = Rel1}};
+%% The mesh fetch helper reports the authoritative member node list.  Deciding
+%% suppression *here* (not in the helper, at spawn time) is what makes partition
+%% detection reliable: a mesh fetch spawned just before a node dropped carries no
+%% knowledge of the drop, and computing the suppression set from its stale snapshot
+%% would reconnect the very node the member is trying to remove — healing the
+%% partition before the `{member_down}` can settle, so the departure is never
+%% observed.  Because this message is processed on the member's mailbox, it is
+%% strictly ordered after the `{nodedown, Node}` the drop enqueued, so `recently_down`
+%% already reflects the drop and the node is suppressed.  The actual `connect_node`
+%% handshakes run off-process (they can block on an unreachable node).
+handle_info({mesh_members, MemberNodes}, State = #state{member_id = {SelfNode, _}}) ->
+    Now = erlang:system_time(millisecond),
+    RD = maps:filter(
+        fun(_Node, Ts) -> Ts >= Now - ?MESH_DOWN_COOLDOWN end, State#state.recently_down
+    ),
+    Targets = [
+        Node
+     || Node <- MemberNodes, Node =/= SelfNode, not maps:is_key(Node, RD)
+    ],
+    spawn_mesh_connect(Targets),
+    {noreply, State#state{recently_down = RD}};
+%% Periodic maintenance: expire stale entries from the conflict-detection trail
+%% (§5.6) and the per-name kill-budget timestamps, then re-arm.  Trail pruning is
+%% suspended while any current member is disconnected: a disconnected member misses
+%% unregister broadcasts outright, so its stale rows can show up at a rejoin gather
+%% long after any broadcast lag — the trail must outlive the partition (see the
+%% ?PRUNE_INTERVAL note).
+handle_info(
+    prune_released,
+    State = #state{recently_released = Rel, kill_budget = KB, members = Members, config = Config}
+) ->
+    erlang:send_after(?PRUNE_INTERVAL, self(), prune_released),
+    Now = erlang:system_time(millisecond),
+    AllConnected = lists:all(
+        fun({Node, _Name}) -> Node =:= node() orelse lists:member(Node, nodes()) end,
+        maps:keys(Members)
+    ),
+    Rel1 =
+        case AllConnected of
+            true ->
+                Cutoff = Now - dgen_config:conflict_release_ttl(Config),
+                maps:filter(fun(_Pid, Ts) -> Ts >= Cutoff end, Rel);
+            false ->
+                Rel
+        end,
+    {_Count, Window} = dgen_config:conflict_kill_budget(Config),
+    KB1 = maps:filter(
+        fun(_Name, Tss) -> Tss =/= [] end,
+        maps:map(fun(_Name, Tss) -> [Ts || Ts <- Tss, Ts >= Now - Window] end, KB)
+    ),
+    {noreply, State#state{recently_released = Rel1, kill_budget = KB1}};
+%% The resync request we sent went unanswered (dropped cast, deposed target) —
+%% clear the guard so the next gap-observing broadcast requests again.
+handle_info(resync_timeout, State) ->
+    {noreply, State#state{resync_timer = undefined}};
+%% Re-drive the destructive ops of a batch that failed to commit (see
+%% salvage_failed_plan): re-enqueue them if we are (still) the leader, or forward
+%% the pid-guarded clears to the current leader if we were deposed — so an
+%% unregister or strict-mode retract is never silently lost, which would otherwise
+%% leave replicas divergent (or a `no`-answered binding alive) until an unrelated
+%% handoff.
+handle_info({requeue_ops, Ops}, State = #state{leader = Leader, member_id = Self}) when
+    Leader =:= Self
+->
+    {noreply, lists:foldl(fun enqueue_op/2, State, Ops)};
+handle_info({requeue_ops, Ops}, State = #state{leader = Leader}) when Leader =/= undefined ->
+    lists:foreach(
+        fun
+            ({remove, Name, Pid}) when is_pid(Pid) -> forward_retract(Leader, Name, Pid);
+            ({retract, Name, Pid}) -> forward_retract(Leader, Name, Pid);
+            %% A remove that never had a bound pid nets to nothing; a down is the
+            %% new leader's to observe via its own monitor.
+            (_) -> ok
+        end,
+        Ops
+    ),
+    {noreply, State};
+handle_info({requeue_ops, _Ops}, State) ->
+    %% No leader to hand these to — drop; a later handoff gather reconciles.
+    {noreply, State};
+%% Periodic durable-epoch check (piggybacked on the mesh pass): the election record
+%% in the database is ahead of what this member has heard.  That means a leadership
+%% handoff happened that never reached us — the elector's post-commit assume action
+%% failed (consumer crash, unreachable leader), or we missed the snapshot fan-out.
+%% Re-announcing produces a fresh membership event whose assume/fan-out brings us —
+%% and, if we are the durable leader, our leadership — up to date.
+handle_info({durable_epoch, DurableEpoch}, State = #state{epoch = Epoch}) when
+    is_integer(DurableEpoch), DurableEpoch > Epoch
+->
+    #state{elector = Elector, member_id = Self, join_token = Token, synced = Synced} = State,
+    dgen_server:cast(Elector, {join, Self, Token, not Synced}),
+    {noreply, State};
+handle_info({durable_epoch, _DurableEpoch}, State) ->
+    {noreply, State};
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -1139,8 +1440,10 @@ do_leader_changed(NewLeader, OldLeader, Self, State0) ->
         end,
     if
         OldLeader =:= Self, NewLeader =/= Self ->
-            %% Lost leadership — demonitor registered Pids, keep names for snapshot reads.
-            relinquish_leadership(State#state{leader = NewLeader});
+            %% Lost leadership — resolve any direct registrations still awaiting
+            %% replica acks (their timers must not fire into a follower), then
+            %% demonitor registered Pids, keeping names for snapshot reads.
+            relinquish_leadership(fail_pending_acks(State#state{leader = NewLeader}));
         OldLeader =/= Self, NewLeader =:= Self ->
             %% Gained leadership — set up monitors for all currently known names.
             assume_leadership(State#state{leader = NewLeader});
@@ -1180,18 +1483,23 @@ relinquish_leadership(State = #state{name_to_ref = NTR}) ->
 
 %% Gather every reachable member's names map across this (assuming) leader's own
 %% replica and every other reachable member.  Because the leader's broadcasts are
-%% totally ordered (commit versions are globally monotonic) and FIFO, the member with
-%% the highest applied_version holds the freshest binding for *every* name, so the
-%% single freshest map is the reconstruction source.  The other members' maps are
-%% returned too, for the conflict detector (§5.6) — a partition can leave a member
-%% holding a divergent live binding the freshest map never saw.  Returns
-%% `{FreshestNames, MaxVersion, PeerMaps}` where PeerMaps is each *other* reachable
-%% member's names map.
+%% totally ordered (commit versions are globally monotonic) and FIFO, and gap
+%% detection keeps every replica a *prefix* of that stream (see applied_version),
+%% the member with the highest applied_version holds the freshest binding for
+%% *every* name, so the single freshest map is the reconstruction source — and a
+%% version tie implies identical content, so tie-breaking (self-first) is safe.
+%% The other members' snapshots are returned too, for the conflict detector (§5.6)
+%% — a partition can leave a member holding a divergent live binding the freshest
+%% map never saw — and for the released-trail merge.  Returns
+%% `{FreshestNames, MaxVersion, PeerResults}` where PeerResults is
+%% `#{MemberId => {Records, Version, Released}}` for each *other* member that
+%% answered.  The per-peer snapshot calls run in parallel (each in a short-lived
+%% helper process), so the assuming leader's loop is blocked for at most about one
+%% ?GATHER_TIMEOUT overall rather than one per unreachable peer.
 gather_maps(SelfNames, SelfVersion, OtherIds) ->
-    % TODO - parallelize rpcs to get the names maps
-    PeerResults = [R || MemberId <- OtherIds, {ok, R} <- [member_names(MemberId)]],
-    {FreshestNames, MaxVersion} = lists:foldl(
-        fun({Names, Version}, {_BestNames, BestVersion} = Best) ->
+    PeerResults = gather_peer_snapshots(OtherIds),
+    {FreshestNames, MaxVersion} = maps:fold(
+        fun(_Id, {Names, Version, _Released}, {_BestNames, BestVersion} = Best) ->
             case Version > BestVersion of
                 true -> {Names, Version};
                 false -> Best
@@ -1200,7 +1508,39 @@ gather_maps(SelfNames, SelfVersion, OtherIds) ->
         {SelfNames, SelfVersion},
         PeerResults
     ),
-    {FreshestNames, MaxVersion, [Names || {Names, _V} <- PeerResults]}.
+    {FreshestNames, MaxVersion, PeerResults}.
+
+%% Fan out one member_names/1 helper per peer and collect the answers under a
+%% single overall deadline.  Late answers (a peer that responds after the deadline)
+%% arrive as ordinary messages and are dropped by the catch-all handle_info clause.
+gather_peer_snapshots([]) ->
+    #{};
+gather_peer_snapshots(OtherIds) ->
+    Ref = make_ref(),
+    Parent = self(),
+    lists:foreach(
+        fun(MemberId) ->
+            spawn(fun() -> Parent ! {Ref, MemberId, member_names(MemberId)} end)
+        end,
+        OtherIds
+    ),
+    Deadline = erlang:monotonic_time(millisecond) + ?GATHER_TIMEOUT + 500,
+    collect_gather(Ref, OtherIds, Deadline, #{}).
+
+collect_gather(_Ref, [], _Deadline, Acc) ->
+    Acc;
+collect_gather(Ref, Waiting, Deadline, Acc) ->
+    Timeout = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    receive
+        {Ref, MemberId, {ok, Snapshot}} ->
+            collect_gather(Ref, lists:delete(MemberId, Waiting), Deadline, Acc#{
+                MemberId => Snapshot
+            });
+        {Ref, MemberId, error} ->
+            collect_gather(Ref, lists:delete(MemberId, Waiting), Deadline, Acc)
+    after Timeout ->
+        Acc
+    end.
 
 %% Detect genuine uniqueness conflicts among the gathered maps (§5.6).  A conflict is
 %% a name held by *two different live pids* — the authority (the freshest map's pid)
@@ -1294,6 +1634,14 @@ alarm_conflict(Name, Authority, Divergent, Action) ->
         "dgen_registry: name conflict — name=~p authority=~p divergent=~p action=~p. "
         "Two different live pids held one name (single-fault uniqueness breach, §5.6).",
         [Name, Authority, Divergent, Action]
+    ),
+    %% Also surface through telemetry (when available), like degrade-open events —
+    %% `action` distinguishes terminated / detect_only / budget_exhausted, the last
+    %% being the one an operator must act on.
+    emit_telemetry(
+        [dgen_registry, conflict],
+        #{divergent_count => length(Divergent)},
+        #{name => Name, authority => Authority, action => Action}
     ).
 
 %% Is a (possibly remote) pid alive?  An unreachable node is treated as not-alive so a
@@ -1315,18 +1663,22 @@ is_pid_alive(Pid) ->
             end
     end.
 
-%% Bounded, fault-tolerant snapshot read of a peer member's names map + version.  A
-%% member on a disconnected node, or one that does not answer within ?GATHER_TIMEOUT,
-%% is skipped — its bindings are unavailable for this gather.  With no durable
-%% taken-set, a binding only that member held is lost (single-fault uniqueness); if it
-%% was replicated (two-holder), the freshest surviving holder still carries it.
+%% Bounded, fault-tolerant snapshot read of a peer member's names map + version +
+%% released trail.  A member on a disconnected node, or one that does not answer
+%% within ?GATHER_TIMEOUT, is skipped — its bindings are unavailable for this
+%% gather.  With no durable taken-set, a binding only that member held is lost
+%% (single-fault uniqueness); if it was replicated (two-holder), the freshest
+%% surviving holder still carries it.
 member_names({Node, Name}) ->
     case lists:member(Node, nodes()) of
         false ->
             error;
         true ->
             try gen_server:call({Name, Node}, get_names_snapshot, ?GATHER_TIMEOUT) of
-                {Names, Version} when is_map(Names), is_integer(Version) -> {ok, {Names, Version}}
+                {Names, Version, Released} when
+                    is_map(Names), is_integer(Version), is_map(Released)
+                ->
+                    {ok, {Names, Version, Released}}
             catch
                 _:_ -> error
             end
@@ -1364,12 +1716,17 @@ maybe_start_commit(State = #state{member_id = Self, leader = Leader, pending = P
     Leader =/= Self
 ->
     %% Not (or no longer) the leader — reject every buffered registration and
-    %% set_metadata (caller retries against the new leader); drop removes (the new
-    %% leader owns those names and drives their DOWNs itself).
+    %% set_metadata (caller retries against the new leader); forward buffered
+    %% removes/retracts to the new leader as pid-guarded retracts so an unregister
+    %% (or a strict-mode retraction whose caller already heard `no`) is not silently
+    %% lost with the deposition.  Downs are dropped: the new leader monitors the
+    %% pids itself and observes their exits directly.
     lists:foreach(
         fun
             ({add, _N, _P, _Meta, Origin}) -> deliver_reply(Origin, reject_value(Origin));
             ({set_meta, _N, _I, _D, Origin}) -> deliver_reply(Origin, reject_value(Origin));
+            ({remove, N, P}) when is_pid(P) -> forward_retract(Leader, N, P);
+            ({retract, N, P}) -> forward_retract(Leader, N, P);
             (_) -> ok
         end,
         queue:to_list(Pending)
@@ -1417,7 +1774,7 @@ maybe_start_commit(State) ->
                 Tenant,
                 Tuid,
                 Self,
-                #{owner => self(), ref => Ref, read_version => LastVersion}
+                #{owner => self(), ref => Ref, epoch => Epoch, read_version => LastVersion}
             ),
             State1#state{committing = #{ref => Ref, mref => MRef, plan => Plan}}
     end.
@@ -1438,10 +1795,12 @@ apply_committed_plan(Plan, Version, State) ->
         direct_meta := DirectMeta
     } = Plan,
     #state{
+        member_id = Self,
         name_to_ref = NTR0,
         ref_to_name = RTN0,
         members = Members,
-        recently_released = Rel0
+        recently_released = Rel0,
+        applied_version = PrevVersion
     } = State,
     %% Apply the durable delta to the local replica (and the inverted index).  Only the
     %% names in DBOp are touched, so a concurrent optimistic unregister of an untouched
@@ -1450,10 +1809,12 @@ apply_committed_plan(Plan, Version, State) ->
     {NTR1, RTN1} = apply_monitor_ops(DBOp, WNames, NTR0, RTN0),
     %% Replicate to followers first, so the replicate_sync below (FIFO behind these)
     %% is seen by a follower only after it already holds the batch's bindings.  Each
-    %% broadcast carries this batch's commit Version, which advances followers'
-    %% applied_version (used to pick the freshest source on a handoff gather).
+    %% broadcast carries this batch's commit Version *and* the predecessor version
+    %% (our applied_version before this batch) plus our id: followers apply only
+    %% contiguous broadcasts, so a member that missed a batch detects the gap and
+    %% resyncs instead of silently advancing with a hole (see apply_bcast).
     lists:foreach(
-        fun(Msg) -> broadcast_to_peers(Members, stamp_bcast(Msg, Version)) end,
+        fun(Msg) -> broadcast_to_peers(Members, stamp_bcast(Msg, PrevVersion, Version, Self)) end,
         lists:reverse(BcastsRev)
     ),
     Now = erlang:system_time(millisecond),
@@ -1478,7 +1839,7 @@ apply_committed_plan(Plan, Version, State) ->
         {Origin, Name, Pid}
      || {Origin, yes} <- DirectYes, {Name, Pid} <- [maps:get(Origin, DirectMeta)]
     ],
-    confirm_direct(EnrichedDirect, State1).
+    confirm_direct(EnrichedDirect, Version, State1).
 
 is_direct_yes({{local, _From}, yes}) -> true;
 is_direct_yes(_Other) -> false.
@@ -1490,10 +1851,12 @@ is_direct_yes(_Other) -> false.
 %% Otherwise broadcast a replicate_sync and resolve on the acks or, on timeout, the
 %% `strict_replication` policy (degrade-open or fail-closed).  `Direct` entries are
 %% `{Origin, Name, Pid}`.
-confirm_direct([], State) ->
+confirm_direct([], _Version, State) ->
     State;
 confirm_direct(
-    Direct, State = #state{members = Members, member_id = Self, pending_acks = PA, config = Config}
+    Direct,
+    Version,
+    State = #state{members = Members, member_id = Self, pending_acks = PA, config = Config}
 ) ->
     Needed = min(dgen_config:register_replicas(Config), map_size(Members)),
     case Needed =< 0 of
@@ -1502,7 +1865,11 @@ confirm_direct(
             State;
         false ->
             BatchRef = make_ref(),
-            broadcast_to_peers(Members, {replicate_sync, BatchRef, Self}),
+            %% The sync carries the batch's commit version so a follower only acks
+            %% once it has actually applied up to this batch — a follower that
+            %% gap-skipped the broadcasts (awaiting resync) does not hold the
+            %% bindings and must not be counted as a holder.
+            broadcast_to_peers(Members, {replicate_sync, BatchRef, Self, Version}),
             TimerRef = erlang:send_after(
                 dgen_config:replicate_timeout(Config), self(), {replicate_timeout, BatchRef}
             ),
@@ -1625,7 +1992,14 @@ plan_batch(Ops, Tab, NTR, Epoch) ->
         replies => [],
         bcasts => [],
         released => [],
-        direct_meta => #{}
+        direct_meta => #{},
+        %% The epoch the plan was built under: the commit-result handler refuses to
+        %% apply a plan whose epoch is no longer current (leadership moved while the
+        %% worker was in flight), and the broadcasts are stamped with it.
+        epoch => Epoch,
+        %% The raw ops, kept so a failed batch's destructive ops (removes/retracts/
+        %% downs) can be salvaged (salvage_failed_plan) instead of silently dropped.
+        ops => Ops
     },
     lists:foldl(fun(Op, Acc) -> plan_op(Op, Epoch, Acc) end, Init, Ops).
 
@@ -1715,11 +2089,18 @@ plan_op({remove, Name, ReleasedPid}, Epoch, Acc) ->
                     true -> [ReleasedPid | Rel];
                     false -> Rel
                 end,
+            %% The broadcast carries the released pid so every member records it in
+            %% its own copy of the conflict-detector trail (§5.6).
+            ReleasedOut =
+                case WasBound of
+                    true -> ReleasedPid;
+                    false -> undefined
+                end,
             Acc#{
                 names := WN#{Name => removed},
                 wntr := maps:remove(Name, WNTR),
                 dbop := DB#{Name => clear},
-                bcasts := [{name_unregistered, Name, Epoch} | Bs],
+                bcasts := [{name_unregistered, Name, ReleasedOut, Epoch} | Bs],
                 released := Rel1
             };
         false ->
@@ -1737,7 +2118,7 @@ plan_op({retract, Name, Pid}, Epoch, Acc) ->
                 names := WN#{Name => removed},
                 wntr := maps:remove(Name, WNTR),
                 dbop := DB#{Name => clear},
-                bcasts := [{name_unregistered, Name, Epoch} | Bs],
+                bcasts := [{name_unregistered, Name, Pid, Epoch} | Bs],
                 released := [Pid | Rel]
             };
         _ ->
@@ -1748,12 +2129,14 @@ plan_op({down, Name, Ref}, Epoch, Acc) ->
     #{names := WN, wntr := WNTR, dbop := DB, bcasts := Bs} = Acc,
     case maps:get(Name, WNTR, undefined) of
         Ref ->
-            %% Ref still matches the live binding — honour the auto-unregister.
+            %% Ref still matches the live binding — honour the auto-unregister.  The
+            %% pid is dead, so no released pid rides the broadcast (the trail is for
+            %% *live* releases only).
             Acc#{
                 names := WN#{Name => removed},
                 wntr := maps:remove(Name, WNTR),
                 dbop := DB#{Name => clear},
-                bcasts := [{name_unregistered, Name, Epoch} | Bs]
+                bcasts := [{name_unregistered, Name, undefined, Epoch} | Bs]
             };
         _ ->
             %% Stale DOWN (name re-registered, or already removed) — ignore.
@@ -1784,19 +2167,220 @@ apply_monitor_ops(DBOp, WNames, NTR, RTN) ->
 send_replies(Replies) ->
     lists:foreach(fun({Origin, Reply}) -> deliver_reply(Origin, Reply) end, Replies).
 
-%% Stamp a plan's broadcast message with the batch's commit version, which followers
-%% use to advance their applied_version.
-stamp_bcast({name_registered, Name, Pid, Index, Data, Epoch}, Version) ->
-    {name_registered, Name, Pid, Index, Data, Epoch, Version};
-stamp_bcast({metadata_set, Name, Index, Data, Epoch}, Version) ->
-    {metadata_set, Name, Index, Data, Epoch, Version};
-stamp_bcast({name_unregistered, Name, Epoch}, Version) ->
-    {name_unregistered, Name, Epoch, Version}.
+%% Stamp a plan's broadcast message with the batch's predecessor version, its commit
+%% version, and the sending leader's id.  Followers use the pair to apply only
+%% *contiguous* broadcasts (gap detection — see apply_bcast) and the leader id as
+%% the resync target when a gap is observed.
+stamp_bcast({name_registered, Name, Pid, Index, Data, Epoch}, PrevV, Version, LeaderId) ->
+    {name_registered, Name, Pid, Index, Data, Epoch, PrevV, Version, LeaderId};
+stamp_bcast({metadata_set, Name, Index, Data, Epoch}, PrevV, Version, LeaderId) ->
+    {metadata_set, Name, Index, Data, Epoch, PrevV, Version, LeaderId};
+stamp_bcast({name_unregistered, Name, ReleasedPid, Epoch}, PrevV, Version, LeaderId) ->
+    {name_unregistered, Name, ReleasedPid, Epoch, PrevV, Version, LeaderId}.
 
-%% Advance applied_version to the highest version applied (broadcasts can only carry
-%% non-decreasing versions within an epoch, but max/2 is robust to any reordering).
+%% Apply a replication broadcast if — and only if — it is contiguous with this
+%% member's replica, so the replica always remains a prefix of the leader's totally
+%% ordered stream (what makes freshest-wins reconstruction sound, §5.7):
+%%
+%%   - An older epoch's broadcast (a deposed leader's) is dropped.
+%%   - `PrevV =:= applied_version`: the next batch in sequence — apply.
+%%   - `V =:= applied_version`: another message of the batch we are already
+%%     applying (all of a batch's broadcasts share one commit version) — apply.
+%%   - `V =< applied_version`: at or behind our snapshot baseline — a duplicate or
+%%     an already-superseded message; drop.
+%%   - Otherwise there is a **gap**: we missed at least one batch (a cast dropped
+%%     while we were briefly disconnected, a message lost with a dying connection).
+%%     Do not apply and do not advance; request a full snapshot from the sender
+%%     instead.  Guarded by resync_timer so a burst of gapped broadcasts asks once.
+apply_bcast(Epoch, PrevV, V, LeaderId, ApplyFun, State) ->
+    #state{epoch = CurrentEpoch, applied_version = Applied} = State,
+    if
+        Epoch < CurrentEpoch -> State;
+        PrevV =:= Applied; V =:= Applied -> bump_applied(V, ApplyFun(cancel_resync(State)));
+        V =< Applied -> State;
+        true -> request_resync(LeaderId, State)
+    end.
+
+%% Ask `LeaderId` for a full snapshot (we observed a gap in its stream), at most
+%% once per ?RESYNC_RETRY window.  The reply is a regular {apply_names_snapshot}.
+request_resync(LeaderId, State = #state{resync_timer = undefined, member_id = Self}) ->
+    cast_to_member(LeaderId, {resync_req, Self}),
+    Ref = erlang:send_after(?RESYNC_RETRY, self(), resync_timeout),
+    State#state{resync_timer = Ref};
+request_resync(_LeaderId, State) ->
+    State.
+
+cancel_resync(State = #state{resync_timer = undefined}) ->
+    State;
+cancel_resync(State = #state{resync_timer = Ref}) ->
+    erlang:cancel_timer(Ref),
+    State#state{resync_timer = undefined}.
+
+%% Advance applied_version to the highest version applied (within an epoch a leader's
+%% broadcasts carry non-decreasing versions, and apply_bcast only lets contiguous
+%% ones through, but max/2 keeps this robust regardless).
 bump_applied(Version, State = #state{applied_version = Applied}) ->
     State#state{applied_version = max(Applied, Version)}.
+
+%% Record that this member now holds synced registry state, announcing the
+%% transition to the elector once (`fresh = false`) so the membership record's
+%% freshness converges — see the `synced` field doc and the elector's member_info.
+mark_synced(State = #state{synced = true}) ->
+    State;
+mark_synced(State = #state{elector = Elector, member_id = Self, join_token = Token}) ->
+    dgen_server:cast(Elector, {join, Self, Token, false}),
+    State#state{synced = true}.
+
+%% Is a peer member's node currently connected (so a cast to it will not be
+%% dropped and a forward will actually be answered)?
+member_reachable({Node, _Name}) ->
+    Node =:= node() orelse lists:member(Node, nodes()).
+
+%% Report a peer's death to the elector, fencing the `{member_down}` with the token the
+%% elector currently holds for that member (read fresh from durable state via a priority
+%% read that bypasses the queue), falling back to `Cached` if that read fails.  Runs in a
+%% short-lived helper so the member loop never blocks on a call to the elector — see the
+%% DOWN handler for the deadlock this avoids and why the fresh read matters.
+spawn_member_down(Elector, MemberId, Cached) ->
+    _ = spawn(fun() ->
+        Token =
+            try dgen_server:priority_call(Elector, {get_member_token, MemberId}) of
+                T when is_reference(T) -> T;
+                _ -> Cached
+            catch
+                _:_ -> Cached
+            end,
+        dgen_server:cast(Elector, {member_down, MemberId, Token})
+    end),
+    ok.
+
+schedule_reap(Node, N) ->
+    erlang:send_after(?REAP_INTERVAL, self(), {reap_down, Node, N}),
+    ok.
+
+%% Report `member_down` for every member the elector currently lists on `Node`, fenced
+%% with each member's current durable token (so a member that has genuinely rejoined is
+%% not clobbered — the fresh token already advanced past what we send, or the rejoin's
+%% own `{join}` re-adds it).  Runs off the member loop; reads the elector and casts only.
+spawn_reap(Elector, Node) ->
+    _ = spawn(fun() ->
+        try dgen_server:priority_call(Elector, get_members) of
+            Members when is_list(Members) ->
+                lists:foreach(
+                    fun
+                        ({N, _} = MemberId) when N =:= Node ->
+                            Token =
+                                try
+                                    dgen_server:priority_call(
+                                        Elector, {get_member_token, MemberId}
+                                    )
+                                of
+                                    T when is_reference(T) -> T;
+                                    _ -> undefined
+                                catch
+                                    _:_ -> undefined
+                                end,
+                            dgen_server:cast(Elector, {member_down, MemberId, Token});
+                        (_) ->
+                            ok
+                    end,
+                    Members
+                );
+            _ ->
+                ok
+        catch
+            _:_ -> ok
+        end
+    end),
+    ok.
+
+%% Answer a consistent read only after verifying, against the durable leader key,
+%% that this member really is the fenced leader for its current epoch (Guarantee 5:
+%% consistent reads are authoritative, never stale).  Without this, a deposed
+%% leader that has not yet heard about the handoff — the minority side of a
+%% partition believes `leader = self` until a snapshot it may not receive — would
+%% serve its frozen replica as authoritative.  Fencing writes alone cannot prevent
+%% that; reads need their own fence.
+%%
+%% `Value` is captured in the handler, at the member's mailbox point; the verify
+%% runs in a short-lived helper so the DB round-trip never blocks the member's
+%% loop.  This is linearizable because leadership is continuous within an epoch:
+%% if `{Self, Epoch}` still holds at verify time, no other leader existed between
+%% the capture and the verify, so the captured value was (and still is at the
+%% verification point) the authoritative answer.  Any verification failure — a
+%% mismatch, or an unreachable backend — answers `Denied` (the CP refusal), the
+%% same value an unreachable-leader forward answers.
+reply_fenced(From, Value, Denied, #state{
+    tenant = Tenant, tuid = Tuid, member_id = Self, epoch = Epoch
+}) ->
+    _ = spawn(fun() ->
+        Reply =
+            case dgen_registry_names:verify_leader(Tenant, Tuid, Self, Epoch) of
+                true -> Value;
+                false -> Denied
+            end,
+        gen_server:reply(From, Reply)
+    end),
+    ok.
+
+%% Forward a pid-guarded retract to the (believed) current leader — used when a
+%% durable clear this member owed (an unregister, or a strict-mode retraction)
+%% cannot ride its own commit pipeline anymore.  Best-effort by necessity: with no
+%% leader there is nowhere to send it, and a later handoff gather reconciles.
+forward_retract(undefined, _Name, _Pid) ->
+    ok;
+forward_retract(Leader, Name, Pid) ->
+    cast_to_member(Leader, {retract_req, Name, Pid}).
+
+%% A batch failed to commit (fenced / backend error / worker death) or committed
+%% but its plan is no longer applicable (leadership moved in flight).  Its
+%% registrations were rejected — callers retry — but its destructive ops (removes,
+%% retracts, downs) must be re-driven: dropping an unregister would leave this
+%% member's optimistic delete diverged from every other replica until an unrelated
+%% handoff, and dropping a retract would leave a `no`-answered binding alive.
+%% Scheduled after a short delay so a persistently failing backend does not spin.
+salvage_failed_plan(State, #{ops := Ops}) ->
+    Destructive = [
+        Op
+     || Op <- Ops,
+        element(1, Op) =:= remove orelse element(1, Op) =:= retract orelse
+            element(1, Op) =:= down
+    ],
+    case Destructive of
+        [] -> ok;
+        _ -> erlang:send_after(?REQUEUE_DELAY, self(), {requeue_ops, Destructive})
+    end,
+    State.
+
+%% Losing leadership with direct registrations still awaiting replica acks: resolve
+%% them now, by the same policy as a replicate timeout (§8).  Degrade-open answers
+%% `yes` (the binding committed under our term and we hold it, so the handoff gather
+%% carries it); fail-closed answers `no` and forwards the pid-guarded retract to the
+%% new leader, so the caller's `no` cannot leave the binding alive.
+fail_pending_acks(State = #state{pending_acks = PA}) when map_size(PA) =:= 0 ->
+    State;
+fail_pending_acks(State = #state{pending_acks = PA, leader = NewLeader, config = Config}) ->
+    Strict = dgen_config:strict_replication(Config),
+    maps:foreach(
+        fun(_BatchRef, {Direct, TimerRef, Needed, Acked}) ->
+            erlang:cancel_timer(TimerRef),
+            case Strict of
+                false ->
+                    notify_degrade_open(Needed, map_size(Acked), length(Direct)),
+                    deliver_direct(Direct);
+                true ->
+                    lists:foreach(
+                        fun({Origin, Name, Pid}) ->
+                            deliver_reply(Origin, no),
+                            forward_retract(NewLeader, Name, Pid)
+                        end,
+                        Direct
+                    )
+            end
+        end,
+        PA
+    ),
+    State#state{pending_acks = #{}}.
 
 %% ---------------------------------------------------------------------------
 %% Local names replica (ETS) — the member is this table's sole writer.
@@ -2098,39 +2682,57 @@ merge_peer_tokens(Tokens, State = #state{peer_tokens = PeerTokens}) ->
 broadcast_to_peers(Members, Msg) ->
     maps:foreach(fun(MemberId, _) -> cast_to_member(MemberId, Msg) end, Members).
 
-%% Connect Erlang distribution to every member node (except those recently down), in a
-%% short-lived helper so neither the queued read nor the (potentially slow) connection
-%% handshakes block the member's loop.  The member set is read from the elector via a
-%% regular `call` (not `priority_call`): it rides the elector's durable queue in order
-%% with the membership changes, rather than bypassing it on the urgent lane, so the
-%% mesh sees a just-joined node as soon as its join is processed and does not jump ahead
-%% of or add bypass load to the membership work.  The set is authoritative — the same on
-%% every node — including a brand-new member that has only committed its join to the
-%% database and is not yet reachable any other way.  `connect_node/1` is idempotent (an
-%% already-connected node is a no-op) and a node that cannot be reached simply returns
-%% `false`; either way the next pass retries.
-spawn_mesh_connect(Elector, SelfNode, Suppressed) ->
+%% Read the authoritative member set from the elector and report it back to the
+%% member as `{mesh_members, MemberNodes}`, in a short-lived helper so the
+%% (potentially slow, durable-queue) read never blocks the member's loop.  The
+%% member set is read via a regular `call` (not `priority_call`): it rides the
+%% elector's durable queue in order with the membership changes, rather than
+%% bypassing it on the urgent lane, so the mesh sees a just-joined node as soon as
+%% its join is processed and does not jump ahead of or add bypass load to the
+%% membership work.  The set is authoritative — the same on every node — including a
+%% brand-new member that has only committed its join to the database and is not yet
+%% reachable any other way.
+%%
+%% Crucially, the helper does *not* itself decide which nodes to connect: it just
+%% reports the set back, and the member applies the recently-down suppression on its
+%% own mailbox (see the `mesh_members` clause).  A fetch spawned before a node
+%% dropped therefore cannot reconnect that node with a stale suppression snapshot.
+spawn_mesh_fetch(Elector, Owner) ->
     _ = spawn(fun() ->
+        %% Piggyback a durable-epoch check on the periodic pass: read the committed
+        %% election epoch (a priority read — its own transaction, bypassing the
+        %% queue) and report it to the member.  If it is ahead of what the member
+        %% has heard, a leadership handoff never reached this node (the post-commit
+        %% assume action failed, or the snapshot was dropped) — the member re-joins
+        %% to trigger a fresh assume/fan-out.  Without this, a missed handoff could
+        %% leave a new leader unaware of its role (all writes failing) until an
+        %% unrelated membership event.
+        try dgen_server:priority_call(Elector, get_epoch) of
+            DurableEpoch when is_integer(DurableEpoch) ->
+                Owner ! {durable_epoch, DurableEpoch};
+            _ ->
+                ok
+        catch
+            _:_ -> ok
+        end,
         try dgen_server:call(Elector, get_members) of
             Members when is_list(Members) ->
-                lists:foreach(
-                    fun
-                        ({Node, _Name}) when Node =/= SelfNode ->
-                            case lists:member(Node, Suppressed) of
-                                true -> ok;
-                                false -> net_kernel:connect_node(Node)
-                            end;
-                        (_) ->
-                            ok
-                    end,
-                    Members
-                );
+                Owner ! {mesh_members, [Node || {Node, _Name} <- Members]};
             _ ->
                 ok
         catch
             _:_ -> ok
         end
     end),
+    ok.
+
+%% Connect Erlang distribution to each target member node, off the member's loop
+%% (the handshake can block on an unreachable node).  `connect_node/1` is idempotent
+%% (an already-connected node is a no-op) and a node that cannot be reached simply
+%% returns `false`; either way the next mesh pass retries.  The targets have already
+%% been filtered against the current recently-down suppression by the caller.
+spawn_mesh_connect(Targets) ->
+    _ = spawn(fun() -> lists:foreach(fun net_kernel:connect_node/1, Targets) end),
     ok.
 
 %% Cast to a peer member.  A fire-and-forget cast to `{Name, Node}` on a

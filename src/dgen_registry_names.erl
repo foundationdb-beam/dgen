@@ -13,9 +13,10 @@
 %%
 %% Historically this module stored one **occupancy key per registered name**
 %% (`{Tuid, <<"names">>, Name} -> {Epoch, PidNode}`) as the authoritative taken-set.
-%% That has been collapsed to a **single key per registry**: a monotonic counter at
-%% `{Tuid, <<"version">>}`, bumped once per committed batch with a conflict-free
-%% atomic add. See §4.4 of `docs/dgen_registry_design.md`.
+%% That has been collapsed to a **single key per registry**: a monotonic version at
+%% `{Tuid, <<"version">>}`, rewritten once per committed batch with a conflict-free
+%% versionstamp (`set_versionstamped_value`), so its value advances with FDB's
+%% commit-version order. See §4.4 of `docs/dgen_registry_design.md`.
 %%
 %% The bump exists *solely* to turn the fenced commit into a write transaction so the
 %% leader-key read-conflict is actually resolved by the FDB resolver (a transaction
@@ -27,8 +28,8 @@
 %% ## Key layout
 %%
 %% ```
-%% {Tuid, <<"version">>} -> atomic counter (little-endian)   %% the only data key
-%% {Tuid, <<"leader">>}  -> term_to_binary(MemberId)         %% the fence (elector-owned)
+%% {Tuid, <<"version">>} -> 10-byte versionstamp (big-endian commit version)  %% the only data key
+%% {Tuid, <<"leader">>}  -> term_to_binary({MemberId, Epoch})                 %% the fence (elector-owned)
 %% ```
 %%
 %% So a registry's *name table* holds ~2 DB keys for N processes, independent of N.
@@ -53,11 +54,18 @@
 %%
 %% ## Fencing
 %%
-%% A commit is fenced against a concurrent leadership change on the leader key. Two
-%% equivalent mechanisms are used, both safe:
+%% A commit is fenced against a concurrent leadership change on the leader key. The
+%% fence compares **both the member id and the epoch** — `{Self, Epoch}` — so it is a
+%% monotonic fencing token, not an identity check: a member deposed and later
+%% re-elected holds a *new* epoch, and a commit it started under the old epoch can
+%% never pass the fence in the new term (the classic ABA hazard of id-only fences).
+%% Legacy values (a bare MemberId written by older versions) are accepted on id alone
+%% until the next election rewrites the key. Two equivalent mechanisms are used,
+%% both safe:
 %%
 %% - **Read** (the first commit after assuming leadership; every retry): read the
-%%   leader key inside the transaction and proceed only if it still names `Self`. The
+%%   leader key inside the transaction and proceed only if it still names `{Self,
+%%   Epoch}`. The
 %%   read adds a read-conflict, so a concurrent leadership change conflicts the commit;
 %%   the retry re-reads, sees the new leader, and aborts with `fenced`.
 %% - **Write-conflict only** (steady state, when the read version is pinned to a prior
@@ -72,15 +80,17 @@
 
 -behaviour(dgen_transaction).
 
--export([read_version/2, start_commit/4]).
+-export([read_version/2, start_commit/4, verify_leader/4]).
 %% dgen_transaction callbacks (the async, non-blocking, cached-GRV commit path).
 -export([init/1, handle_begin/2, handle_retry/2, handle_committed/2]).
 
 -if(?DOCATTRS).
 -doc """
-Reads the registry's durable version counter (the number of committed batches).
+Reads the registry's durable version key — the versionstamp of the most recently
+committed batch, decoded as a big-endian integer.
 
-Returns a non-negative integer (`0` if no batch has committed yet). Used for
+Returns a non-negative integer (`0` if no batch has committed yet). It is a
+globally-monotonic FDB commit version, **not** a count of batches. Used for
 diagnostics and tests; the registry itself does not read this key — the commit
 version returned by the transaction is what stamps the in-memory maps.
 """.
@@ -114,17 +124,24 @@ The worker is **monitored** (returns `{ok, {Pid, MRef}}`): the caller must handl
 its `DOWN` as a commit failure, so a worker that dies without delivering a result
 (e.g. it is killed) still resolves the in-flight commit rather than wedging it.
 
-`Self` is the committing member's id (the fence subject). `Opts` is a map: `owner`
-(pid, required), `ref` (correlation token, required), `read_version` (a prior
-committed version to pin, or omitted/`undefined` for a fresh GRV). On a retryable
-conflict the worker resets to a fresh GRV automatically.
+`Self` is the committing member's id and `epoch` its current leadership epoch —
+together the fence subject `{Self, Epoch}`. `Opts` is a map: `owner` (pid,
+required), `ref` (correlation token, required), `epoch` (the leader's epoch,
+required), `read_version` (a prior committed version to pin, or
+omitted/`undefined` for a fresh GRV). On a retryable conflict the worker resets
+to a fresh GRV automatically.
 """.
 -endif.
 -spec start_commit(
     dgen_backend:tenant(),
     dgen_server:tuid(),
     dgen_registry_elector:member_id(),
-    #{owner := pid(), ref := term(), read_version => undefined | integer()}
+    #{
+        owner := pid(),
+        ref := term(),
+        epoch := non_neg_integer(),
+        read_version => undefined | integer()
+    }
 ) -> {ok, {pid(), reference()}} | {error, term()}.
 start_commit({Db, Dir}, Tuid, Self, Opts) ->
     LeaderKey = dgen_registry_elector:leader_db_key(Dir, Tuid),
@@ -132,6 +149,7 @@ start_commit({Db, Dir}, Tuid, Self, Opts) ->
     ReadVersion = maps:get(read_version, Opts, undefined),
     Args = #{
         self => Self,
+        epoch => maps:get(epoch, Opts),
         leader_key => LeaderKey,
         version_key => VersionKey,
         %% How to fence the first attempt (see the Fencing section): a pinned read
@@ -153,6 +171,54 @@ read_version_opt(Version) -> [{read_version, Version}].
 
 fence_mode(undefined) -> read;
 fence_mode(_Version) -> conflict.
+
+-if(?DOCATTRS).
+-doc """
+Verifies, against the durable leader key, that `Self` is the fenced leader for
+`Epoch` right now.
+
+Used by the consistent-read path (`whereis_name_consistent/1` and friends): a
+member that believes it is leader confirms that belief against the database
+before answering, so a deposed leader that has not yet heard about the handoff
+(e.g. it is on the minority side of a partition) cannot serve a stale answer as
+authoritative (Guarantee 5 of the design doc). Any failure to verify — a
+mismatch, a missing key, or an unreachable backend — returns `false` (the CP
+refusal).
+""".
+-endif.
+-spec verify_leader(
+    dgen_backend:tenant(),
+    dgen_server:tuid(),
+    dgen_registry_elector:member_id(),
+    non_neg_integer()
+) -> boolean().
+verify_leader(Tenant = {_Db, Dir}, Tuid, Self, Epoch) ->
+    B = dgen_config:backend(),
+    Key = dgen_registry_elector:leader_db_key(Dir, Tuid),
+    try
+        dgen_backend:transactional(Tenant, fun({Tx, _Dir}) ->
+            case B:wait(B:get(Tx, Key)) of
+                not_found -> false;
+                Bin -> leader_matches(binary_to_term(Bin), Self, Epoch)
+            end
+        end)
+    catch
+        _:_ -> false
+    end.
+
+%% Does a decoded leader-key value name `{Self, Epoch}`?  The current format is
+%% `{MemberId, Epoch}`; a bare `{Node, Name}` member id is the legacy (pre-epoch)
+%% format, accepted on id alone until the next election rewrites the key.  Note a
+%% member id is itself a 2-tuple, so the formats are distinguished by the second
+%% element's type (an integer epoch vs. a registry-name atom).
+leader_matches({{_, _} = Leader, LeaderEpoch}, Self, Epoch) when is_integer(LeaderEpoch) ->
+    Leader =:= Self andalso LeaderEpoch =:= Epoch;
+leader_matches({undefined, LeaderEpoch}, _Self, _Epoch) when is_integer(LeaderEpoch) ->
+    false;
+leader_matches({_, _} = Leader, Self, _Epoch) ->
+    Leader =:= Self;
+leader_matches(_Other, _Self, _Epoch) ->
+    false.
 
 %% ---------------------------------------------------------------------------
 %% dgen_transaction callbacks
@@ -186,14 +252,16 @@ handle_committed(Version, _State) ->
     {ok, Version}.
 
 %% Read the leader key (the read adds the read-conflict that fences against a
-%% concurrent leadership change) and bump the version only while still the leader.
-fenced_by_read(Tx, State = #{self := Self, leader_key := LeaderKey}) ->
+%% concurrent leadership change) and bump the version only while still the leader
+%% *for this epoch* — a depose-and-re-elect of the same member carries a newer
+%% epoch, so a commit planned in the older term is fenced (no ABA).
+fenced_by_read(Tx, State = #{self := Self, epoch := Epoch, leader_key := LeaderKey}) ->
     B = dgen_config:backend(),
-    case current_leader(B, Tx, LeaderKey) of
-        Self ->
+    case leader_matches(current_leader(B, Tx, LeaderKey), Self, Epoch) of
+        true ->
             bump_version(B, Tx, State),
             {commit, State};
-        _Other ->
+        false ->
             {stop, fenced, State}
     end.
 

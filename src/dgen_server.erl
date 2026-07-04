@@ -102,7 +102,10 @@ ordered with the rest of the stream.
   alerting or metrics.
 
 `Actions` is a list of 1-arity funs executed after the transaction commits. The
-argument is the
+argument is the module state as committed by that transaction — note that under
+batched consumption (`consume_k > 1`) all of a batch's actions run after the
+batch's single commit and each receives the state as of the **end of the batch**,
+not the state at the message that produced the action.
 
 ## Module State
 
