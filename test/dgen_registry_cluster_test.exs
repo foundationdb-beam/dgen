@@ -754,20 +754,30 @@ defmodule DGen.RegistryClusterTest do
       pid = spawn(fn -> Process.sleep(:infinity) end)
       on_exit(fn -> Process.exit(pid, :kill) end)
 
-      epoch = :dgen_registry.get_epoch(reg)
-      leader = :dgen_registry.get_leader(reg)
       peer_member = :erpc.call(peer_node, :dgen_registry, :member_name, [reg])
-      v = peer_applied_version(peer_node, peer_member)
+      leader = :erpc.call(peer_node, :dgen_registry, :get_leader, [reg])
 
-      :erpc.call(peer_node, :gen_server, :cast, [
-        peer_member,
-        {:name_registered, :valid_name, pid, %{}, :undefined, epoch, v, v + 1, leader}
-      ])
+      # apply_bcast fences on the *peer member's* current epoch and applied_version,
+      # so craft the broadcast from the peer's own view (not the local node's epoch).
+      # A transient re-election under CI load bumps the peer's epoch and resets its
+      # applied_version (via an apply_names_snapshot) to a fresh versionstamp, which
+      # would fence a broadcast stamped from stale reads — retry with fresh stamps
+      # until the cluster is quiescent enough for the current-epoch broadcast to land.
+      assert eventually(fn ->
+               epoch = :erpc.call(peer_node, :dgen_registry, :get_epoch, [reg])
+               v = peer_applied_version(peer_node, peer_member)
 
-      # Barrier: ensure the peer member processed the cast before the caller-side read.
-      :erpc.call(peer_node, :sys, :get_state, [peer_member])
+               :erpc.call(peer_node, :gen_server, :cast, [
+                 peer_member,
+                 {:name_registered, :valid_name, pid, %{}, :undefined, epoch, v, v + 1, leader}
+               ])
 
-      assert pid == :erpc.call(peer_node, :dgen_registry, :whereis_name, [{reg, :valid_name}])
+               # Barrier: ensure the peer member processed the cast before the read.
+               :erpc.call(peer_node, :sys, :get_state, [peer_member])
+
+               pid == :erpc.call(peer_node, :dgen_registry, :whereis_name, [{reg, :valid_name}])
+             end),
+             "peer never accepted a current-epoch name_registered broadcast"
     end
 
     test "epoch increments when a new leader is elected after the peer joins", %{
