@@ -656,8 +656,23 @@ defmodule DGen.RegistryTest do
   end
 
   # ---------------------------------------------------------------------------
-  # Epoch fencing — stale leader broadcasts are discarded
+  # Epoch fencing and gap detection — stale-leader broadcasts are discarded, and a
+  # broadcast that is not contiguous with the member's replica (a missed batch)
+  # is not applied.
+  #
+  # Broadcast shape: {name_registered, Name, Pid, Index, Data, Epoch, PrevVersion,
+  # Version, LeaderId} (and the analogous {name_unregistered, Name, ReleasedPid,
+  # Epoch, PrevVersion, Version, LeaderId}). A broadcast is applied only when
+  # PrevVersion equals the member's applied version (the next batch in sequence)
+  # or Version equals it (the same batch continuing).
   # ---------------------------------------------------------------------------
+
+  # The member's current applied version, read through the same snapshot call the
+  # handoff gather uses, so tests can craft contiguous (or gapped) broadcasts.
+  defp applied_version(member) do
+    {_records, version, _released} = GenServer.call(member, :get_names_snapshot)
+    version
+  end
 
   describe "epoch fencing" do
     test "name_registered with stale epoch is discarded", %{reg: reg} do
@@ -666,10 +681,15 @@ defmodule DGen.RegistryTest do
       on_exit(fn -> Process.exit(pid, :kill) end)
 
       epoch = :dgen_registry.get_epoch(reg)
-      # Simulate a broadcast from a stale leader carrying a smaller epoch.
-      # Shape: {name_registered, Name, Pid, Index, Data, Epoch, Version}; the trailing 0
-      # is the applied-version stamp (irrelevant here).
-      GenServer.cast(member, {:name_registered, :stale_name, pid, %{}, :undefined, epoch - 1, 0})
+      leader = :dgen_registry.get_leader(reg)
+      v = applied_version(member)
+      # Simulate a broadcast from a stale leader carrying a smaller epoch. The
+      # version stamps are contiguous, so only the epoch causes the discard.
+      GenServer.cast(
+        member,
+        {:name_registered, :stale_name, pid, %{}, :undefined, epoch - 1, v, v + 1, leader}
+      )
+
       # whereis_name now reads ETS in the caller (no member round-trip), so it can no
       # longer act as a mailbox barrier — flush the member's mailbox with get_state.
       :sys.get_state(member)
@@ -677,17 +697,46 @@ defmodule DGen.RegistryTest do
       assert :undefined == :dgen_registry.whereis_name({reg, :stale_name})
     end
 
-    test "name_registered with current epoch is applied", %{reg: reg} do
+    test "name_registered with current epoch and contiguous version is applied", %{reg: reg} do
       member = :dgen_registry.member_name(reg)
       pid = spawn(fn -> Process.sleep(:infinity) end)
       on_exit(fn -> Process.exit(pid, :kill) end)
 
       epoch = :dgen_registry.get_epoch(reg)
-      GenServer.cast(member, {:name_registered, :current_name, pid, %{}, :undefined, epoch, 0})
+      leader = :dgen_registry.get_leader(reg)
+      v = applied_version(member)
+
+      GenServer.cast(
+        member,
+        {:name_registered, :current_name, pid, %{}, :undefined, epoch, v, v + 1, leader}
+      )
+
       # Barrier: ensure the member has processed the cast before the caller-side read.
       :sys.get_state(member)
 
       assert pid == :dgen_registry.whereis_name({reg, :current_name})
+    end
+
+    test "name_registered with a version gap is not applied", %{reg: reg} do
+      member = :dgen_registry.member_name(reg)
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+
+      epoch = :dgen_registry.get_epoch(reg)
+      leader = :dgen_registry.get_leader(reg)
+      v = applied_version(member)
+
+      # PrevVersion is ahead of the member's applied version: the member missed a
+      # batch, so this broadcast must not be applied (the member asks for a resync
+      # snapshot instead of advancing with a hole in its replica).
+      GenServer.cast(
+        member,
+        {:name_registered, :gapped_name, pid, %{}, :undefined, epoch, v + 10, v + 11, leader}
+      )
+
+      :sys.get_state(member)
+
+      assert :undefined == :dgen_registry.whereis_name({reg, :gapped_name})
     end
 
     test "name_unregistered with stale epoch is discarded", %{reg: reg} do
@@ -696,24 +745,36 @@ defmodule DGen.RegistryTest do
 
       :yes = :dgen_registry.register_name({reg, :persisted_name}, pid)
       epoch = :dgen_registry.get_epoch(reg)
+      leader = :dgen_registry.get_leader(reg)
       member = :dgen_registry.member_name(reg)
+      v = applied_version(member)
 
-      GenServer.cast(member, {:name_unregistered, :persisted_name, epoch - 1, 0})
+      GenServer.cast(
+        member,
+        {:name_unregistered, :persisted_name, :undefined, epoch - 1, v, v + 1, leader}
+      )
+
       # Barrier: ensure the member has processed (and discarded) the stale cast.
       :sys.get_state(member)
 
       assert pid == :dgen_registry.whereis_name({reg, :persisted_name})
     end
 
-    test "name_unregistered with current epoch is applied", %{reg: reg} do
+    test "name_unregistered with current epoch and contiguous version is applied", %{reg: reg} do
       pid = spawn(fn -> Process.sleep(:infinity) end)
       on_exit(fn -> Process.exit(pid, :kill) end)
 
       :yes = :dgen_registry.register_name({reg, :to_remove}, pid)
       epoch = :dgen_registry.get_epoch(reg)
+      leader = :dgen_registry.get_leader(reg)
       member = :dgen_registry.member_name(reg)
+      v = applied_version(member)
 
-      GenServer.cast(member, {:name_unregistered, :to_remove, epoch, 0})
+      GenServer.cast(
+        member,
+        {:name_unregistered, :to_remove, :undefined, epoch, v, v + 1, leader}
+      )
+
       # Barrier: ensure the member has processed the cast before the caller-side read.
       :sys.get_state(member)
 

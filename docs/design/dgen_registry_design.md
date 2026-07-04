@@ -116,7 +116,7 @@ between them is the main thing an application author decides:
 | Function | Where it reads from | Speed | Freshness |
 |---|---|---|---|
 | `whereis_name/1` | the local member's ETS table, read in the calling process | fast, no network hop, no member round-trip | *snapshot* — may briefly lag a recent change made on another node |
-| `whereis_name_consistent/1` | the current leader | one network hop | *authoritative* — reflects the leader's committed view |
+| `whereis_name_consistent/1` | the current leader, with the answer **fence-verified** against the database | one network hop plus a database check | *authoritative* — reflects the leader's committed view, and a deposed leader cannot serve it (§5.1) |
 
 `whereis_name/1` is what OTP's routing uses internally, so a `gen_server:call`
 through a via-tuple takes the fast path: it does a lock-free `ets:lookup/2` against
@@ -125,7 +125,9 @@ can resolve names concurrently without ever queuing behind the member's mailbox.
 
 **Registration returns a verdict.** `register_name/2` answers `yes` if the name is
 now yours, or `no` if it is already taken (or if the registry currently has no
-leader to adjudicate). It never blocks indefinitely on the result.
+leader to adjudicate, or the leader is unreachable — an unreachable leader is
+answered `no` immediately rather than waited on, and even a routing timeout comes
+back as `no`, never as an exit). It never blocks indefinitely on the result.
 
 **Automatic cleanup.** The leader watches every registered process with
 `erlang:monitor/2`. When a registered process exits, its name is unregistered
@@ -169,7 +171,10 @@ the next membership change elects a replacement deterministically.
 
 Each leadership term is stamped with an increasing **epoch** number. Messages from
 an older epoch are ignored, so a message from a deposed leader cannot disturb the
-current one.
+current one. The epoch is also written into the durable leadership record itself,
+which makes the fence (§5.1) a true monotonic fencing token rather than an identity
+check: even a leader that is deposed and later *re-elected* cannot complete a write
+it started in its earlier term.
 
 ### 4.3 The leader is the sole writer
 
@@ -196,10 +201,12 @@ that it recreates, empty, whenever it (re)starts.
 As a result the **name table** costs only about **two keys** in the database,
 regardless of how many names are registered:
 
-- a **leader key**, recording the current leader, and
-- a **version counter**, bumped once per batch of committed changes.
+- a **leader key**, recording the current leader *and its epoch* (the fencing
+  token, §5.1), and
+- a **version key**, rewritten once per batch of committed changes with a
+  monotonically increasing commit version.
 
-The version counter exists to make the leader's write a real database transaction
+The version key exists to make the leader's write a real database transaction
 (so the consistency machinery in the next section engages) and to give each batch a
 globally-ordered version number. Neither key grows with the number of registered
 names.
@@ -220,8 +227,16 @@ register.
 
 After the leader applies a batch of changes it broadcasts them to the other members,
 which update their local maps. Combined with the forwarding path, this is what keeps
-every node's phone book current. The details of *how current*, and what survives a
-failure, are the subject of the next section.
+every node's phone book current.
+
+Each broadcast carries its batch's version *and the version of the batch before it*,
+so a member applies broadcasts only when they are **contiguous** with what it already
+holds. A member that missed a batch — a message dropped while it was briefly
+disconnected — detects the gap, stops applying, and asks the leader for a fresh
+snapshot instead of silently continuing with a hole in its replica. Every member's
+replica is therefore always a *prefix* of the leader's ordered stream, which is what
+makes the handoff reconstruction in §5.7 sound. The details of *how current* a
+replica is, and what survives a failure, are the subject of the next section.
 
 ### 4.6 Joining, leaving, and connectivity
 
@@ -385,17 +400,31 @@ the one paired with it.
 This section states precisely what holds and what does not. It is the heart of the
 document.
 
-### 5.1 Fencing: a stale leader cannot write
+### 5.1 Fencing: a stale leader cannot write — or serve consistent reads
 
-When leadership moves, the new leader's identity is committed to the database. From
-that instant, the old leader is **fenced**: its attempts to commit a change conflict
-with the leadership record and are rejected by the database. It physically cannot
-register or unregister a name any more.
+When leadership moves, the new leader's identity **and epoch** are committed to the
+database. From that instant, the old leader is **fenced**: its attempts to commit a
+change conflict with the leadership record and are rejected by the database. It
+physically cannot register or unregister a name any more. Because the record carries
+the epoch, the fence is a monotonic fencing token: a member that is deposed and later
+re-elected holds a *new* epoch, so even its own in-flight writes from the earlier
+term are rejected — there is no ABA window in which an old term's write can land in a
+new term.
 
 This is what rules out the classic split-brain failure where two nodes each believe
 they are in charge and both hand out the same name. There is at most one leader that
 can successfully write, enforced by the database's transaction conflict detection
 rather than by hope or timing.
+
+Consistent **reads** are fenced too. A deposed leader that has not yet heard about
+the handoff (the minority side of a partition believes it still leads until told
+otherwise) must not serve its frozen replica as authoritative — so every
+`*_consistent` answer is released only after the answering member re-verifies its
+leadership (id and epoch) against the durable record. A verification that fails, or
+cannot reach the database, answers the not-registered/empty value instead: the same
+CP refusal the write path makes. This is what lets Guarantee 5 say "authoritative"
+without a timing asterisk; the cost is one database read per consistent read, which
+is the deliberate price of the word.
 
 ### 5.2 Linearizable registration
 
@@ -469,9 +498,22 @@ the same name.
 
 When the registry observes this — two *different, live* processes for one name — it
 resolves it decisively: it **terminates both** processes, clears the name, and raises
-an alarm. Supervised processes then restart and re-register cleanly under the single
-leader. A per-name budget bounds how often this can fire before the situation is
-escalated to an operator instead of looping.
+an alarm (a log line and, when the optional `telemetry` library is present, a
+`[dgen_registry, conflict]` event). Supervised processes then restart and re-register
+cleanly under the single leader. A per-name budget bounds how often this can fire
+before the situation is escalated to an operator instead of looping.
+
+Detection must not misfire on mere staleness: a member that lagged behind (or was
+briefly disconnected) may still report a binding that was *legitimately* unregistered
+while its process lives on — that is lag, not a conflict, and killing for it would be
+wrong. The registry therefore keeps a **released-pid trail**: every explicit
+unregister of a live process is remembered for a configurable window
+(`conflict_release_ttl`, §8) on *every* member — the leader records it at commit,
+followers record it from the replication broadcast, and a leadership handoff merges
+every reachable member's trail into the new leader's, so the discriminator survives
+leadership changes. Trail entries are only expired while the cluster is fully
+connected, so a partition cannot outlive the trail that protects against its lagging
+replicas.
 
 This is why the registry is described as a **singleton** registry, and why it carries
 an explicit contract:
@@ -488,21 +530,34 @@ during a partition — see [Configuration](#8-configuration).
 ### 5.7 Leadership handoff
 
 When the leader changes, the new leader rebuilds its name table by asking every
-reachable member for its current map and taking the most up-to-date answer. It does
-not read names from the database (there are none to read). Because the previous
-leader is already fenced, this handoff needs no global pause: the moment leadership
-commits, the old leader can no longer interfere.
+reachable member for its current map — the requests fan out in parallel, bounded by a
+single overall timeout — and taking the most up-to-date answer. It does not read
+names from the database (there are none to read). Because the previous leader is
+already fenced, this handoff needs no global pause: the moment leadership commits,
+the old leader can no longer interfere.
 
 Reconstruction takes the freshest reachable member's map as the answer. Because
-broadcasts are totally ordered, that one map already holds the current binding for
-every name a *reachable* member knows — so a name that is two-holder survives any
-single member being unreachable (its other holder is in the gather). A binding that
+broadcasts are totally ordered *and every member's replica is a gap-checked prefix of
+that order* (§4.5 — a member that missed a batch resyncs rather than advancing past
+the hole), the freshest map already holds the current binding for every name a
+*reachable* member knows, and two members reporting the same version necessarily hold
+the same map — so a name that is two-holder survives any single member being
+unreachable (its other holder is in the gather). A binding that
 was held *only* by an unreachable member (a degrade-open single holder, or a
 multi-fault loss) is absent from the rebuilt table and is **not** restored when that
 member later returns — its name is treated as free, and re-registration is the
 application's responsibility (§5.4). The one thing that *is* repaired automatically is
 a resulting **conflict**: if such a name was reissued while the holder was away, the
 two live claimants are reconciled by termination (§5.6) when the member returns.
+
+Two smaller handoff properties are worth stating. First, a handoff always reaches its
+new leader eventually: the membership change and the new leadership record commit
+atomically, and if the notification that follows is lost (the notifying process
+crashed, or could not reach the new leader), every member periodically compares the
+epoch it has heard against the committed one and re-announces itself on a mismatch —
+which re-drives the handoff. Second, direct registrations that were awaiting their
+replica confirmations when leadership was lost are resolved immediately under the
+same policy as a replication timeout (§8), rather than being left to dangle.
 
 ---
 
@@ -526,7 +581,11 @@ These are normative. Behaviour that violates one of these is a defect.
    timeout occurred, in which case it may have one holder. The default policy and the
    stricter alternatives are documented in [Configuration](#8-configuration).
 5. **Authoritative consistent reads.** `whereis_name_consistent/1` reflects the
-   current leader's committed view of the name.
+   current leader's committed view of the name. This holds even across an
+   unnoticed deposition: every consistent answer is fence-verified against the
+   durable leadership record before release (§5.1), so a deposed leader that has
+   not yet heard about the handoff answers the CP refusal (not-registered) rather
+   than a stale value presented as authoritative.
 6. **Automatic unregistration.** When a registered process exits, its name is
    unregistered without an explicit call.
 7. **CP under partition.** The side of a partition that cannot reach the database (or
@@ -577,6 +636,9 @@ does not promise.
    `whereis_name_consistent/1` when you need the authoritative answer.
 5. **Synchronous unregistration semantics.** `unregister_name/1` is best-effort and
    eventually consistent; it does not block until every node has observed the removal.
+   (Eventual propagation is actively driven, though: an unregister whose commit fails
+   or whose leader is deposed mid-flight is re-driven — re-enqueued on the leader or
+   handed to the new one as a pid-guarded clear — rather than silently dropped.)
 6. **Preservation of a process the registry must terminate.** The registry may
    terminate a registered process to enforce uniqueness (§5.6). A process that cannot
    withstand being forcibly killed — one that is neither restart-safe nor transient by
@@ -627,10 +689,11 @@ default for every registry), and then to the built-in default below.
 |---|---|---|
 | `register_replicas` | `1` | How many follower copies a *direct* registration waits for before `yes`. Bounded by the number of followers. Higher values widen durability at the cost of registration latency. |
 | `replicate_timeout` | `1000` ms | How long the leader waits for those confirmations before applying the timeout policy. |
-| `strict_replication` | `false` | Timeout policy. `false`: **degrade open** — acknowledge `yes` with whatever holders exist (possibly one) to stay responsive. `true`: **fail closed** — reject the registration and retract the binding so a caller never sees an unreplicated `yes`. |
+| `strict_replication` | `false` | Timeout policy. `false`: **degrade open** — acknowledge `yes` with whatever holders exist (possibly one) to stay responsive. `true`: **fail closed** — reject the registration and retract the binding so a caller never sees an unreplicated `yes`. The retraction survives a leadership change: if the rejecting leader is deposed before its retraction commits, the pid-guarded retract is handed to the new leader, so a `no` cannot silently leave the binding alive. |
 | `terminate_on_conflict` | `true` | Whether a detected uniqueness conflict (§5.6) terminates the conflicting processes, or only detects and alarms. |
 | `conflict_kill_budget` | `{3, 60000}` | At most *N* terminations per name per window (ms) before escalating to an operator instead of looping. |
-| `reject_when_degraded` | `false` | Optional prevention (§5.6). When `true`, a leader whose last handoff could not reach every member refuses to register a name it does not already hold — preventing a reissue rather than repairing it. Deliberately blunt: it cannot distinguish a partition from a deliberate scale-down, so it is off by default. |
+| `conflict_release_ttl` | `600000` ms | How long an explicitly-released live pid stays in the conflict-detector trail (§5.6) — the discriminator that keeps a lagging replica from being mistaken for a conflict. Expiry is suspended while any member is disconnected, so a partition cannot outlive the trail. Entries are tiny; a generous window is cheap. |
+| `reject_when_degraded` | `false` | Optional prevention (§5.6). When `true`, a leader whose last handoff could not reach every member that *could be holding bindings* refuses to register a name it does not already hold — preventing a reissue rather than repairing it. A brand-new joiner that has not yet connected (it exists only as a row in the database, §4.6) holds nothing and does not count, so a healthy scale-up does not trip this. Deliberately blunt otherwise: it cannot distinguish a partition from a deliberate scale-down, so it is off by default. |
 
 Observability: when a direct registration degrades open, the registry emits an event
 through the optional `telemetry` library (if present) and logs a warning, so the

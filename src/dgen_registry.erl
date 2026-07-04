@@ -253,12 +253,22 @@ Registers `Pid` under `{RegistryName, LogicalName}` with metadata, in one fenced
 
 `MetaSpec` is `#{index => map(), data => term()}` (both optional; defaults `#{}` and
 `undefined`). Like `register_name/2`, returns `yes` on success or `no` if the name is
-already taken or no leader is currently elected.
+already taken, no leader is currently elected, or the leader could not be reached in
+time — registration always returns a verdict rather than exiting on a routing
+timeout (a caller that hears `no` retries; it never has to handle a timeout exit).
 """.
 -endif.
 -spec register_name({atom(), term()}, pid(), map()) -> yes | no.
 register_name({RegistryName, LogicalName}, Pid, MetaSpec) ->
-    gen_server:call(member_name(RegistryName), {register, LogicalName, Pid, meta_of(MetaSpec)}).
+    try
+        gen_server:call(member_name(RegistryName), {register, LogicalName, Pid, meta_of(MetaSpec)})
+    catch
+        %% The member (or the leader behind it) did not answer in time — e.g. the
+        %% leader became unreachable after the forward was sent.  The contract is a
+        %% verdict, not an exit: answer `no` so the caller retries.  A missing
+        %% registry (noproc) still exits — that is a usage error, not a timeout.
+        exit:{timeout, _} -> no
+    end.
 
 -if(?DOCATTRS).
 -doc """

@@ -4,6 +4,7 @@
     backend/0,
     terminate_on_conflict/1,
     conflict_kill_budget/1,
+    conflict_release_ttl/1,
     register_replicas/1,
     replicate_timeout/1,
     strict_replication/1,
@@ -93,3 +94,14 @@ terminate_on_conflict(Config) ->
 -spec conflict_kill_budget(config()) -> {pos_integer(), pos_integer()}.
 conflict_kill_budget(Config) ->
     get(Config, conflict_kill_budget, {3, 60000}).
+
+%% How long (ms) a pid explicitly released while alive (an unregister of a live
+%% process) stays in the conflict-detector trail (§5.6).  The trail is what stops
+%% the detector from kill-both-ing a legitimately unregistered-then-re-registered
+%% name when a lagging member reports the old binding at a handoff gather, so it
+%% must comfortably outlast realistic disconnect windows — pruning is additionally
+%% suspended while any member is disconnected.  Entries are tiny (pid + timestamp)
+%% and only explicit live releases create them, so a generous default is cheap.
+-spec conflict_release_ttl(config()) -> pos_integer().
+conflict_release_ttl(Config) ->
+    get(Config, conflict_release_ttl, 600000).
