@@ -115,6 +115,28 @@ defmodule DGen.RegistryTest do
   # Registration
   # ---------------------------------------------------------------------------
 
+  describe "readiness (ready/1, await_ready/2)" do
+    test "a leader-elected registry reports ready", %{reg: reg} do
+      # setup already awaited the leader, so this node has assumed leadership and synced.
+      assert :dgen_registry.ready(reg)
+      assert :ok == :dgen_registry.await_ready(reg, 5_000)
+    end
+
+    test "await_ready returns ok fast once ready, then registrations succeed", %{reg: reg} do
+      assert :ok == :dgen_registry.await_ready(reg, 5_000)
+
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+      assert :yes == :dgen_registry.register_name({reg, :after_ready}, pid)
+    end
+
+    test "ready/1 is false and await_ready times out for a registry that does not exist" do
+      absent = :"never_started_#{:erlang.unique_integer([:positive])}"
+      refute :dgen_registry.ready(absent)
+      assert {:error, :timeout} == :dgen_registry.await_ready(absent, 200)
+    end
+  end
+
   describe "register_name/2" do
     test "returns yes and name resolves via whereis_name/1", %{reg: reg} do
       pid = spawn(fn -> Process.sleep(:infinity) end)

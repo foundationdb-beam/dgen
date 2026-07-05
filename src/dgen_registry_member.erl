@@ -210,7 +210,7 @@
 
 %% Maximum number of write ops coalesced into a single commit.  A larger pending
 %% buffer is split across successive commits, bounding transaction size.
--define(MAX_BATCH, 10000).
+-define(MAX_BATCH, 1000000).
 
 %% (The replicate-before-ack target and timeout are configurable per registry — see
 %% dgen_config:register_replicas/1, replicate_timeout/1, strict_replication/1.)
@@ -270,6 +270,20 @@
 
 %% Bound on the per-peer aliveness probe used when adjudicating a suspected conflict.
 -define(ALIVE_PROBE_TIMEOUT, 1000).
+
+%% Leader-liveness probe.  The normal failover trigger is `nodedown`, which only
+%% fires for a node this member was *connected to* and then lost.  A leader recovered
+%% from durable elector state whose node this member has *never* connected to — e.g. a
+%% whole-cluster cold restart where the previously-elected node is gone (killed while
+%% leader, new nodes come up under different names) — produces no `nodedown`, so the
+%% dead leader is never reaped and every write forwards to it forever.  This periodic
+%% probe closes that gap: if the elected leader's node is unreachable, it reaps that
+%% node through the same fenced `member_down` path a `nodedown` uses, letting a
+%% reachable member (re-)elect.  The first pass is delayed a grace window so a leader
+%% that is merely *not connected yet* (the mesh runs at startup but connect is async)
+%% is given time to become reachable before we could mistake "connecting" for "dead".
+-define(LEADER_PROBE_GRACE, 4000).
+-define(LEADER_PROBE_INTERVAL, 4000).
 
 -export([start_link/2]).
 -export([
@@ -577,12 +591,23 @@ handle_continue(
     %% application only has to make the nodes *able* to connect (cookie, networking);
     %% dgen does the connecting.
     self() ! mesh_connect,
+    %% Backstop the `nodedown`-driven failover for a leader we never connected to
+    %% (a leader recovered from durable state whose node is gone) — see probe_leader.
+    %% Delayed so a genuinely-reachable leader is meshed before the first check.
+    erlang:send_after(?LEADER_PROBE_GRACE, self(), probe_leader),
     {noreply, State#state{elector = Elector}}.
 
 %% ---------------------------------------------------------------------------
 %% handle_call/3
 %% ---------------------------------------------------------------------------
 
+%% Readiness probe (see dgen_registry:await_ready/2).  This member can serve
+%% registrations once it knows a leader *and* has synced registry state — it has
+%% applied a snapshot (follower) or assumed leadership itself.  Before that a
+%% register would be fast-rejected (`no`, no leader) or read an empty replica.
+%% Side-effect free: a plain state read, no name is touched.
+handle_call(ready, _From, State = #state{leader = Leader, synced = Synced}) ->
+    {reply, Leader =/= undefined andalso Synced, State};
 %% ---- Name registration ----------------------------------------------------
 
 %% Leader: park the registration in the group-commit buffer and answer later.
@@ -760,7 +785,9 @@ handle_call(
     _From,
     State = #state{names_tab = Tab, applied_version = Version, recently_released = Released}
 ) ->
-    {reply, {current_records(Tab), Version, Released}, State};
+    %% Ship the (potentially huge) names map as an off-heap binary, same as the
+    %% distribute path — see encode_records/1.  The gathering leader decodes it.
+    {reply, {encode_records(current_records(Tab)), Version, Released}, State};
 %% ---- Elector calls (during lock period) ------------------------------------
 
 %% Called by the elector to atomically assume leadership and fan out the
@@ -781,6 +808,42 @@ handle_call(
 %% After updating own state the leader sends `{apply_names_snapshot}` casts
 %% to every follower from its own process (maintaining FIFO ordering with
 %% subsequent `{name_registered}` broadcasts).
+%% Fast path — a *continuing* leader (already leader for this exact epoch, holding
+%% synced state) handling a member's join.  Its own replica is authoritative: every
+%% follower is a prefix of its broadcast stream, so no member can hold a fresher
+%% binding and there is nothing to gather.  So skip the O(members) gather, the
+%% wholesale replica rebuild, and the leadership re-assumption (which would demonitor
+%% and re-monitor every registered pid) — and, crucially, do NOT re-snapshot the
+%% already-synced followers.  Just monitor the joiner, ship *it* the current snapshot
+%% (inline, so it precedes any later {name_registered} broadcast — FIFO ordering),
+%% and tell the existing followers to monitor the joiner too via a small token-only
+%% message.  The full gather+distribute below is reserved for a genuine leadership
+%% change, where a new leader must reconstruct from the freshest surviving member.
+handle_call(
+    {elector_assume_and_distribute, MemberId, AllIds, Tokens, _FreshIds, Epoch},
+    _From,
+    State = #state{member_id = Self, leader = Self, epoch = Epoch, synced = true}
+) when MemberId =/= undefined ->
+    State1 = merge_peer_tokens(
+        Tokens, add_member_monitors(extra_member_ids(MemberId, AllIds, Self), State)
+    ),
+    %% Onboard the joiner with a full snapshot (unavoidable O(names) for a fresh
+    %% member), carrying the whole member list so it monitors every peer — exactly
+    %% what the full path would send this one member.
+    RecordsBin = encode_records(current_records(State1#state.names_tab)),
+    cast_to_member(
+        MemberId,
+        {apply_names_snapshot, RecordsBin, Self, AllIds, Tokens, Epoch,
+            State1#state.applied_version}
+    ),
+    %% Existing followers keep their (prefix-consistent) replica; they only need to
+    %% learn to monitor the new member and record its token so their own future
+    %% {member_down} for it is correctly fenced.  No records travel here.
+    lists:foreach(
+        fun(Id) -> cast_to_member(Id, {peer_joined, MemberId, Tokens}) end,
+        [Id || Id <- AllIds, Id =/= Self, Id =/= MemberId]
+    ),
+    {reply, ok, State1};
 handle_call(
     {elector_assume_and_distribute, MemberId, AllIds, Tokens, FreshIds, Epoch},
     _From,
@@ -853,12 +916,13 @@ handle_call(
     }),
     State3 = add_member_monitors(extra_member_ids(MemberId, AllIds, Self), State2),
     State4 = merge_peer_tokens(Tokens, State3),
-    RecordsOut = maps:to_list(Records),
+    %% Encode the snapshot once; every follower's cast then shares the one refc binary.
+    RecordsBin = encode_records(Records),
     lists:foreach(
         fun(Id) ->
             cast_to_member(
                 Id,
-                {apply_names_snapshot, RecordsOut, Self, extra_member_ids(MemberId, AllIds, Id),
+                {apply_names_snapshot, RecordsBin, Self, extra_member_ids(MemberId, AllIds, Id),
                     Tokens, Epoch, MaxVersion}
             )
         end,
@@ -1071,9 +1135,9 @@ handle_cast(
         applied_version = Version
     }
 ) ->
-    RecordsOut = maps:to_list(current_records(Tab)),
+    RecordsBin = encode_records(current_records(Tab)),
     cast_to_member(
-        FollowerId, {apply_names_snapshot, RecordsOut, Leader, [], #{}, Epoch, Version}
+        FollowerId, {apply_names_snapshot, RecordsBin, Leader, [], #{}, Epoch, Version}
     ),
     {noreply, State};
 handle_cast({resync_req, _FollowerId}, State) ->
@@ -1098,9 +1162,10 @@ handle_cast({retract_req, LogicalName, Pid}, State = #state{leader = Leader}) wh
 %% Applies the leader transition, the record update (pid + metadata per name), and
 %% extra member monitors atomically within a single cast — no other message can
 %% interleave.  The snapshot carries the leader's applied_version, which re-baselines
-%% this member.  `RecordsList` is `[{Name, {Pid, Index, Data}}]`.
+%% this member.  `RecordsPayload` is the `term_to_binary`-encoded records map (a legacy
+%% `[{Name, {Pid, Index, Data}}]` list is also accepted — see decode_records/1).
 handle_cast(
-    {apply_names_snapshot, RecordsList, NewLeader, ExtraMembers, Tokens, Epoch, Version},
+    {apply_names_snapshot, RecordsPayload, NewLeader, ExtraMembers, Tokens, Epoch, Version},
     State = #state{member_id = Self, leader = OldLeader, epoch = CurrentEpoch}
 ) ->
     case Epoch >= CurrentEpoch of
@@ -1110,7 +1175,7 @@ handle_cast(
             %% are becoming leader) reads the names back from the table to set up monitors.
             %% The snapshot satisfies any outstanding resync request (cancel it) and makes
             %% this member synced (its first snapshot re-announces `fresh = false`).
-            State0 = records_replace(cancel_resync(State), maps:from_list(RecordsList)),
+            State0 = records_replace(cancel_resync(State), decode_records(RecordsPayload)),
             State1 = do_leader_changed(NewLeader, OldLeader, Self, State0),
             State2 = State1#state{epoch = Epoch, applied_version = Version},
             State3 = add_member_monitors(ExtraMembers, State2),
@@ -1143,6 +1208,13 @@ handle_cast({unregister, LogicalName}, State = #state{leader = Leader}) when
 ->
     cast_to_member(Leader, {unregister, LogicalName}),
     {noreply, row_delete(State, LogicalName)};
+%% A new member joined and the (continuing) leader's fast path is onboarding it
+%% directly.  We are an existing follower whose replica is already up to date, so we
+%% must not touch it — we only start monitoring the joiner and record its token, so a
+%% future DOWN we observe for it is fenced with the token the elector holds.  (On a
+%% genuine leadership change the new leader still re-snapshots everyone the full way.)
+handle_cast({peer_joined, MemberId, Tokens}, State) ->
+    {noreply, merge_peer_tokens(Tokens, add_member_monitors([MemberId], State))};
 handle_cast(_, State) ->
     {noreply, State}.
 
@@ -1302,6 +1374,17 @@ handle_info({reap_down, Node, N}, State = #state{elector = Elector, member_id = 
             spawn_reap(Elector, Node),
             schedule_reap(Node, N - 1)
     end,
+    {noreply, State};
+%% Periodic leader-liveness probe (see ?LEADER_PROBE_GRACE).  If the elector's current
+%% leader sits on a node that is neither ours nor connected, reap that node so a
+%% reachable member re-elects.  This is the only failover trigger for a leader we were
+%% never connected to (no `nodedown` ever fired for it).  Reachable, self, or
+%% not-yet-elected leaders are left untouched.  Runs off the loop — `spawn_probe_leader`
+%% reads the elector and casts only, opening no connection, so like the reap backstop it
+%% cannot heal the partition it reacts to.
+handle_info(probe_leader, State = #state{elector = Elector, member_id = {SelfNode, _}}) ->
+    erlang:send_after(?LEADER_PROBE_INTERVAL, self(), probe_leader),
+    spawn_probe_leader(Elector, SelfNode),
     {noreply, State};
 %% Converge Erlang distribution to a full mesh: read the authoritative member set
 %% from the elector (a DB-backed read, so it is the same on every node regardless of
@@ -1674,11 +1757,15 @@ member_names({Node, Name}) ->
         false ->
             error;
         true ->
-            try gen_server:call({Name, Node}, get_names_snapshot, ?GATHER_TIMEOUT) of
-                {Names, Version, Released} when
-                    is_map(Names), is_integer(Version), is_map(Released)
-                ->
-                    {ok, {Names, Version, Released}}
+            %% Everything — the call, the decode, and the shape check — runs inside the
+            %% try: a `try ... of` body is *not* covered by the catch, and decode_records
+            %% can fault on a corrupt payload, so keep it protected and fall to `error`.
+            try
+                {Payload, Version, Released} =
+                    gen_server:call({Name, Node}, get_names_snapshot, ?GATHER_TIMEOUT),
+                Names = decode_records(Payload),
+                true = is_map(Names) andalso is_integer(Version) andalso is_map(Released),
+                {ok, {Names, Version, Released}}
             catch
                 _:_ -> error
             end
@@ -2294,6 +2381,26 @@ spawn_reap(Elector, Node) ->
     end),
     ok.
 
+%% Read the elector's current leader; if it is a *different* node that is not
+%% connected, reap every member stranded there (fenced `member_down`, via spawn_reap),
+%% which triggers re-election.  A leader that is ourselves, unset, or on a connected
+%% node is left alone.  Runs off the member loop and never opens a connection.
+spawn_probe_leader(Elector, SelfNode) ->
+    _ = spawn(fun() ->
+        try dgen_server:priority_call(Elector, get_leader) of
+            {LeaderNode, _} when LeaderNode =/= SelfNode ->
+                case lists:member(LeaderNode, nodes()) of
+                    true -> ok;
+                    false -> spawn_reap(Elector, LeaderNode)
+                end;
+            _ ->
+                ok
+        catch
+            _:_ -> ok
+        end
+    end),
+    ok.
+
 %% Answer a consistent read only after verifying, against the durable leader key,
 %% that this member really is the fenced leader for its current epoch (Guarantee 5:
 %% consistent reads are authoritative, never stale).  Without this, a deposed
@@ -2428,6 +2535,27 @@ current_records(Tab) ->
     ets:foldl(
         fun({Name, Pid, Index, Data}, Acc) -> Acc#{Name => {Pid, Index, Data}} end, #{}, Tab
     ).
+
+%% Snapshot payload codec (see the "distribute" note above).  The records map is
+%% shipped as a single `term_to_binary` blob rather than an on-heap list of tuples.
+%% A large binary is a refc binary — stored off-heap and never scanned by GC — so a
+%% 100k+-name snapshot no longer bloats the sender's or receiver's process heap, nor
+%% thrashes their collectors while it sits in a mailbox; `[compressed]` also shrinks
+%% the wire bytes (names/pids compress well).  Encoding once and casting the *same*
+%% binary to every follower makes the fan-out share one blob instead of copying the
+%% whole list per follower.  `decode_records/1` also accepts the legacy list form, so
+%% a node running the old wire format during a rolling upgrade still applies.
+-define(SNAPSHOT_ENCODE_OPTS, [compressed]).
+
+encode_records(Records) when is_map(Records) ->
+    term_to_binary(Records, ?SNAPSHOT_ENCODE_OPTS).
+
+decode_records(Bin) when is_binary(Bin) -> binary_to_term(Bin);
+%% Legacy wire forms during a rolling upgrade: apply_names_snapshot shipped a
+%% `[{Name, Record}]` list, get_names_snapshot a bare records map.  Both normalise to
+%% the map every caller wants.
+decode_records(List) when is_list(List) -> maps:from_list(List);
+decode_records(Map) when is_map(Map) -> Map.
 
 %% Project a records map down to its pids for the pid-uniqueness conflict detector.
 record_pids(Records) ->

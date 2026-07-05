@@ -118,6 +118,10 @@ exact equalities. See §4.7 of the design doc.
     get_leader/1,
     get_members/1,
     get_epoch/1,
+    %% Readiness
+    ready/1,
+    await_ready/1,
+    await_ready/2,
     %% Process identity helpers (exported for tests / introspection)
     member_name/1,
     names_table/1,
@@ -416,6 +420,73 @@ get_leader(Name) ->
 -spec get_epoch(Name :: atom()) -> non_neg_integer().
 get_epoch(Name) ->
     with_elector(Name, 0, fun(Pid) -> dgen_server:priority_call(Pid, get_epoch) end).
+
+%% Poll interval and per-probe call bound for await_ready/2.
+-define(READY_POLL_INTERVAL, 50).
+-define(READY_CALL_TIMEOUT, 1000).
+
+-if(?DOCATTRS).
+-doc """
+Is the registry on this node ready to serve registrations *right now*?
+
+Returns `true` once the local member both knows a leader and has synced registry
+state (applied the leader's snapshot, or assumed leadership itself). Returns `false`
+while it is still starting/joining, has no elected leader, or is momentarily
+unresponsive (a busy member is treated as not-ready rather than blocking the caller).
+
+This is a point-in-time check; use `await_ready/2` to block until ready. Note that
+readiness means registrations are being *served*, not that any particular
+registration will return `yes` (a name may already be taken, or leadership may move).
+""".
+-endif.
+-spec ready(Name :: atom()) -> boolean().
+ready(Name) ->
+    try gen_server:call(member_name(Name), ready, ?READY_CALL_TIMEOUT) of
+        Ready when is_boolean(Ready) -> Ready;
+        _ -> false
+    catch
+        %% Member starting/restarting (noproc), or busy past the probe bound
+        %% (timeout) — not ready yet.
+        exit:_ -> false
+    end.
+
+-if(?DOCATTRS).
+-doc "Blocks until `ready/1` holds, or 5s elapses. See `await_ready/2`.".
+-endif.
+-spec await_ready(Name :: atom()) -> ok | {error, timeout}.
+await_ready(Name) ->
+    await_ready(Name, 5000).
+
+-if(?DOCATTRS).
+-doc """
+Blocks until the registry on this node is ready to serve registrations, or `Timeout`
+(milliseconds) elapses.
+
+Returns `ok` once `ready/1` holds, or `{error, timeout}` if the deadline passes first.
+Intended for a node that has just started/joined a cluster: it waits out leader
+election and the join handoff (the leader gathers and delivers the names snapshot)
+before the caller starts registering, so registrations are not fast-rejected against a
+not-yet-known leader. Safe to call from many nodes; it only reads local member state.
+""".
+-endif.
+-spec await_ready(Name :: atom(), Timeout :: non_neg_integer()) -> ok | {error, timeout}.
+await_ready(Name, Timeout) ->
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    await_ready_loop(Name, Deadline).
+
+await_ready_loop(Name, Deadline) ->
+    case ready(Name) of
+        true ->
+            ok;
+        false ->
+            case erlang:monotonic_time(millisecond) < Deadline of
+                true ->
+                    timer:sleep(?READY_POLL_INTERVAL),
+                    await_ready_loop(Name, Deadline);
+                false ->
+                    {error, timeout}
+            end
+    end.
 
 -if(?DOCATTRS).
 -doc "Returns the list of all current member ids in the registry.".

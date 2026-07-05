@@ -171,6 +171,22 @@ defmodule DGen.Registry do
   defdelegate get_members(registry_name), to: :dgen_registry
 
   @doc """
+  Whether the registry on this node is ready to serve registrations right now
+  (a leader is known and this member has synced). Point-in-time; see `await_ready/2`.
+  """
+  defdelegate ready(registry_name), to: :dgen_registry
+
+  @doc "Blocks until `ready/1` holds, or 5s elapses. Returns `:ok` or `{:error, :timeout}`."
+  defdelegate await_ready(registry_name), to: :dgen_registry
+
+  @doc """
+  Blocks until the registry on this node is ready to serve registrations, or
+  `timeout` ms elapses. Returns `:ok` or `{:error, :timeout}`. Use after starting
+  or joining a cluster to wait out leader election and the join handoff.
+  """
+  defdelegate await_ready(registry_name, timeout), to: :dgen_registry
+
+  @doc """
   Returns the registered name of the member process for the given registry name.
 
   Identity today (`member_name(name) == name`) — the member is registered

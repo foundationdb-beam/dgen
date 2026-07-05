@@ -206,6 +206,73 @@ defmodule DGen.RegistryClusterTest do
              "expected both #{inspect({node(), local_member})} and " <>
                "#{inspect({peer_node, remote_member})} in members"
     end
+
+    test "await_ready returns ok on both the primary and the joined peer", %{
+      reg: reg,
+      peer_node: peer_node
+    } do
+      assert :ok == :dgen_registry.await_ready(reg, 5_000)
+      assert :ok == :erpc.call(peer_node, :dgen_registry, :await_ready, [reg, 5_000])
+    end
+
+    # The continuing-leader fast path: a second peer joins a cluster that already
+    # holds names, handled by the primary as the *continuing* leader. It must
+    # onboard the joiner fully, leave the existing follower's replica intact, and
+    # keep serving registrations to all three nodes.
+    test "a third node joins a populated cluster and onboards fully", %{
+      reg: reg,
+      peer_node: peer_node,
+      abs_cluster_file: abs_cluster_file,
+      dir_path: dir_path
+    } do
+      # Register a handful of names on the primary; the existing peer replicates them.
+      names =
+        for i <- 1..5 do
+          pid = spawn(fn -> Process.sleep(:infinity) end)
+          on_exit(fn -> Process.exit(pid, :kill) end)
+          assert :yes == :dgen_registry.register_name({reg, {:pre, i}}, pid)
+          {{:pre, i}, pid}
+        end
+
+      assert eventually(fn -> remote_whereis(peer_node, reg, {:pre, 1}) != :undefined end),
+             "existing follower never replicated the pre-existing names"
+
+      # Bring up a THIRD node and start the registry — its join is served by the
+      # primary as the continuing leader (the fast path).
+      {peer2_pid, peer2_node} = DGen.ClusterHelper.boot_peer!("thirdnode")
+      on_exit(fn -> DGen.ClusterHelper.stop_peer(peer2_pid) end)
+
+      :erpc.call(peer2_node, DGen.ClusterHelper, :start_registry, [
+        reg,
+        abs_cluster_file,
+        dir_path
+      ])
+
+      assert :ok == :erpc.call(peer2_node, :dgen_registry, :await_ready, [reg, 15_000])
+
+      # The third node onboarded every pre-existing name ...
+      for {name, pid} <- names do
+        assert eventually(fn -> remote_whereis(peer2_node, reg, name) == pid end),
+               "third node did not onboard #{inspect(name)}"
+      end
+
+      # ... the existing follower still holds them (its replica was not wiped) ...
+      for {name, pid} <- names do
+        assert remote_whereis(peer_node, reg, name) == pid,
+               "existing follower lost #{inspect(name)} on the third node's join"
+      end
+
+      # ... and a new registration propagates to all three nodes.
+      np = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(np, :kill) end)
+      assert :yes == :dgen_registry.register_name({reg, :after_third}, np)
+
+      assert eventually(fn -> remote_whereis(peer_node, reg, :after_third) == np end),
+             "existing follower did not see a registration made after the third node joined"
+
+      assert eventually(fn -> remote_whereis(peer2_node, reg, :after_third) == np end),
+             "third node did not see a registration made after it joined"
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -791,6 +858,75 @@ defmodule DGen.RegistryClusterTest do
 
       assert local_epoch > 0
       assert local_epoch == remote_epoch
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Recovery from durable leadership naming a node that is gone
+  # ---------------------------------------------------------------------------
+
+  describe "leadership recovery after a cold restart" do
+    # A leader recorded in the durable elector state, whose node was killed while
+    # leader and never comes back (a whole-cluster restart under new node names),
+    # produces no `nodedown` for a freshly-started member that was never connected
+    # to it. The leader-liveness probe must reap it so the fresh node self-elects,
+    # rather than forwarding every registration to a dead leader forever.
+    test "a fresh node self-elects past a durable leader whose node is gone", %{
+      abs_cluster_file: abs_cluster_file,
+      dir_path: dir_path,
+      db: db,
+      case_dir: case_dir
+    } do
+      self_node = node()
+      reg = :"deadleader_reg_#{:erlang.unique_integer([:positive])}"
+
+      # Boot a peer, make it the sole member (and therefore leader), so it writes
+      # durable elector state naming itself leader.
+      {peer_pid, peer_node} = DGen.ClusterHelper.boot_peer!("deadleader")
+
+      _peer_sup =
+        :erpc.call(peer_node, DGen.ClusterHelper, :start_registry, [
+          reg,
+          abs_cluster_file,
+          dir_path
+        ])
+
+      assert match?(
+               {^peer_node, _},
+               :erpc.call(peer_node, DGen.ClusterHelper, :await_leader!, [reg])
+             )
+
+      # Kill the peer node abruptly. Durable state still names it leader; this local
+      # node never ran `reg`, so it was never a connected member of that cluster and
+      # will get no `nodedown` for the now-dead peer.
+      DGen.ClusterHelper.stop_peer(peer_pid)
+
+      # Start `reg` here for the first time. Its elector recovers leader = peer_node.
+      {:ok, sup} = :dgen_registry.start_link(reg, {db, case_dir})
+      on_exit(fn -> DGen.ClusterHelper.stop_registry(sup) end)
+
+      # It really did inherit the dead leader (the bug precondition) ...
+      assert eventually(
+               fn -> match?({^peer_node, _}, :dgen_registry.get_leader(reg)) end,
+               2_000
+             ),
+             "expected the fresh node to recover the dead peer as leader"
+
+      # ... and the leader-liveness probe reaps it so this node takes over.
+      assert eventually(
+               fn -> match?({^self_node, _}, :dgen_registry.get_leader(reg)) end,
+               15_000
+             ),
+             "fresh node never self-elected past the dead recovered leader"
+
+      # Leadership actually works now: a registration succeeds.
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+
+      assert eventually(fn ->
+               :dgen_registry.register_name({reg, :after_heal}, pid) == :yes
+             end),
+             "registration still failed after the fresh node took over"
     end
   end
 
