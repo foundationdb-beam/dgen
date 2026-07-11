@@ -75,10 +75,13 @@ defmodule DGen.Registry do
   defdelegate register_name(name, pid), to: :dgen_registry
 
   @doc """
-  Removes the registration for `{registry_name, logical_name}`.
+  Removes the registration for `{registry_name, logical_name}`. Returns `:ok`.
 
-  Fire-and-forget: routes through the local member, which forwards to the
-  leader. The local member's snapshot is updated immediately.
+  A tracked call mirroring the register path: the local member's snapshot is
+  updated immediately, and the removal is forwarded to the leader. `:ok`
+  normally means the leader committed it; with an unreachable leader the
+  removal is stashed and re-driven on the next leadership/rejoin event, so an
+  explicit unregister is never silently lost (design doc, Non-goal 5).
   """
   defdelegate unregister_name(name), to: :dgen_registry
 
@@ -151,6 +154,56 @@ defmodule DGen.Registry do
   Like `query/2`, but routed through the leader for an authoritative (never-stale) result.
   """
   defdelegate query_consistent(registry_name, constraints), to: :dgen_registry
+
+  @doc """
+  Creates (or updates) a durable presence subscription `sub_id`: keeps the processes
+  matching `notify` up to date with the set of processes matching `watch`.
+
+  `watch` and `notify` are queries (`{:all, %{attr => value}}`, or a bare map read as
+  `{:all, map}`). `sub_id` is any application term (an idempotent upsert). Whenever a
+  committed batch changes which processes satisfy `watch`, every process currently
+  matching `notify` receives one message `{:dgen_presence, sub_id, events}` where
+  `events` is a non-empty list of `{:joined, name, pid}` / `{:left, name, pid}`. A
+  process is sent an initial snapshot of the current `watch` set (as `:joined` events)
+  whenever it enters the notify set — at subscribe time *or* when it registers into
+  `notify` later — and deltas thereafter, so the subscription can be created before any
+  viewer exists.
+
+  The subscription is **durable** — stored in the elector's backend state, so it
+  outlives the cluster: tie its lifetime to a database entity and presence comes back
+  intact after a scale-to-zero. Sent as a durable cast (applied asynchronously), so
+  `:ok` means "accepted"; `subscriptions/1` reflects it shortly after. Returns `:ok`, or
+  `{:error, :empty_query}` if either query is empty.
+  """
+  defdelegate subscribe(registry_name, sub_id, watch, notify), to: :dgen_registry
+
+  @doc """
+  Removes the durable presence subscription `sub_id` (from `subscribe/4`). Returns `:ok`
+  (idempotent; applied asynchronously).
+  """
+  defdelegate unsubscribe(registry_name, sub_id), to: :dgen_registry
+
+  @doc """
+  Removes all durable presence subscriptions from the registry. Returns `:ok` (applied
+  asynchronously).
+  """
+  defdelegate unsubscribe_all(registry_name), to: :dgen_registry
+
+  @doc """
+  Returns the registry's durable presence subscriptions as
+  `%{sub_id => {watch, notify}}` (shared cluster-wide and durable).
+  """
+  defdelegate subscriptions(registry_name), to: :dgen_registry
+
+  @doc """
+  Removes all of the registry's durable backend state (membership, leader/version fence,
+  and subscriptions). Returns `:ok`.
+
+  Stop the registry supervisor first, then call this with the tenant you started it with
+  — a running elector would re-create the keys from its in-memory state. Clears only this
+  registry's keys, not any other registry sharing the tenant.
+  """
+  defdelegate delete(registry_name, tenant), to: :dgen_registry
 
   @doc """
   Consistent read routed through the leader.

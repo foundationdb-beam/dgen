@@ -123,11 +123,25 @@ through a via-tuple takes the fast path: it does a lock-free `ets:lookup/2` agai
 the local member's `protected` names table directly in the caller, so many processes
 can resolve names concurrently without ever queuing behind the member's mailbox.
 
-**Registration returns a verdict.** `register_name/2` answers `yes` if the name is
-now yours, or `no` if it is already taken (or if the registry currently has no
-leader to adjudicate, or the leader is unreachable — an unreachable leader is
-answered `no` immediately rather than waited on, and even a routing timeout comes
-back as `no`, never as an exit). It never blocks indefinitely on the result.
+**Registration blocks until decided; `no` is always adjudicated.**
+`register_name/2` answers `yes` if the name is now yours, or `no` **only** for an
+*adjudicated* refusal — the name is held by a different live process (or the opt-in
+`reject_when_degraded` prevention mode, §8). It never returns `no` merely because the
+registry is not ready: when there is no reachable leader (none elected yet at startup,
+a brief no-leader window during a handoff, or the leader is unreachable in a
+partition) the call **blocks** and is re-driven the moment a leader is established, so
+it succeeds if one appears within `register_timeout`. Returning `no` there would tell
+OTP's via machinery "already started" for a name that is not taken — a wrong decisive
+answer.
+
+If no leader appears in time, the call **exits** on its `register_timeout` (§8,
+default 5 s) rather than inventing a verdict — the same posture `global`, `syn`, and
+`gproc`'s distributed mode take; the supervisor restarts the caller with fresh state.
+One consequence worth knowing: after such a timeout (or a `no` raced with a leader
+failover) the name *may* be durably bound to the pid you tried to register — a retry
+then answers `yes` (re-registering the same pid under the same name is idempotent,
+§5.2), and if the caller instead abandons the pid, its exit clears the binding
+automatically.
 
 **Automatic cleanup.** The leader watches every registered process with
 `erlang:monitor/2`. When a registered process exits, its name is unregistered
@@ -142,17 +156,18 @@ Both live exactly as long as the registration — see
 
 ## 4. How it works
 
-### 4.1 Two processes per node
+### 4.1 Three processes per node
 
-Starting a registry on a node creates two processes under a local supervisor:
+Starting a registry on a node creates three processes under a local supervisor:
 
 | Process | Role |
 |---|---|
 | **member** | Holds the local `name → pid` replica in a `protected` ETS table that it alone writes and any process reads lock-free. Serves reads. When it is the leader, it is the sole writer for the name table. |
 | **elector** | Tracks which nodes are members and decides which member is the leader, coordinating through the database. |
+| **connector** | Keeps Erlang distribution in step with that membership: proactively connects to every member node, reaps stranded ones, and runs the leader-liveness probe. Pure node-level connectivity plumbing, with no names/leadership state of its own. |
 
 Application code only ever talks to the member (directly or through the
-via-tuple). The elector works behind the scenes.
+via-tuple). The elector and connector work behind the scenes.
 
 ### 4.2 Leadership comes from the database
 
@@ -393,6 +408,114 @@ both together, so the member's cached elector pid is never stale by construction
 is no case where a live member can be holding a pid for an elector that is no longer
 the one paired with it.
 
+### 4.9 Presence: watch/notify subscriptions
+
+Metadata queries (§4.7) answer *"who matches this right now?"* as a one-shot read. A
+**presence subscription** turns that into a live feed: a caller registers a **watch
+query** and a **notify query** under an application-chosen id, and the registry pushes a
+message to the notify targets whenever the set of processes satisfying the watch query
+changes.
+
+```erlang
+%% Keep every process matching `notify` up to date with the set matching `watch`.
+ok = dgen_registry:subscribe(my_registry,
+                             {presence, RoomId},              %% SubId (application term)
+                             #{role => member, room => RoomId}, %% watch
+                             #{role => room_view, room => RoomId}), %% notify
+%% Each matching room-view process now receives, per committed change:
+%%   {dgen_presence, {presence, RoomId}, [{joined, Name, Pid} | {left, Name, Pid}, ...]}
+dgen_registry:unsubscribe(my_registry, {presence, RoomId}).
+```
+
+A `query/0` is `{all, #{attr => value}}` (a conjunction of exact equalities — the
+`query/2` semantics), or a bare map read as `{all, Map}`. The type is **tagged so it can
+grow** (ranges, disjunction, predicates) without breaking existing subscriptions.
+
+**Durable, keyed by an application id.** A subscription is **not** tied to any Erlang
+process or to the cluster's lifetime. It is stored in the **elector's durable
+`dgen_server` state** (§4.2) — the same backend-backed, cluster-shared state that holds
+the member set and the leader — keyed by an application-supplied `SubId`. Because that
+state survives a full cluster restart (a new elector loads the existing state rather than
+re-initialising it), an application can model its presence stakeholders as database
+entities: `subscribe` when an entity is created, `unsubscribe` when it is deleted, and a
+`subscribe` with an existing `SubId` is an idempotent **upsert**. A system can scale to
+zero and come back with exactly the subscriptions it had — the notify targets simply
+resume receiving updates as they re-register. This is why subscriptions live on the
+elector and not, say, as ordinary registry rows (which are pid-scoped and evaporate with
+the VM): durability is the whole point.
+
+**Manipulated only through the elector.** The public API (`subscribe/4`,
+`unsubscribe/2`, `unsubscribe_all/1`, `subscriptions/1`) talks to the elector, not the
+member. A write is a durable `dgen_server` **cast** (`handle_cast_tx`) — fire-and-forget
+for latency, like the membership changes — so `ok` means "accepted for durable
+processing", and the change commits (and `subscriptions/1`, a priority read, reflects it)
+shortly after. Durability holds regardless, and because a subscription is an idempotent
+upsert keyed by its id, a write lost in the narrow pre-enqueue window is recoverable by
+re-subscribing. There is no way for an external caller to poke the leader's presence
+state directly.
+
+**Teardown.** Because every durable key a registry writes — the elector's state and
+queue, the leader fence, the version key — lives under a single tenant keyspace prefix
+derived from the registry name, the whole footprint is reclaimed by one range clear:
+`delete/2(Name, Tenant)` (call it after stopping the supervisor; a live elector caches
+its state in memory and would re-create the keys on its next commit). This matters for an
+application that creates many short-lived, per-entity registries in a shared tenant —
+without it, each deleted registry would leak its keys. `unsubscribe_all/1` is the
+narrower operation that clears just the subscriptions while the registry keeps running.
+
+**How a change is detected.** Notifications are computed on the **leader**, at the same
+point a committed batch is applied to its replica (the group commit of §4.5). The batch's
+durable delta already names every registration that changed; each changed name's
+*post-batch* state is tested against every subscription's watch query and compared to
+that subscription's previously-matching set. A name that starts matching is a `joined`,
+one that stops is a `left`, and a rebind of a matching name to a different pid is a `left`
+of the old plus a `joined` of the new. This makes the feed correct for **every** way the
+watch set can move — a register, an unregister, an auto-unregister on process death, or a
+`set_metadata` that shifts a row in or out of the query.
+
+**Initial snapshot for every viewer, whenever it appears.** A notify target learns who is
+already present via an **initial snapshot** — the current watch set delivered as a batch
+of `joined` events. Crucially this fires not only at `subscribe` time but whenever a
+process *enters* the notify set: the notify side is tracked symmetrically to the watch
+side (`notify_matches` mirrors `sub_matches`), so a process that registers into the
+notify query *after* the subscription was created still receives the full current watch
+set, then deltas thereafter. This matters because a durable subscription routinely
+outlives — or predates — its viewers: the subscription can be created (tied to a database
+entity) before any process that will consume it exists. A viewer that is already a notify
+target when the watch set changes instead gets the ordinary `joined`/`left` delta.
+
+**How the leader gets the subscriptions.** The elector is the source of truth; the leader
+holds a working copy:
+
+- *Live change* — a `subscribe`/`unsubscribe` cast commits in the elector's consume
+  transaction, whose post-commit action pushes the delta (`{presence_update, …}`,
+  epoch-stamped) to the current leader, which applies it and, for a new subscription,
+  seeds its watch membership and fires the initial snapshot.
+- *Handoff* — a newly-assuming leader **pulls** the full durable set from its co-located
+  elector (a local priority read — the elector shares the member's supervisor) at the
+  moment it becomes leader, and computes each watch set against the reconstructed replica.
+  Pulling at assume time (rather than trusting a set captured earlier) closes the race
+  where a subscribe commits during a handoff window: anything committed before the pull is
+  read, and anything after pushes a delta the now-established leader applies. This pull is
+  also the backstop that reconciles any live delta a transiently unreachable leader missed
+  — every leadership change re-reads the truth. A follower holds no presence state at all.
+
+The leader's working state is three maps: `subs` (`SubId → {watch, notify}`, seeded on
+assume and advanced by deltas) plus a leader-only current **watch** membership and
+current **notify** membership per subscription (both recomputed on assume, advanced per
+commit — the watch one drives the `joined`/`left` deltas, the notify one detects a new
+viewer to send the initial snapshot to).
+
+**Consistency.** The feed inherits the model of §5: changes are pushed in commit order,
+each subscriber sees a prefix of the true sequence of watch-set transitions, and delivery
+is asynchronous (a notify target on another node sees a change slightly after the leader
+commits it). A viewer's first message is its initial snapshot (delivered when it enters
+the notify set), and every message after that is a delta — so a viewer, from the moment
+it appears, always has a complete and then continuously-maintained view of the watch set,
+regardless of whether it registered before or after the subscription. As everywhere else,
+a delivered `Pid` is a candidate, not a liveness guarantee: it may already have died when
+the message arrives.
+
 ---
 
 ## 5. Consistency and failure model
@@ -434,6 +557,13 @@ impostors, and that leader processes them one at a time, registration is
 and once `register_name/2` returns `yes`, every subsequent consistent read observes
 that registration (until it is changed).
 
+Registration is also **idempotent for the same holder**: registering a name to the
+pid that already holds it returns `yes`, not `no`. Only a *different* live pid is
+rejected. This is what makes a registration safe to redrive — a caller whose
+`register_name` call timed out (§3) or raced a failover, but whose registration
+actually committed, retries and gets a decisive `yes` for its own binding rather than
+a `no` it would have to disambiguate.
+
 ### 5.3 Partition behaviour: CP
 
 If the network splits, only the side that can still reach the database and holds the
@@ -444,6 +574,19 @@ This is the deliberate CP trade-off: during a partition the disconnected side
 sacrifices **availability** (of writes) to preserve **consistency** (no two
 processes share a name). Reads of the local snapshot still work on both sides, but
 may be stale on the disconnected side.
+
+One partition shape deserves its own note: an **Erlang-distribution-only**
+partition, where the mesh between nodes is severed but the database stays reachable
+from both sides. Both sides then observe each other's departure and briefly contend
+over the single durable leadership record; the contention settles — leadership is
+sticky and the record is one — after which exactly one side holds leadership and
+commits, while the other side's members answer the CP refusals (`no` for writes,
+not-registered for consistent reads, §5.1) and periodically re-announce themselves
+until the mesh heals. The leader-liveness probe deliberately reaps only a leader on
+a node the probing member has *never* been connected to (the cold-restart recovery
+case), so an isolated member cannot depose a healthy leader through the shared
+database. On heal, the rejoin adjudication of §5.6 repairs any name that was
+reissued across the split.
 
 ### 5.4 Uniqueness is single-fault tolerant
 
@@ -471,7 +614,15 @@ When `register_name/2` returns `yes`, the binding is held by **two members**, so
 survives any single node going down:
 
 - A registration **forwarded** from a follower is held by both the leader and that
-  follower as soon as the follower records it — two holders for free.
+  follower as soon as the follower records it — two holders for free. The
+  follower's ack is **version-guarded**: the leader's reply carries the batch's
+  commit version, and the follower answers `yes` only once its replica has applied
+  up to that version (normally already true — the replication broadcast precedes
+  the reply). A follower whose replica is momentarily *gapped* (it missed a batch
+  and is awaiting a resync) defers the ack until the resync lands, so the second
+  holder is always visible to the handoff reconstruction in §5.7 — without the
+  guard, a leader crash in that window could silently drop an acked binding whose
+  only surviving copy sat at a version the freshest-wins gather ignores.
 - A registration made **directly on the leader's node** is, at first, held only by
   the leader. The leader therefore waits for a follower to confirm it has a copy
   before answering `yes`.
@@ -503,17 +654,41 @@ an alarm (a log line and, when the optional `telemetry` library is present, a
 cleanly under the single leader. A per-name budget bounds how often this can fire
 before the situation is escalated to an operator instead of looping.
 
+Detection runs at both moments a divergent replica can surface. At every
+**leadership-change handoff**, the gather collects every reachable member's replica
+and adjudicates divergences before the new leader fans out its snapshot (§5.7). And
+when a previously-synced member **rejoins a continuing leader** — the common shape
+of a partition heal, where the surviving side kept its leader and no handoff
+happens — the leader first gathers the rejoiner's replica (one bounded round-trip,
+off its message loop) and adjudicates it against its own authoritative table before
+onboarding. A fresh member (never synced) provably holds no bindings and skips the
+check entirely, so a healthy scale-up pays nothing. One honest limitation either
+way: repair needs a *witness* — some replica still reporting the stale binding. A
+binding no surviving replica reports (a multi-fault loss, Non-goal 2) leaves nothing
+to detect; its process has simply lost its registration.
+
 Detection must not misfire on mere staleness: a member that lagged behind (or was
 briefly disconnected) may still report a binding that was *legitimately* unregistered
 while its process lives on — that is lag, not a conflict, and killing for it would be
-wrong. The registry therefore keeps a **released-pid trail**: every explicit
-unregister of a live process is remembered for a configurable window
-(`conflict_release_ttl`, §8) on *every* member — the leader records it at commit,
-followers record it from the replication broadcast, and a leadership handoff merges
-every reachable member's trail into the new leader's, so the discriminator survives
-leadership changes. Trail entries are only expired while the cluster is fully
-connected, so a partition cannot outlive the trail that protects against its lagging
-replicas.
+wrong. The registry therefore keeps a **release trail**: every explicit unregister of
+a live process is remembered — keyed by the **name-and-pid pair**, so releasing a pid
+under one of its names never masks a genuine conflict on *another* name the same
+process also holds — for a configurable window (`conflict_release_ttl`, §8) on
+*every* member. The leader records it at commit, followers record it from the
+replication broadcast, and a leadership handoff merges every reachable member's
+trail into the new leader's, so the discriminator survives leadership changes. Trail
+entries are only expired while the cluster is fully connected **and** no member has
+departed within the last `conflict_release_ttl`: a member dropped from the set
+during a partition is no longer "a disconnected member", but its stale rows can
+still surface when it rejoins, and the trail must outlive that window too. (A member
+gone longer than the TTL is outside the trail's protection horizon; its rejoin is
+adjudicated with whatever trail remains, under the kill budget.)
+
+One scope note on the kill budget below: it is tracked by the **current leader**
+and, unlike the trail, is not merged across a handoff — a leadership change starts
+the new leader with a fresh budget for every name. The `conflict_kill_budget` bound
+is therefore per name *per leader term*; a conflict that regenerates across
+failovers is bounded per term, not globally.
 
 This is why the registry is described as a **singleton** registry, and why it carries
 an explicit contract:
@@ -535,6 +710,17 @@ single overall timeout — and taking the most up-to-date answer. It does not re
 names from the database (there are none to read). Because the previous leader is
 already fenced, this handoff needs no global pause: the moment leadership commits,
 the old leader can no longer interfere.
+
+That gather is a **network** fan-out, so the new leader runs it **off its message
+loop**: it answers the elector immediately and finishes assuming when the gather
+returns. This is what keeps a handoff from freezing the new leader — an inline
+multi-second gather would stall every request and every further membership change
+queued behind it, which under heavy churn (many nodes joining and leaving) compounds
+into a cluster that stops responding. During the brief window before the
+reconstruction completes the new leader is not yet serving as leader, so writes on it
+*block* (the no-leader path, §3) and are re-driven once it assumes — never served
+against a half-built table. A newer membership change that arrives mid-gather simply
+supersedes the in-flight one.
 
 Reconstruction takes the freshest reachable member's map as the answer. Because
 broadcasts are totally ordered *and every member's replica is a gap-checked prefix of
@@ -577,9 +763,11 @@ These are normative. Behaviour that violates one of these is a defect.
    `whereis_name_consistent/1` reflects it until it changes.
 4. **Two-holder durability of acknowledged registrations.** A registration
    acknowledged `yes` is held by at least two members and survives any single node
-   failure — *except* when the operator has allowed degrade-open and a replication
-   timeout occurred, in which case it may have one holder. The default policy and the
-   stricter alternatives are documented in [Configuration](#8-configuration).
+   failure — *except* under the degrade-open replication policy (which is the
+   **default**) when a replication timeout occurred, in which case it may have one
+   holder. Operators who want the two-holder property unconditionally must opt into
+   `strict_replication`; the policy spectrum is documented in
+   [Configuration](#8-configuration).
 5. **Authoritative consistent reads.** `whereis_name_consistent/1` reflects the
    current leader's committed view of the name. This holds even across an
    unnoticed deposition: every consistent answer is fence-verified against the
@@ -627,18 +815,27 @@ does not promise.
    re-register on startup. A full cluster restart starts with an empty registry.
 2. **Multi-fault uniqueness.** The simultaneous loss of both holders of a binding may
    lose the registration and can, transiently, allow the name to be reissued. This is
-   detected and repaired (§5.6), not prevented — unless the optional prevention mode
-   is enabled, which trades availability for it.
+   detected and repaired (§5.6) *when a surviving replica still reports the old
+   binding*; a loss with no surviving witness leaves nothing to detect — the
+   displaced process has simply lost its registration and is not terminated. It is
+   not prevented — unless the optional prevention mode is enabled, which trades
+   availability for it.
 3. **Availability during a partition.** The disconnected/minority side cannot
    register names. This is a consequence of the CP choice, not a defect.
 4. **Strong freshness from `whereis_name/1`.** The snapshot read may lag a recent
    change made elsewhere by a short replication interval. Use
    `whereis_name_consistent/1` when you need the authoritative answer.
-5. **Synchronous unregistration semantics.** `unregister_name/1` is best-effort and
-   eventually consistent; it does not block until every node has observed the removal.
-   (Eventual propagation is actively driven, though: an unregister whose commit fails
-   or whose leader is deposed mid-flight is re-driven — re-enqueued on the leader or
-   handed to the new one as a pid-guarded clear — rather than silently dropped.)
+5. **Synchronous cluster-wide unregistration.** `unregister_name/1` routes to the
+   leader as a tracked call and normally returns `ok` after the removal has
+   committed — but it does **not** block until every node has observed it;
+   cluster-wide visibility remains eventually consistent (replication is
+   asynchronous). Eventual propagation is actively driven at every hop: an
+   unregister whose commit fails, whose leader is deposed mid-flight, whose forward
+   was dropped, or that was accepted while no leader was reachable is stashed and
+   re-driven — re-enqueued on the leader, or handed to the current leader as a
+   pid-guarded clear on the next snapshot or leadership event — rather than
+   silently dropped. Explicit unregisters are rare, so the tracked round-trip
+   costs nothing that matters.
 6. **Preservation of a process the registry must terminate.** The registry may
    terminate a registered process to enforce uniqueness (§5.6). A process that cannot
    withstand being forcibly killed — one that is neither restart-safe nor transient by
@@ -687,12 +884,14 @@ default for every registry), and then to the built-in default below.
 
 | Setting | Default | Effect |
 |---|---|---|
+| `register_timeout` | `5000` ms | Caller-side bound on how long `register_name/2,3` waits for its verdict before **exiting** with a call timeout (see §3 — a timeout is deliberately not converted to `no`). Unlike the other knobs this is resolved in the *calling* process, which has no handle on the per-registry options map, so it is set through the `dgen` application environment only (no per-registry override). |
 | `register_replicas` | `1` | How many follower copies a *direct* registration waits for before `yes`. Bounded by the number of followers. Higher values widen durability at the cost of registration latency. |
+| `commit_batch_size` | `5000` | Max write ops the leader coalesces into one group commit; the rest ride the next commit. Bounds the *inline* per-commit work (plan, replica apply, broadcast fan-out are all O(batch)), so a burst — e.g. a departing node's flood of `DOWN`s — is split across bounded commits and the leader loop stays responsive between them. Latency/throughput only, never correctness. Lower to cap the burst; raise to coalesce more aggressively. |
 | `replicate_timeout` | `1000` ms | How long the leader waits for those confirmations before applying the timeout policy. |
 | `strict_replication` | `false` | Timeout policy. `false`: **degrade open** — acknowledge `yes` with whatever holders exist (possibly one) to stay responsive. `true`: **fail closed** — reject the registration and retract the binding so a caller never sees an unreplicated `yes`. The retraction survives a leadership change: if the rejecting leader is deposed before its retraction commits, the pid-guarded retract is handed to the new leader, so a `no` cannot silently leave the binding alive. |
 | `terminate_on_conflict` | `true` | Whether a detected uniqueness conflict (§5.6) terminates the conflicting processes, or only detects and alarms. |
-| `conflict_kill_budget` | `{3, 60000}` | At most *N* terminations per name per window (ms) before escalating to an operator instead of looping. |
-| `conflict_release_ttl` | `600000` ms | How long an explicitly-released live pid stays in the conflict-detector trail (§5.6) — the discriminator that keeps a lagging replica from being mistaken for a conflict. Expiry is suspended while any member is disconnected, so a partition cannot outlive the trail. Entries are tiny; a generous window is cheap. |
+| `conflict_kill_budget` | `{3, 60000}` | At most *N* terminations per name per window (ms) before escalating to an operator instead of looping. Tracked by the current leader only and not merged across a handoff, so the bound is per name *per leader term* (§5.6). |
+| `conflict_release_ttl` | `600000` ms | How long an explicitly-released live name/pid pair stays in the conflict-detector trail (§5.6) — the discriminator that keeps a lagging replica from being mistaken for a conflict. Expiry is suspended while any member is disconnected *and* for one TTL after any member departs, so neither a partition nor a dropped member's rejoin within the window can outlive the trail. Entries are tiny; a generous window is cheap. |
 | `reject_when_degraded` | `false` | Optional prevention (§5.6). When `true`, a leader whose last handoff could not reach every member that *could be holding bindings* refuses to register a name it does not already hold — preventing a reissue rather than repairing it. A brand-new joiner that has not yet connected (it exists only as a row in the database, §4.6) holds nothing and does not count, so a healthy scale-up does not trip this. Deliberately blunt otherwise: it cannot distinguish a partition from a deliberate scale-down, so it is off by default. |
 
 Observability: when a direct registration degrades open, the registry emits an event

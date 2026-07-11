@@ -79,8 +79,10 @@
 -export([
     init/1,
     handle_cast_tx/3,
-    handle_call/3,
-    leader_db_key/2
+    handle_call_tx/4,
+    leader_db_key/2,
+    tuid/1,
+    member_token/3
 ]).
 
 -export_type([member_id/0, member_info/0, registry_state/0]).
@@ -99,7 +101,14 @@
     name := atom(),
     members := #{member_id() => member_info()},
     leader := member_id() | undefined,
-    epoch := non_neg_integer()
+    epoch := non_neg_integer(),
+    %% Durable presence subscriptions (§4.9): `SubId => {Watch, Notify}`, keyed by an
+    %% application-supplied id.  Stored in the elector's *durable* dgen_server state, so
+    %% they outlive the Erlang cluster entirely — an application can tie a subscription
+    %% to a database entity's lifetime and have it survive a scale-to-zero and come back
+    %% intact.  The current leader is fed this set (a delta on each change, the full map
+    %% on a handoff) and computes the notifications; the elector is the source of truth.
+    subscriptions => #{term() => {term(), term()}}
 }.
 
 %% ---------------------------------------------------------------------------
@@ -111,9 +120,24 @@
 -endif.
 -spec init(#{name := atom()}) -> {ok, dgen_server:tuid(), registry_state()}.
 init(#{name := Name}) ->
-    Tuid = {<<"dgen_registry.">>, atom_to_binary(Name)},
-    State = #{name => Name, members => #{}, leader => undefined, epoch => 0},
-    {ok, Tuid, State}.
+    State = #{
+        name => Name, members => #{}, leader => undefined, epoch => 0, subscriptions => #{}
+    },
+    {ok, tuid(Name), State}.
+
+-if(?DOCATTRS).
+-doc """
+The transaction-unit id (backend keyspace prefix) for registry `Name`.
+
+The single source of truth for the registry's backend key prefix: the elector, the
+member (its version-key commit and leader-key fence), and the top-level supervisor
+must all use the *same* tuid, so they derive it here rather than each rebuilding the
+literal.  Exported for that reason.
+""".
+-endif.
+-spec tuid(atom()) -> dgen_server:tuid().
+tuid(Name) ->
+    {<<"dgen_registry.">>, atom_to_binary(Name)}.
 
 -if(?DOCATTRS).
 -doc """
@@ -183,7 +207,24 @@ handle_cast_tx(TxCtx, {member_down, MemberId, Token}, State) ->
                     %% via its own erlang:monitor DOWN signal; no broadcast needed.
                     {noreply, NewState}
             end
-    end.
+    end;
+%% Presence subscription writes (§4.9).  Cast, not call: the public API fires these
+%% fire-and-forget for latency, so `ok` means "accepted for durable processing", not yet
+%% "committed" — the same posture as the membership casts above.  Durability still holds
+%% (the change commits in this consume transaction and survives a full cluster restart),
+%% and because subscriptions are idempotent upserts keyed by an application-supplied id,
+%% a write lost in the pre-consume window is recoverable by re-subscribing.  Each returns
+%% a post-commit action that pushes the change to the current leader.
+handle_cast_tx(_TxCtx, {subscribe, SubId, Watch, Notify}, State) ->
+    Subs = subscriptions_of(State),
+    NewState = State#{subscriptions => Subs#{SubId => {Watch, Notify}}},
+    {noreply, NewState, [presence_push_action({subscribe, SubId, Watch, Notify})]};
+handle_cast_tx(_TxCtx, {unsubscribe, SubId}, State) ->
+    Subs = subscriptions_of(State),
+    NewState = State#{subscriptions => maps:remove(SubId, Subs)},
+    {noreply, NewState, [presence_push_action({unsubscribe, SubId})]};
+handle_cast_tx(_TxCtx, unsubscribe_all, State) ->
+    {noreply, State#{subscriptions => #{}}, [presence_push_action(unsubscribe_all)]}.
 
 %% Build the post-commit action that routes a membership change through the current
 %% leader: it calls `{elector_assume_and_distribute, …}` so the leader gathers every
@@ -200,6 +241,9 @@ assume_distribute_action(TriggerMember) ->
                 ok;
             _ ->
                 try
+                    %% A newly-assuming leader seeds its presence state (§4.9) by pulling
+                    %% the durable subscription set from its *co-located* elector when it
+                    %% finishes assuming — so we do not thread it through here.
                     call_to_member(
                         Leader,
                         {elector_assume_and_distribute, TriggerMember, maps:keys(All),
@@ -211,6 +255,11 @@ assume_distribute_action(TriggerMember) ->
                 end
         end
     end.
+
+%% Read the durable subscription map, tolerating durable state written by a
+%% pre-presence version (no `subscriptions` key).
+subscriptions_of(State) ->
+    maps:get(subscriptions, State, #{}).
 
 %% The assume call to the leader failed.  If it failed with `noproc` — we *reached* the
 %% leader's node but found no member process registered there — the leader's registry is
@@ -243,35 +292,88 @@ is_noproc({noproc, _}) -> true;
 is_noproc(_) -> false.
 
 %% ---------------------------------------------------------------------------
-%% handle_call/3  (read-only priority_calls — bypasses queue and locks)
+%% handle_call_tx/4  (all elector calls)
 %% ---------------------------------------------------------------------------
 
+%% dgen_server dispatches *every* call — priority reads (`priority_call`, which still
+%% bypass the durable queue and locks) and durable queued calls alike — to the `_tx`
+%% variant when a module exports it (see dgen_server:invoke_tx_callback/4).  The elector
+%% only ever receives priority reads here (the presence *writes* are casts, handled by
+%% handle_cast_tx), so all clauses just reply.  (There is deliberately no `handle_call/3`:
+%% exporting it too would be dead code, since the `_tx` variant always wins the dispatch.)
 -if(?DOCATTRS).
--doc "Handles read-only priority calls: `get_leader` and `get_members`.".
+-doc """
+Handles the elector's read-only priority calls: `get_leader`, `get_members`, `get_epoch`,
+`{get_member_token, _}`, and `get_subscriptions` (the durable subscription map, §4.9).
+The presence writes are casts — see handle_cast_tx/3.
+""".
 -endif.
--spec handle_call(term(), dgen_server:from(), registry_state()) ->
+-spec handle_call_tx(dgen_server:tx_ctx(), term(), dgen_server:from(), registry_state()) ->
     dgen_server:reply_ret().
-
-handle_call(get_leader, _From, State) ->
+handle_call_tx(_TxCtx, get_leader, _From, State) ->
     {reply, maps:get(leader, State, undefined), State};
-handle_call(get_members, _From, State) ->
+handle_call_tx(_TxCtx, get_members, _From, State) ->
     {reply, maps:keys(maps:get(members, State, #{})), State};
-handle_call(get_epoch, _From, State) ->
+handle_call_tx(_TxCtx, get_epoch, _From, State) ->
     {reply, maps:get(epoch, State, 0), State};
 %% Return the current stored join token for a member (or `undefined` if it is not a
-%% member).  Read fresh from the durable elector state (this is a priority read), so a
-%% member reporting a peer's death can fence its `{member_down}` with the token the
-%% elector *actually* holds — not a locally cached one that a dropped snapshot may have
-%% left stale.  Without this, a member whose peer re-announced a fresh token (on a
-%% nodeup) that never reached this node would fence with the old token, and a genuine
-%% death would be discarded as stale, stranding the dead member in the set (§5.7).
-handle_call({get_member_token, MemberId}, _From, State) ->
+%% member).  Read fresh from the durable elector state, so a member reporting a peer's
+%% death can fence its `{member_down}` with the token the elector *actually* holds — not
+%% a locally cached one that a dropped snapshot may have left stale.  Without this, a
+%% member whose peer re-announced a fresh token (on a nodeup) that never reached this
+%% node would fence with the old token, and a genuine death would be discarded as stale,
+%% stranding the dead member in the set (§5.7).
+handle_call_tx(_TxCtx, {get_member_token, MemberId}, _From, State) ->
     Token =
         case maps:get(MemberId, maps:get(members, State, #{}), undefined) of
             #{join_token := T} -> T;
             _ -> undefined
         end,
-    {reply, Token, State}.
+    {reply, Token, State};
+%% Read the durable subscription map (§4.9) — reflects the elector's committed set.
+handle_call_tx(_TxCtx, get_subscriptions, _From, State) ->
+    {reply, subscriptions_of(State), State}.
+
+%% Post-commit action that pushes a subscription change to the current leader as an
+%% epoch-stamped `{presence_update, …}` cast.  Fire-and-forget: the leader applies it
+%% if the epoch is current, and a drop (unreachable leader) is caught up by the reseed
+%% on the next handoff.  No leader yet → nothing to push; the reseed covers it.
+presence_push_action(Update) ->
+    fun(#{leader := Leader, epoch := Epoch}) ->
+        case Leader of
+            undefined -> ok;
+            _ -> push_to_leader(Leader, {presence_update, Update, Epoch})
+        end
+    end.
+
+%% Cast to the leader member, guarding against an automatic distribution reconnect to a
+%% disconnected node (the same hazard call_to_member/2 guards against — see §5.7).
+push_to_leader({Node, Name}, Msg) ->
+    case dgen_utils:node_reachable(Node) of
+        true -> gen_server:cast({Name, Node}, Msg);
+        false -> ok
+    end.
+
+-if(?DOCATTRS).
+-doc """
+Client-side helper: read the token the elector holds for `MemberId` right now,
+falling back to `Default` if the member is unknown or the read fails.
+
+A priority read (bypasses the durable queue).  This is the fence for a
+`{member_down}`: reporting the elector's *current* token means a peer that has
+genuinely rejoined (advancing its token) is not clobbered by a stale DOWN, while a
+truly dead member is still reaped.  Pure — safe to call from an off-loop helper; the
+member's peer-DOWN path and the connector's reap both use it.
+""".
+-endif.
+-spec member_token(pid(), member_id(), Default) -> reference() | Default.
+member_token(Elector, MemberId, Default) ->
+    try dgen_server:priority_call(Elector, {get_member_token, MemberId}) of
+        T when is_reference(T) -> T;
+        _ -> Default
+    catch
+        _:_ -> Default
+    end.
 
 %% ---------------------------------------------------------------------------
 %% Internal helpers
@@ -349,7 +451,7 @@ call_to_member({Node, Name}, Msg) ->
     %% token — the old {member_down} is then discarded as stale and the partition is
     %% never detected.  (This guard is independent of the now-removed distributed
     %% lock; keep it regardless — §5.7.)
-    case Node =:= node() orelse lists:member(Node, nodes()) of
+    case dgen_utils:node_reachable(Node) of
         true -> gen_server:call({Name, Node}, Msg, ?SnapshotTimeout);
         false -> exit({nodedown, Node})
     end.

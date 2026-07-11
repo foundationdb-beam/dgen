@@ -17,7 +17,13 @@ defmodule DGen.RegistryTest do
   setup %{tenant: tenant} do
     reg = :"reg_#{:erlang.unique_integer([:positive])}"
     {:ok, sup} = :dgen_registry.start_link(reg, tenant)
-    await_leader!(reg)
+    # Wait for the *member* to be ready to serve, not merely for the elector to have
+    # elected a leader (await_leader!). Leadership is assumed asynchronously (the handoff
+    # gather runs off the member loop), so there is a window where get_leader/1 already
+    # reports a leader but the member has not finished assuming — leader still undefined,
+    # not yet synced. Tests that then call ready/1, set_metadata/2, etc. would race that
+    # window. await_ready/2 blocks until the member has actually assumed and synced.
+    assert :ok == :dgen_registry.await_ready(reg, 5_000)
     on_exit(fn -> stop_registry(sup) end)
     %{reg: reg}
   end
@@ -85,6 +91,32 @@ defmodule DGen.RegistryTest do
   # Sort query matches by name for order-independent comparison.
   defp names(matches), do: matches |> Enum.map(& &1.name) |> Enum.sort()
 
+  # Register the calling (test) process as a presence notify target under `index`, so
+  # {:dgen_presence, ...} messages for a subscription whose notify query matches `index`
+  # arrive in the test mailbox.
+  defp register_listener(reg, index) do
+    :yes = :dgen_registry.register_name({reg, {:listener, self()}}, self(), %{index: index})
+    :ok
+  end
+
+  # subscribe/4 commits on the (durable) elector, which then *asynchronously* pushes the
+  # subscription to the leader. These block until the leader has (or no longer has)
+  # applied it — the presence sync point for a race-free assertion. Detection is
+  # layout-agnostic: it scans the member's #state{} for any map keyed by `sub_id` (the
+  # `subs` / `sub_matches` fields), so it does not depend on record field order.
+  defp await_sub(reg, sub_id), do: assert(eventually(fn -> leader_has_sub?(reg, sub_id) end))
+
+  defp await_no_sub(reg, sub_id),
+    do: assert(eventually(fn -> not leader_has_sub?(reg, sub_id) end))
+
+  defp leader_has_sub?(reg, sub_id) do
+    reg
+    |> :dgen_registry.member_name()
+    |> :sys.get_state()
+    |> Tuple.to_list()
+    |> Enum.any?(fn v -> is_map(v) and Map.has_key?(v, sub_id) end)
+  end
+
   # Supervisors exit with :shutdown (not :normal) when their parent process
   # dies, which has already happened by the time on_exit callbacks run.
   # Use :shutdown as the stop reason and catch any race. Takes the supervisor's
@@ -146,7 +178,7 @@ defmodule DGen.RegistryTest do
       assert pid == :dgen_registry.whereis_name({reg, :foo})
     end
 
-    test "returns no when the name is already taken", %{reg: reg} do
+    test "returns no when the name is already taken by a different pid", %{reg: reg} do
       pid1 = spawn(fn -> Process.sleep(:infinity) end)
       pid2 = spawn(fn -> Process.sleep(:infinity) end)
 
@@ -157,6 +189,38 @@ defmodule DGen.RegistryTest do
 
       :yes = :dgen_registry.register_name({reg, :dup}, pid1)
       assert :no = :dgen_registry.register_name({reg, :dup}, pid2)
+    end
+
+    # Re-registering the SAME pid under the SAME name is an idempotent success, not
+    # a conflict — so a caller whose register timed out (but whose registration in
+    # fact committed) can redrive it and get a decisive :yes for its own binding.
+    test "re-registering the same pid under the same name is an idempotent yes", %{reg: reg} do
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+
+      assert :yes = :dgen_registry.register_name({reg, :idem}, pid)
+      assert :yes = :dgen_registry.register_name({reg, :idem}, pid)
+      assert :yes = :dgen_registry.register_name({reg, :idem}, pid)
+      assert pid == :dgen_registry.whereis_name({reg, :idem})
+      # A different pid is still rejected after the idempotent re-registers.
+      other = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(other, :kill) end)
+      assert :no = :dgen_registry.register_name({reg, :idem}, other)
+      assert pid == :dgen_registry.whereis_name({reg, :idem})
+    end
+
+    # register_name/3 re-applies the call's metadata on an idempotent re-register,
+    # so a redrive that carries the same metadata leaves the row consistent.
+    test "an idempotent re-register with register_name/3 keeps the binding", %{reg: reg} do
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+
+      spec = %{index: %{role: :worker}, data: :d}
+      assert :yes = :dgen_registry.register_name({reg, :idem3}, pid, spec)
+      assert :yes = :dgen_registry.register_name({reg, :idem3}, pid, spec)
+
+      assert {:ok, %{pid: ^pid, index: %{role: :worker}, data: :d}} =
+               :dgen_registry.get_metadata({reg, :idem3})
     end
 
     test "different logical names are independent", %{reg: reg} do
@@ -173,6 +237,13 @@ defmodule DGen.RegistryTest do
       assert pid1 == :dgen_registry.whereis_name({reg, :a})
       assert pid2 == :dgen_registry.whereis_name({reg, :b})
     end
+
+    # Note: the "no reachable leader → the register blocks (never a false :no)"
+    # contract is exercised deterministically by the cluster suite's
+    # "CP refusals during a distribution-only partition" test — on the non-leader
+    # side a write blocks and its register_timeout exits rather than returning :no.
+    # A single-node unit test for it would have to poke the member's async-managed
+    # `leader` field, which races the post-sync re-announce, so it lives there.
   end
 
   describe "unregister_name/1" do
@@ -182,13 +253,10 @@ defmodule DGen.RegistryTest do
 
       :yes = :dgen_registry.register_name({reg, :bar}, pid)
 
-      :dgen_registry.unregister_name({reg, :bar})
-
-      # unregister_name is a cast; whereis_name now reads the member's ETS table in
-      # the caller (no member round-trip), so it no longer serialises behind the cast.
-      # Flush the member's mailbox with get_state to ensure the local delete is applied
-      # before the read.
-      :sys.get_state(:dgen_registry.member_name(reg))
+      # unregister_name is now a tracked call (Non-goal 5): `ok` comes back after
+      # the leader has committed the removal, and the member's optimistic delete
+      # happened before that — so the caller-side snapshot read sees it at once.
+      assert :ok = :dgen_registry.unregister_name({reg, :bar})
       assert :undefined = :dgen_registry.whereis_name({reg, :bar})
     end
 
@@ -336,9 +404,8 @@ defmodule DGen.RegistryTest do
       pid = spawn_live()
       :yes = :dgen_registry.register_name({reg, :m_unreg}, pid, %{index: %{a: 1}})
 
-      :dgen_registry.unregister_name({reg, :m_unreg})
-      :sys.get_state(:dgen_registry.member_name(reg))
-
+      # unregister_name is a tracked call; the optimistic delete precedes its reply.
+      assert :ok = :dgen_registry.unregister_name({reg, :m_unreg})
       assert :undefined = :dgen_registry.get_metadata({reg, :m_unreg})
     end
   end
@@ -413,13 +480,225 @@ defmodule DGen.RegistryTest do
   end
 
   # ---------------------------------------------------------------------------
+  # Presence (watch/notify subscriptions, §4.9)
+  # ---------------------------------------------------------------------------
+
+  describe "presence (subscribe/unsubscribe)" do
+    test "delivers joined/left as processes enter and leave the watch set", %{reg: reg} do
+      register_listener(reg, %{group: :l})
+      :ok = :dgen_registry.subscribe(reg, :s1, %{role: :worker}, %{group: :l})
+      await_sub(reg, :s1)
+
+      # A worker entering the watch set notifies the listener.
+      w1 = spawn_live()
+      :yes = :dgen_registry.register_name({reg, :w1}, w1, %{index: %{role: :worker}})
+      assert_receive {:dgen_presence, :s1, [{:joined, :w1, ^w1}]}, 1_000
+
+      # A registration outside the watch set does not.
+      o = spawn_live()
+      :yes = :dgen_registry.register_name({reg, :o1}, o, %{index: %{role: :other}})
+      refute_receive {:dgen_presence, :s1, _}, 200
+
+      # The worker dying leaves the set (auto-unregister via the leader monitor).
+      Process.exit(w1, :kill)
+      assert_receive {:dgen_presence, :s1, [{:left, :w1, ^w1}]}, 1_000
+
+      # An explicit unregister of a worker also leaves the set.
+      w2 = spawn_live()
+      :yes = :dgen_registry.register_name({reg, :w2}, w2, %{index: %{role: :worker}})
+      assert_receive {:dgen_presence, :s1, [{:joined, :w2, ^w2}]}, 1_000
+      :ok = :dgen_registry.unregister_name({reg, :w2})
+      assert_receive {:dgen_presence, :s1, [{:left, :w2, ^w2}]}, 1_000
+    end
+
+    test "delivers an initial snapshot of the current watch set on subscribe", %{reg: reg} do
+      a = spawn_live()
+      b = spawn_live()
+      :yes = :dgen_registry.register_name({reg, :a}, a, %{index: %{role: :worker}})
+      :yes = :dgen_registry.register_name({reg, :b}, b, %{index: %{role: :worker}})
+      register_listener(reg, %{group: :l})
+
+      # No await_sub here — the initial snapshot message is itself the signal that the
+      # (asynchronous) subscribe reached the leader, so allow for the cast to propagate.
+      :ok = :dgen_registry.subscribe(reg, :s2, %{role: :worker}, %{group: :l})
+      assert_receive {:dgen_presence, :s2, events}, 2_000
+      assert Enum.sort(events) == Enum.sort([{:joined, :a, a}, {:joined, :b, b}])
+    end
+
+    test "a notify process registered after subscribe still gets the initial snapshot",
+         %{reg: reg} do
+      # A watch member and a subscription exist, but no notify process yet.
+      w1 = spawn_live()
+      :yes = :dgen_registry.register_name({reg, :w1}, w1, %{index: %{role: :worker}})
+      :ok = :dgen_registry.subscribe(reg, :sN, %{role: :worker}, %{group: :l})
+      await_sub(reg, :sN)
+
+      # The notify process (self) registers *after* the subscription — it must still learn
+      # who is already present, i.e. receive the current watch set as an initial snapshot.
+      register_listener(reg, %{group: :l})
+      assert_receive {:dgen_presence, :sN, [{:joined, :w1, ^w1}]}, 1_000
+
+      # And thereafter it receives deltas as a continuing notify target.
+      w2 = spawn_live()
+      :yes = :dgen_registry.register_name({reg, :w2}, w2, %{index: %{role: :worker}})
+      assert_receive {:dgen_presence, :sN, [{:joined, :w2, ^w2}]}, 1_000
+    end
+
+    test "set_metadata moving a name in and out of the watch set notifies", %{reg: reg} do
+      register_listener(reg, %{group: :l})
+      :ok = :dgen_registry.subscribe(reg, :s3, %{role: :worker}, %{group: :l})
+      await_sub(reg, :s3)
+
+      x = spawn_live()
+      :yes = :dgen_registry.register_name({reg, :x}, x, %{index: %{role: :idle}})
+      refute_receive {:dgen_presence, :s3, _}, 200
+
+      :ok = :dgen_registry.set_metadata({reg, :x}, %{index: %{role: :worker}})
+      assert_receive {:dgen_presence, :s3, [{:joined, :x, ^x}]}, 1_000
+
+      :ok = :dgen_registry.set_metadata({reg, :x}, %{index: %{role: :idle}})
+      assert_receive {:dgen_presence, :s3, [{:left, :x, ^x}]}, 1_000
+    end
+
+    test "unsubscribe stops notifications", %{reg: reg} do
+      register_listener(reg, %{group: :l})
+      :ok = :dgen_registry.subscribe(reg, :s4, %{role: :worker}, %{group: :l})
+      await_sub(reg, :s4)
+      :ok = :dgen_registry.unsubscribe(reg, :s4)
+      await_no_sub(reg, :s4)
+
+      w = spawn_live()
+      :yes = :dgen_registry.register_name({reg, :w}, w, %{index: %{role: :worker}})
+      refute_receive {:dgen_presence, :s4, _}, 300
+    end
+
+    test "subscriptions/1 lists durable subscriptions and subscribe upserts", %{reg: reg} do
+      # subscribe/unsubscribe are durable *casts* (applied asynchronously), so read-back
+      # is eventual.
+      :ok = :dgen_registry.subscribe(reg, :s5, %{role: :worker}, %{group: :l})
+
+      assert eventually(fn ->
+               :dgen_registry.subscriptions(reg)[:s5] ==
+                 {{:all, %{role: :worker}}, {:all, %{group: :l}}}
+             end)
+
+      # Same SubId re-subscribed replaces the queries (idempotent upsert).
+      :ok = :dgen_registry.subscribe(reg, :s5, %{role: :admin}, %{group: :l})
+
+      assert eventually(fn ->
+               :dgen_registry.subscriptions(reg)[:s5] ==
+                 {{:all, %{role: :admin}}, {:all, %{group: :l}}}
+             end)
+
+      :ok = :dgen_registry.unsubscribe(reg, :s5)
+      assert eventually(fn -> not Map.has_key?(:dgen_registry.subscriptions(reg), :s5) end)
+    end
+
+    test "subscriptions are durable across a full registry restart", %{tenant: tenant} do
+      dreg = :"dreg_#{:erlang.unique_integer([:positive])}"
+      {:ok, sup1} = :dgen_registry.start_link(dreg, tenant)
+      await_leader!(dreg)
+
+      :ok = :dgen_registry.subscribe(dreg, :d1, %{role: :worker}, %{group: :l})
+      assert eventually(fn -> Map.has_key?(:dgen_registry.subscriptions(dreg), :d1) end)
+
+      # Tear the registry all the way down, then bring it back on the same tenant — the
+      # elector's durable backend state (including the subscription) must survive.
+      # Unlink first: start_link linked sup1 to this test process, so stopping it with
+      # reason :shutdown would otherwise propagate through the link and kill the test.
+      Process.unlink(sup1)
+      stop_registry(sup1)
+      assert eventually(fn -> Process.whereis(dreg) == nil end)
+
+      {:ok, sup2} = :dgen_registry.start_link(dreg, tenant)
+      on_exit(fn -> stop_registry(sup2) end)
+      assert :ok == :dgen_registry.await_ready(dreg, 5_000)
+
+      # The subscription is back, and the re-elected leader actively serves it.
+      assert Map.has_key?(:dgen_registry.subscriptions(dreg), :d1)
+      await_sub(dreg, :d1)
+
+      register_listener(dreg, %{group: :l})
+      w = spawn_live()
+      :yes = :dgen_registry.register_name({dreg, :w}, w, %{index: %{role: :worker}})
+      assert_receive {:dgen_presence, :d1, [{:joined, :w, ^w}]}, 2_000
+    end
+
+    test "an empty watch or notify query is rejected", %{reg: reg} do
+      assert {:error, :empty_query} = :dgen_registry.subscribe(reg, :s6, %{}, %{group: :l})
+      assert {:error, :empty_query} = :dgen_registry.subscribe(reg, :s6, %{role: :worker}, %{})
+    end
+
+    test "a bare map query is accepted and equals the tagged {all, map} form", %{reg: reg} do
+      register_listener(reg, %{group: :l})
+      :ok = :dgen_registry.subscribe(reg, :s7, {:all, %{role: :worker}}, {:all, %{group: :l}})
+      await_sub(reg, :s7)
+
+      w = spawn_live()
+      :yes = :dgen_registry.register_name({reg, :w}, w, %{index: %{role: :worker}})
+      assert_receive {:dgen_presence, :s7, [{:joined, :w, ^w}]}, 1_000
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Teardown / durable-state cleanup (unsubscribe_all/1, delete/2)
+  # ---------------------------------------------------------------------------
+
+  describe "cleanup" do
+    test "unsubscribe_all clears every subscription and stops notifications", %{reg: reg} do
+      :ok = :dgen_registry.subscribe(reg, :a, %{role: :worker}, %{group: :l})
+      :ok = :dgen_registry.subscribe(reg, :b, %{role: :admin}, %{group: :l})
+      await_sub(reg, :a)
+      await_sub(reg, :b)
+      assert eventually(fn -> map_size(:dgen_registry.subscriptions(reg)) == 2 end)
+
+      :ok = :dgen_registry.unsubscribe_all(reg)
+      assert eventually(fn -> :dgen_registry.subscriptions(reg) == %{} end)
+      await_no_sub(reg, :a)
+      await_no_sub(reg, :b)
+
+      # The leader no longer notifies for any watch.
+      register_listener(reg, %{group: :l})
+      w = spawn_live()
+      :yes = :dgen_registry.register_name({reg, :w}, w, %{index: %{role: :worker}})
+      refute_receive {:dgen_presence, _, _}, 300
+    end
+
+    test "delete/2 wipes durable state — a fresh registry on the same tenant starts clean",
+         %{tenant: tenant} do
+      dreg = :"dreg_#{:erlang.unique_integer([:positive])}"
+      {:ok, sup1} = :dgen_registry.start_link(dreg, tenant)
+      assert :ok == :dgen_registry.await_ready(dreg, 5_000)
+
+      :ok = :dgen_registry.subscribe(dreg, :d1, %{role: :worker}, %{group: :l})
+      assert eventually(fn -> Map.has_key?(:dgen_registry.subscriptions(dreg), :d1) end)
+
+      # Stop, then delete the durable footprint (the correct order — a running elector
+      # would re-create keys from its cache).
+      Process.unlink(sup1)
+      stop_registry(sup1)
+      assert eventually(fn -> Process.whereis(dreg) == nil end)
+      :ok = :dgen_registry.delete(dreg, tenant)
+
+      # A fresh registry on the same name+tenant no longer sees the subscription — unlike
+      # the "durable across a restart" test, the durable state is gone.
+      {:ok, sup2} = :dgen_registry.start_link(dreg, tenant)
+      on_exit(fn -> stop_registry(sup2) end)
+      assert :ok == :dgen_registry.await_ready(dreg, 5_000)
+      assert :dgen_registry.subscriptions(dreg) == %{}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # §5.6 conflict-detection predicate (pure, unit-tested in isolation)
   #
-  # The full partition-heal scenario that produces a genuine conflict needs a
-  # multi-node, leadership-orchestrated setup (a follower holds a binding the leader
-  # drops on reconstruction and re-issues); that lives in the cluster suite. Here we
-  # pin the safety-critical predicate itself: which gathered states count as a
-  # conflict, and — crucially — which do not (so we never false-kill a live process).
+  # The full end-to-end scenario that produces a genuine conflict needs a
+  # multi-node, leadership-orchestrated setup (a member holds a divergent live
+  # binding that a leadership-change gather exposes); that lives in the cluster
+  # suite ("conflict resolution by termination" in dgen_registry_cluster_test.exs).
+  # Here we pin the safety-critical predicate itself: which gathered states count
+  # as a conflict, and — crucially — which do not (so we never false-kill a live
+  # process).
   # ---------------------------------------------------------------------------
 
   describe "detect_conflicts/3" do
@@ -431,9 +710,32 @@ defmodule DGen.RegistryTest do
                :dgen_registry_member.detect_conflicts(%{n: p1}, [%{n: p1}, %{n: p2}], %{})
     end
 
-    test "a recently-released divergent pid is suppressed (lag, not conflict)" do
+    test "a recently-released name/pid pair is suppressed (lag, not conflict)" do
       p1 = spawn_live()
       p2 = spawn_live()
+      # Trail entries are keyed {name, pid} (§5.6).
+      released = %{{:n, p2} => System.system_time(:millisecond)}
+
+      assert [] =
+               :dgen_registry_member.detect_conflicts(%{n: p1}, [%{n: p1}, %{n: p2}], released)
+    end
+
+    test "a release under one name does not mask a conflict on another name" do
+      p1 = spawn_live()
+      p2 = spawn_live()
+      # p2 was explicitly released from :other — that must not suppress the
+      # genuine divergence on :n, which p2 also (still) claims.
+      released = %{{:other, p2} => System.system_time(:millisecond)}
+
+      assert [{:n, ^p1, [^p2]}] =
+               :dgen_registry_member.detect_conflicts(%{n: p1}, [%{n: p1}, %{n: p2}], released)
+    end
+
+    test "a legacy bare-pid trail entry (rolling upgrade) still suppresses" do
+      p1 = spawn_live()
+      p2 = spawn_live()
+      # A pre-upgrade member's gathered trail keys by pid alone; the detector
+      # honours that coarser shape until the mixed entries age out.
       released = %{p2 => System.system_time(:millisecond)}
 
       assert [] =
@@ -519,11 +821,62 @@ defmodule DGen.RegistryTest do
       # remove's ReleasedPid is :undefined — only the overlay (from the earlier
       # add, still in this same batch) tells the remove there is something to
       # durably clear.
-      ops = [{:add, :n, pid, {%{}, nil}, add_origin}, {:remove, :n, :undefined}]
+      ops = [{:add, :n, pid, {%{}, nil}, add_origin}, {:remove, :n, :undefined, :undefined}]
       plan = :dgen_registry_member.plan_batch(ops, tab, %{}, 1)
 
       assert %{dbop: %{n: :clear}, replies: replies} = plan
       assert {add_origin, :yes} in replies
+    end
+
+    test "an add for a name already bound to the same pid is an idempotent yes", %{tab: tab} do
+      pid = spawn_live()
+      origin = {:local, {self(), make_ref()}}
+      # Pre-batch ETS: :n is already bound to pid, with an existing monitor ref.
+      :ets.insert(tab, {:n, pid, %{}, nil})
+
+      ops = [{:add, :n, pid, {%{}, nil}, origin}]
+      plan = :dgen_registry_member.plan_batch(ops, tab, %{n: make_ref()}, 1)
+
+      # Same pid re-registers: yes, re-writing the (identical) binding via {:set}.
+      assert %{dbop: %{n: {:set, _node}}, replies: replies} = plan
+      assert {origin, :yes} in replies
+    end
+
+    test "an add for a name bound to a DIFFERENT pid is rejected no", %{tab: tab} do
+      old_pid = spawn_live()
+      new_pid = spawn_live()
+      origin = {:local, {self(), make_ref()}}
+      :ets.insert(tab, {:n, old_pid, %{}, nil})
+
+      ops = [{:add, :n, new_pid, {%{}, nil}, origin}]
+      plan = :dgen_registry_member.plan_batch(ops, tab, %{n: make_ref()}, 1)
+
+      # Different pid: rejected, and no durable change for the name.
+      assert %{dbop: dbop, replies: replies} = plan
+      refute Map.has_key?(dbop, :n)
+      assert {origin, :no} in replies
+    end
+
+    test "a tracked remove is answered ok whether or not anything was bound", %{tab: tab} do
+      pid = spawn_live()
+      unreg_origin = {:unreg, {self(), make_ref()}}
+      noop_origin = {:unreg, {self(), make_ref()}}
+      :ets.insert(tab, {:bound, pid, %{}, nil})
+
+      ops = [
+        {:remove, :bound, pid, unreg_origin},
+        # Unbound name: clearing it is an idempotent no-op, still answered ok.
+        {:remove, :unbound, :undefined, noop_origin}
+      ]
+
+      plan = :dgen_registry_member.plan_batch(ops, tab, %{}, 1)
+
+      assert %{dbop: dbop, replies: replies, released: released} = plan
+      assert dbop == %{bound: :clear}
+      assert {unreg_origin, :ok} in replies
+      assert {noop_origin, :ok} in replies
+      # The trail entry is the {name, pid} pair (§5.6).
+      assert released == [{:bound, pid}]
     end
   end
 

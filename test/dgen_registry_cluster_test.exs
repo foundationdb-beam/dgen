@@ -116,6 +116,54 @@ defmodule DGen.RegistryClusterTest do
     :erpc.call(node, :erlang, :spawn, [:timer, :sleep, [:infinity]])
   end
 
+  # Run an MFA on one side of a partition: locally on the primary, or on the
+  # peer via the :peer stdio control channel — which works while Erlang
+  # distribution is severed and, unlike erpc, cannot reconnect (and thereby
+  # heal) the partition under test.
+  defp side_call(:primary, _peer_pid, m, f, a), do: apply(m, f, a)
+  defp side_call(:peer, peer_pid, m, f, a), do: :peer.call(peer_pid, m, f, a, 8_000)
+
+  defp side_spawn(:primary, _peer_pid), do: spawn(fn -> Process.sleep(:infinity) end)
+
+  defp side_spawn(:peer, peer_pid) do
+    :peer.call(peer_pid, :erlang, :spawn, [:timer, :sleep, [:infinity]])
+  end
+
+  # Do both CP refusals hold on `side` right now?
+  #
+  # (1) A write must NOT succeed (`:yes`). Depending on what that side believes,
+  #     it either returns an adjudicated `:no` — it still thinks it leads and its
+  #     commit aborts on the durable leader-key fence — or, knowing no leader is
+  #     reachable, it BLOCKS and its register_timeout exits (register never
+  #     returns a false `:no` any more). Both are CP refusals; only `:yes` is a
+  #     breach. (The test shrinks register_timeout so the blocking case resolves
+  #     quickly.)
+  # (2) A consistent read of a name the side's frozen replica still holds answers
+  #     `:undefined` (Guarantee 5's denial path) — never the stale pid as
+  #     authoritative.
+  defp cp_refusals_hold?(side, peer_pid, reg, held_name) do
+    probe_pid = side_spawn(side, peer_pid)
+    probe_name = {:cp_probe, :erlang.unique_integer([:positive])}
+
+    reg_refused =
+      try do
+        side_call(side, peer_pid, :dgen_registry, :register_name, [{reg, probe_name}, probe_pid]) !=
+          :yes
+      catch
+        # Blocked past register_timeout and exited — a refusal.
+        _, _ -> true
+      end
+
+    read =
+      try do
+        side_call(side, peer_pid, :dgen_registry, :whereis_name_consistent, [{reg, held_name}])
+      catch
+        _, _ -> :not_undefined
+      end
+
+    reg_refused and read == :undefined
+  end
+
   # Boots a 3-member cluster where `leader_node` becomes leader *before* the
   # primary or the second peer join — sticky leadership then keeps it in
   # charge once they do — so a test can kill the leader without having to
@@ -415,6 +463,55 @@ defmodule DGen.RegistryClusterTest do
   end
 
   # ---------------------------------------------------------------------------
+  # Presence — replication and cross-node notification (§4.9)
+  # ---------------------------------------------------------------------------
+
+  describe "presence across nodes" do
+    test "a subscription is durable elector state, visible from the peer", %{
+      reg: reg,
+      peer_node: peer_node
+    } do
+      :ok = :dgen_registry.subscribe(reg, :cross, %{role: :worker}, %{group: :l})
+
+      # Subscriptions live in the elector's durable, cluster-shared state, so the peer's
+      # subscriptions/1 sees the same subscription (the elector is one logical entity
+      # across nodes).
+      assert eventually(fn ->
+               subs = :erpc.call(peer_node, :dgen_registry, :subscriptions, [reg])
+               Map.has_key?(subs, :cross)
+             end),
+             "subscription not visible in the peer's durable elector state"
+    end
+
+    test "a peer-node registration reaches a primary notify target's presence feed", %{
+      reg: reg,
+      peer_node: peer_node
+    } do
+      # `self()` (on the primary) is the notify target.
+      :yes =
+        :dgen_registry.register_name({reg, {:listener, self()}}, self(), %{index: %{group: :l}})
+
+      # Register the worker on the *peer* first, then subscribe: the subscribe's initial
+      # snapshot (computed on the leader once the durable cast lands) sees the already-
+      # replicated peer-node registration and delivers it to the primary target. Doing it
+      # in this order avoids racing the asynchronous subscribe against the registration —
+      # register_name returned :yes, so the leader already holds :peer_worker.
+      remote_pid = spawn_remote(peer_node)
+
+      :yes =
+        :erpc.call(peer_node, :dgen_registry, :register_name, [
+          {reg, :peer_worker},
+          remote_pid,
+          %{index: %{role: :worker}}
+        ])
+
+      :ok = :dgen_registry.subscribe(reg, :peer_change, %{role: :worker}, %{group: :l})
+
+      assert_receive {:dgen_presence, :peer_change, [{:joined, :peer_worker, ^remote_pid}]}, 5_000
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Snapshot distribution on join
   # ---------------------------------------------------------------------------
 
@@ -679,6 +776,88 @@ defmodule DGen.RegistryClusterTest do
   end
 
   # ---------------------------------------------------------------------------
+  # CP refusals during a distribution-only partition (§5.3, Guarantees 5 and 7)
+  #
+  # The Erlang mesh is severed while the database stays reachable from both
+  # sides. The sides briefly contend over the single durable leadership record
+  # and then settle (sticky leadership; the leader-liveness probe never reaps a
+  # once-connected node, so the losing side cannot keep deposing the winner
+  # through the shared database). Whichever side ends up NOT holding leadership
+  # must exhibit the CP refusals — and this is asserted through the :peer stdio
+  # channel, since an erpc to the disconnected side would heal the partition.
+  # ---------------------------------------------------------------------------
+
+  describe "CP refusals during a distribution-only partition" do
+    test "the side without leadership refuses writes and fences consistent reads", %{
+      reg: reg,
+      peer_node: peer_node,
+      peer_pid: peer_pid
+    } do
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+
+      :yes = :dgen_registry.register_name({reg, :cp_name}, pid)
+
+      assert eventually(fn -> remote_whereis(peer_node, reg, :cp_name) == pid end),
+             ":cp_name never replicated to the peer"
+
+      # A CP write refusal on the non-leader side now *blocks* (no reachable leader)
+      # and leans on register_timeout rather than returning a false :no. Shrink that
+      # timeout on both nodes so the settle-poll below iterates quickly; restore after.
+      prev = Application.get_env(:dgen, :register_timeout)
+      Application.put_env(:dgen, :register_timeout, 800)
+      :erpc.call(peer_node, Application, :put_env, [:dgen, :register_timeout, 800])
+
+      on_exit(fn ->
+        case prev do
+          nil -> Application.delete_env(:dgen, :register_timeout)
+          v -> Application.put_env(:dgen, :register_timeout, v)
+        end
+      end)
+
+      :net_kernel.disconnect(peer_node)
+
+      # Settle + assert in one self-stabilising poll: read the durable-backed
+      # leader view, pick the refusing side, and require both refusals to hold
+      # there simultaneously. Mid-storm iterations simply return false.
+      primary = node()
+
+      assert eventually(
+               fn ->
+                 case :dgen_registry.get_leader(reg) do
+                   {^primary, _} -> cp_refusals_hold?(:peer, peer_pid, reg, :cp_name)
+                   {^peer_node, _} -> cp_refusals_hold?(:primary, peer_pid, reg, :cp_name)
+                   _ -> false
+                 end
+               end,
+               30_000
+             ),
+             "the non-leader side never settled into the CP refusals"
+
+      # Heal: the cluster reconstitutes and serves writes again.
+      Node.connect(peer_node)
+
+      new_pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(new_pid, :kill) end)
+
+      assert eventually(
+               fn ->
+                 try do
+                   :dgen_registry.register_name({reg, :post_cp}, new_pid) == :yes
+                 catch
+                   _, _ -> false
+                 end
+               end,
+               15_000
+             ),
+             "could not register a new name after the partition healed"
+
+      assert eventually(fn -> remote_whereis(peer_node, reg, :post_cp) == new_pid end, 10_000),
+             "post-heal registration did not replicate to the peer"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Leader failure and failover (§5.1, §5.5, §5.7)
   #
   # Every other test in this file disconnects or reconnects the *peer* — the
@@ -778,6 +957,207 @@ defmodule DGen.RegistryClusterTest do
              end),
              "could not register a new name after the abrupt failover"
     end
+
+    # T4: the *direct* registration path (§5.5) — a registration originating on
+    # the leader's own node has only the leader as holder at commit time, so the
+    # leader must wait for a follower's version-guarded replicate_ack before
+    # answering `yes` (replicate-before-ack). This is the half of the two-holder
+    # invariant the forwarded-registration failover tests above cannot reach.
+    # After the ack, at least one follower provably holds the binding at a
+    # version the handoff gather sees — so killing the leader must not lose it.
+    test "a direct (leader-origin) registration survives the leader's death", context do
+      {reg, leader_node, leader_pid, _leader_sup, other_node, _other_pid} =
+        start_peer_led_cluster!(context)
+
+      old_leader = :dgen_registry.get_leader(reg)
+
+      # The pid lives on the primary (it must outlive the leader node), but the
+      # registration is made ON the leader node — the direct path.
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+
+      assert :yes ==
+               :erpc.call(leader_node, :dgen_registry, :register_name, [
+                 {reg, :direct_survivor},
+                 pid
+               ])
+
+      DGen.ClusterHelper.stop_peer(leader_pid)
+
+      assert eventually(
+               fn ->
+                 primary_leader = :dgen_registry.get_leader(reg)
+                 other_leader = :erpc.call(other_node, :dgen_registry, :get_leader, [reg])
+
+                 primary_leader not in [:undefined, old_leader] and
+                   primary_leader == other_leader
+               end,
+               8_000
+             ),
+             "survivors did not agree on a new leader after the leader node died"
+
+      # The replicate-before-ack machinery guaranteed a follower held the binding
+      # when `yes` was answered, so the freshest-wins gather must have carried it.
+      assert eventually(fn ->
+               :dgen_registry.whereis_name_consistent({reg, :direct_survivor}) == pid
+             end),
+             "direct registration was lost with the leader despite the replica ack"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Conflict resolution by termination (§5.6) — end to end
+  #
+  # The unit suite pins the detect_conflicts/3 predicate; this test drives the
+  # whole repair path: a member holding a divergent live binding for a name the
+  # rest of the cluster assigns to a different live pid, exposed at a
+  # leadership-change gather, must get BOTH processes terminated and the name
+  # dropped (kill-both, §5.6). The divergence is created deterministically by
+  # injecting a crafted contiguous {name_registered} broadcast into one member —
+  # the same technique the epoch-fencing tests use — rather than by racing a real
+  # partition, so the test does not depend on partition timing.
+  # ---------------------------------------------------------------------------
+
+  describe "conflict resolution by termination (§5.6)" do
+    @tag capture_log: true
+    test "a leadership-change gather kills both claimants of a diverged name", context do
+      {reg, _leader_node, leader_pid, _leader_sup, other_node, _other_pid} =
+        start_peer_led_cluster!(context)
+
+      # p1 is the legitimate, cluster-wide owner; p2 the divergent claimant.
+      # Both live on the primary so they survive the leader's death and are
+      # alive when the new leader's gather adjudicates.
+      p1 = spawn(fn -> Process.sleep(:infinity) end)
+      p2 = spawn(fn -> Process.sleep(:infinity) end)
+
+      on_exit(fn ->
+        Process.exit(p1, :kill)
+        Process.exit(p2, :kill)
+      end)
+
+      assert :yes == :dgen_registry.register_name({reg, :conflicted}, p1)
+
+      # Every member must hold p1 before the divergence is injected, so the
+      # gather sees p1 from the other follower.
+      assert eventually(fn ->
+               :erpc.call(other_node, :dgen_registry, :whereis_name, [{reg, :conflicted}]) == p1
+             end),
+             "p1's registration never replicated to the other follower"
+
+      # Divergence: overwrite the PRIMARY's replica row with p2 via a crafted
+      # broadcast that is contiguous with its stream (v -> v+1), making the
+      # primary both divergent AND the freshest replica by version — exactly the
+      # shape a lagging/partitioned member presents at a gather.
+      member = :dgen_registry.member_name(reg)
+      epoch = :dgen_registry.get_epoch(reg)
+      leader = :dgen_registry.get_leader(reg)
+      {_records, v, _released} = GenServer.call(member, :get_names_snapshot)
+
+      GenServer.cast(
+        member,
+        {:name_registered, :conflicted, p2, %{}, :undefined, epoch, v, v + 1, leader}
+      )
+
+      :sys.get_state(member)
+      assert p2 == :dgen_registry.whereis_name({reg, :conflicted})
+
+      # Kill the leader: the failover gather collects the primary (freshest,
+      # authority = p2) and the other follower (still reporting p1, live and not
+      # in the release trail) — a genuine §5.6 conflict. Kill-both must fire.
+      DGen.ClusterHelper.stop_peer(leader_pid)
+
+      assert eventually(
+               fn -> not Process.alive?(p1) and not Process.alive?(p2) end,
+               15_000
+             ),
+             "kill-both did not terminate both claimants " <>
+               "(p1 alive: #{Process.alive?(p1)}, p2 alive: #{Process.alive?(p2)})"
+
+      # The conflicted name was dropped from the reconstructed table everywhere.
+      assert eventually(fn ->
+               :dgen_registry.whereis_name({reg, :conflicted}) == :undefined and
+                 :erpc.call(other_node, :dgen_registry, :whereis_name, [{reg, :conflicted}]) ==
+                   :undefined
+             end),
+             "conflicted name was not cleared after kill-both"
+
+      # Supervised processes would now re-register cleanly; simulate that.
+      p3 = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(p3, :kill) end)
+
+      assert eventually(fn ->
+               :dgen_registry.register_name({reg, :conflicted}, p3) == :yes
+             end),
+             "name could not be re-registered after conflict resolution"
+    end
+
+    # The other §5.6 trigger point: a previously-synced member REJOINS while the
+    # leader stays put (the common partition-heal shape — no leadership change,
+    # so no full handoff gather runs). The continuing leader must gather the
+    # rejoiner's replica and adjudicate it against its own authoritative table
+    # before onboarding, killing both claimants of a diverged name rather than
+    # silently overwriting the rejoiner's row and leaving the old claimant
+    # running as a phantom singleton. The rejoin is driven deterministically by
+    # sending the member the same {:nodeup, _} message a real reconnect would.
+    @tag capture_log: true
+    test "a rejoin under a continuing leader adjudicates divergent bindings", %{
+      reg: reg,
+      peer_node: peer_node
+    } do
+      p1 = spawn(fn -> Process.sleep(:infinity) end)
+      p2 = spawn(fn -> Process.sleep(:infinity) end)
+
+      on_exit(fn ->
+        Process.exit(p1, :kill)
+        Process.exit(p2, :kill)
+      end)
+
+      :yes = :dgen_registry.register_name({reg, :fp_conflicted}, p1)
+
+      assert eventually(fn -> remote_whereis(peer_node, reg, :fp_conflicted) == p1 end),
+             "registration never replicated to the peer"
+
+      # Diverge the PEER's replica: a crafted contiguous broadcast rebinds the
+      # name to p2 there (the same injection technique as the epoch/gap tests).
+      peer_member = :erpc.call(peer_node, :dgen_registry, :member_name, [reg])
+      epoch = :erpc.call(peer_node, :dgen_registry, :get_epoch, [reg])
+      leader = :erpc.call(peer_node, :dgen_registry, :get_leader, [reg])
+      v = peer_applied_version(peer_node, peer_member)
+
+      :erpc.call(peer_node, :gen_server, :cast, [
+        peer_member,
+        {:name_registered, :fp_conflicted, p2, %{}, :undefined, epoch, v, v + 1, leader}
+      ])
+
+      :erpc.call(peer_node, :sys, :get_state, [peer_member])
+      assert p2 == remote_whereis(peer_node, reg, :fp_conflicted)
+
+      # Drive the peer's re-announce — the same path a real {:nodeup, _} takes.
+      # Leadership does not change, so the continuing leader (primary) handles
+      # the join on the fast path and must gather + adjudicate the rejoiner.
+      :erpc.call(peer_node, :erlang, :send, [peer_member, {:nodeup, node()}])
+
+      assert eventually(
+               fn -> not Process.alive?(p1) and not Process.alive?(p2) end,
+               15_000
+             ),
+             "rejoin adjudication did not terminate both claimants " <>
+               "(p1 alive: #{Process.alive?(p1)}, p2 alive: #{Process.alive?(p2)})"
+
+      assert eventually(fn ->
+               :dgen_registry.whereis_name({reg, :fp_conflicted}) == :undefined and
+                 remote_whereis(peer_node, reg, :fp_conflicted) == :undefined
+             end),
+             "diverged name was not cleared everywhere after the rejoin adjudication"
+
+      p3 = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(p3, :kill) end)
+
+      assert eventually(fn ->
+               :dgen_registry.register_name({reg, :fp_conflicted}, p3) == :yes
+             end),
+             "name could not be re-registered after the rejoin adjudication"
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -858,6 +1238,189 @@ defmodule DGen.RegistryClusterTest do
 
       assert local_epoch > 0
       assert local_epoch == remote_epoch
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Gap detection → resync recovery (§4.5)
+  #
+  # The unit suite asserts that a gapped broadcast is *refused*; this drives the
+  # recovery half: the refusing member requests a resync snapshot from the
+  # leader, re-baselines from it, and rejoins the contiguous broadcast stream.
+  # ---------------------------------------------------------------------------
+
+  describe "resync after a broadcast gap" do
+    test "a gapped member re-baselines from the leader's snapshot and catches up", %{
+      reg: reg,
+      peer_node: peer_node
+    } do
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+
+      # A real registration so the leader (primary) holds state to resync from.
+      :yes = :dgen_registry.register_name({reg, :pre_gap}, pid)
+
+      assert eventually(fn -> remote_whereis(peer_node, reg, :pre_gap) == pid end),
+             "registration never replicated to the peer"
+
+      peer_member = :erpc.call(peer_node, :dgen_registry, :member_name, [reg])
+      epoch = :erpc.call(peer_node, :dgen_registry, :get_epoch, [reg])
+      leader = :erpc.call(peer_node, :dgen_registry, :get_leader, [reg])
+      v = peer_applied_version(peer_node, peer_member)
+
+      # Inject a broadcast whose PrevVersion is far ahead of the peer's applied
+      # version: the peer must refuse it (no hole in the replica) and ask the
+      # leader for a resync snapshot instead.
+      :erpc.call(peer_node, :gen_server, :cast, [
+        peer_member,
+        {:name_registered, :gap_ghost, pid, %{}, :undefined, epoch, v + 10, v + 11, leader}
+      ])
+
+      :erpc.call(peer_node, :sys, :get_state, [peer_member])
+      assert :undefined == remote_whereis(peer_node, reg, :gap_ghost)
+
+      # The resync snapshot re-baselines the peer to the leader's version...
+      {_records, leader_v, _released} =
+        GenServer.call(:dgen_registry.member_name(reg), :get_names_snapshot)
+
+      assert eventually(fn ->
+               peer_applied_version(peer_node, peer_member) >= leader_v
+             end),
+             "peer never re-baselined from the resync snapshot"
+
+      # ... the ghost never appears, the real state is intact, and the peer is
+      # back on the contiguous stream: a fresh registration replicates normally.
+      assert :undefined == remote_whereis(peer_node, reg, :gap_ghost)
+      assert pid == remote_whereis(peer_node, reg, :pre_gap)
+
+      pid2 = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid2, :kill) end)
+      :yes = :dgen_registry.register_name({reg, :post_gap}, pid2)
+
+      assert eventually(fn -> remote_whereis(peer_node, reg, :post_gap) == pid2 end),
+             "peer did not resume applying broadcasts after the resync"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Uniqueness under contention (Guarantee 1/3)
+  #
+  # Two nodes race to register the same name; exactly one caller may hear `yes`
+  # per name, and every node must converge on the winner. The core singleton
+  # claim, exercised as an actual race rather than sequentially.
+  # ---------------------------------------------------------------------------
+
+  describe "concurrent registration race" do
+    test "when both nodes race for one name, exactly one wins and all agree", %{
+      reg: reg,
+      peer_node: peer_node
+    } do
+      for round <- 1..10 do
+        name = {:race, round}
+        local_pid = spawn(fn -> Process.sleep(:infinity) end)
+        remote_pid = spawn_remote(peer_node)
+        on_exit(fn -> Process.exit(local_pid, :kill) end)
+
+        local_task =
+          Task.async(fn -> :dgen_registry.register_name({reg, name}, local_pid) end)
+
+        remote_task =
+          Task.async(fn ->
+            :erpc.call(peer_node, :dgen_registry, :register_name, [{reg, name}, remote_pid])
+          end)
+
+        local_result = Task.await(local_task, 10_000)
+        remote_result = Task.await(remote_task, 10_000)
+
+        assert Enum.sort([local_result, remote_result]) == [:no, :yes],
+               "round #{round}: expected exactly one :yes, got " <>
+                 "local=#{inspect(local_result)} remote=#{inspect(remote_result)}"
+
+        winner = if local_result == :yes, do: local_pid, else: remote_pid
+
+        assert :dgen_registry.whereis_name_consistent({reg, name}) == winner,
+               "round #{round}: authoritative read disagrees with the race verdict"
+
+        assert eventually(fn -> remote_whereis(peer_node, reg, name) == winner end),
+               "round #{round}: peer snapshot never converged on the winner"
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Unregister re-drive across a partition (Non-goal 5)
+  #
+  # An explicit unregister accepted while the leader is unreachable must not be
+  # silently lost: the member stashes it and re-drives it as a pid-guarded
+  # retract once the partition heals. Uses :peer.call (the stdio control
+  # channel) to reach the disconnected peer without re-opening distribution —
+  # an erpc would heal the very partition under test.
+  # ---------------------------------------------------------------------------
+
+  describe "unregister re-drive after a partition" do
+    test "an unregister accepted while the leader is unreachable is applied on heal", %{
+      reg: reg,
+      peer_node: peer_node,
+      peer_pid: peer_pid
+    } do
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+
+      :yes = :dgen_registry.register_name({reg, :redrive_me}, pid)
+
+      assert eventually(fn -> remote_whereis(peer_node, reg, :redrive_me) == pid end),
+             "registration never replicated to the peer"
+
+      # Sever distribution; the peer's member now sees the leader (primary) as
+      # unreachable, so its unregister takes the stash-and-ok path. (If the
+      # disconnect is still propagating on the peer, the forward is instead sent
+      # into the dying connection and stashed under its Ref — either way the
+      # removal is retained and re-driven, and the call answers :ok. The outer
+      # :peer.call timeout is kept well above unregister_name's internal 5s call
+      # timeout so the inner path always resolves first.)
+      :net_kernel.disconnect(peer_node)
+
+      assert :ok ==
+               :peer.call(
+                 peer_pid,
+                 :dgen_registry,
+                 :unregister_name,
+                 [{reg, :redrive_me}],
+                 15_000
+               )
+
+      # Read-your-delete holds locally on the disconnected peer...
+      assert :undefined ==
+               :peer.call(peer_pid, :dgen_registry, :whereis_name, [{reg, :redrive_me}], 5_000)
+
+      # ... while the primary (which could not have heard about it) still serves it.
+      assert pid == :dgen_registry.whereis_name({reg, :redrive_me})
+
+      # Heal. The peer rejoins, receives the leader's snapshot (which briefly
+      # resurrects the row on the peer), and its stashed removal is re-driven to
+      # the leader as a pid-guarded retract — the unregister must win everywhere.
+      Node.connect(peer_node)
+
+      assert eventually(
+               fn -> :dgen_registry.whereis_name({reg, :redrive_me}) == :undefined end,
+               20_000
+             ),
+             "the stashed unregister was never re-driven to the leader"
+
+      assert eventually(
+               fn -> remote_whereis(peer_node, reg, :redrive_me) == :undefined end,
+               20_000
+             ),
+             "the peer's replica did not converge on the removal"
+
+      # The name is genuinely free again.
+      pid2 = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid2, :kill) end)
+
+      assert eventually(fn ->
+               :dgen_registry.register_name({reg, :redrive_me}, pid2) == :yes
+             end),
+             "name was not re-registrable after the re-driven unregister"
     end
   end
 

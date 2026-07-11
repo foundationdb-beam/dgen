@@ -48,32 +48,65 @@
 %%
 %% ## Membership and connectivity
 %%
-%% The member keeps the Erlang-distribution mesh in step with registry membership.
-%% Periodically (and at startup, and on every `{nodeup, _}`) it reads the authoritative
-%% member set from the elector — a DB-backed read, identical on every node regardless of
-%% which one consumed the joins — and `net_kernel:connect_node/1`s to each member node
-%% (`mesh_connect`). So once a node's join is committed, every member connects to it and
-%% `nodes()` converges to include all reachable members; the application only has to make
-%% the nodes *able* to connect (shared cookie, reachable hostnames), not wire up the mesh
-%% itself. This is what lets a brand-new node, which so far exists only as a row in the
-%% database, be drawn into the cluster: it connects to the existing members, the resulting
-%% `{nodeup, _}` drives the rejoin below, and it is brought fully up to date.
+%% Keeping the Erlang-distribution mesh in step with registry membership — the
+%% proactive `net_kernel:connect_node/1` pass, the backstop reap of stranded members,
+%% and the leader-liveness probe — lives in the sibling `dgen_registry_connector`, not
+%% here.  So once a node's join is committed the connector connects to it and `nodes()`
+%% converges to every reachable member; the application only has to make the nodes
+%% *able* to connect (shared cookie, reachable hostnames), not wire up the mesh itself.
 %%
-%% The member subscribes to `nodeup`/`nodedown` events via
-%% `net_kernel:monitor_nodes/1`.  On `{nodeup, Node}`, the member re-announces
-%% itself to the elector (`{join, Self}`).  This handles the case where an
-%% Erlang-level network partition caused both sides to remove each other from
-%% the member set via `{member_down}` while the DB remained healthy: once the
-%% partition heals and distribution reconnects, both sides re-join and the
-%% elector reconstitutes the cluster without requiring a restart.
+%% The member still subscribes to `nodeup`/`nodedown` via `net_kernel:monitor_nodes/1`.
+%% On `{nodeup, Node}` it does two things: it re-announces itself to the elector
+%% (`{join, Self}`), and it promptly re-drives any unregisters it stashed while the
+%% leader was unreachable (`redrive_pending_unregs`, Non-goal 5).  The re-announce
+%% handles an Erlang-level partition that caused both sides to remove each other from the
+%% member set via `{member_down}` while the DB stayed healthy: once distribution
+%% reconnects, both sides re-join and the elector reconstitutes the cluster without a
+%% restart.  The stashed-unregister re-drive means the removal reaches the (now-reachable)
+%% leader immediately, rather than waiting for the re-onboarding snapshot.  (The connector subscribes to node
+%% events independently for its mesh bookkeeping.)  The connector also nudges this
+%% member with `{durable_epoch, E}` when the committed election epoch has moved ahead of
+%% what the member has heard — a missed handoff — prompting a re-join.
+%%
+%% ## Registration blocks until a leader exists
+%%
+%% A registration is only ever answered `no` for an *adjudicated* refusal — the name is
+%% held by a different live pid (or the opt-in `reject_when_degraded` prevention mode).
+%% When there is simply **no reachable leader** (none elected yet at startup, a brief
+%% no-leader window during a handoff, or the elected leader is unreachable in a
+%% partition), the registration is **not** answered `no` — that would be a false
+%% `already_started` to OTP's via machinery.  Instead the caller is *blocked*: the
+%% request is stashed in `pending_registers` and re-driven (`redrive_registers/1`) the
+%% moment a leader is established (assuming leadership, or applying a leader's snapshot),
+%% so it succeeds if a leader appears within the caller's `register_timeout` and
+%% otherwise the caller's own `gen_server:call` times out (§3 of the design doc — a
+%% timeout exits rather than returning a verdict).  The stash is pruned by wall-clock
+%% age so a prolonged no-leader window (a partition) cannot grow it without bound.  All
+%% register routing is in `route_register/5`.
 %%
 %% Forwards `{register, …}` and `{unregister, …}` to the leader. The register
 %% forward is **asynchronous**: the follower stashes the caller's `From` (with the
 %% registration's metadata) under a `Ref`, casts `{register_req, Ref, Self, Name, Pid,
 %% Meta}` to the leader, and replies `{noreply}` — it never blocks on the leader. When
-%% the leader's `{register_reply, Ref, yes|no}` arrives, the follower (on `yes`) writes
-%% the registration's row (pid + metadata) into its own table and then answers the
-%% caller; on `no` the table is left unchanged.
+%% the leader's `{register_reply, Ref, yes|no, Version}` arrives, the follower (on
+%% `yes`) writes the registration's row (pid + metadata) into its own table and then
+%% answers the caller; on `no` the table is left unchanged.  The `yes` ack is
+%% **version-guarded**: it is answered only once the follower's replica has applied up
+%% to the batch's commit `Version` — normally already true, since the batch's
+%% `{name_registered}` broadcast precedes the reply (FIFO).  If that broadcast was
+%% gap-refused (the follower missed an earlier batch and awaits a resync), the ack is
+%% *deferred* until the resync lands (`deferred_yes` / `flush_deferred`), so the
+%% "second holder" is always version-visible to the freshest-wins handoff gather —
+%% otherwise a single leader crash could silently drop an acked binding whose only
+%% surviving copy sat in a gapped replica the gather's version comparison ignores.
+%%
+%% An `{unregister, …}` is likewise a tracked, call-shaped forward (`unregister_req` /
+%% `unregister_reply`): the follower deletes its row optimistically, stashes the
+%% caller under a `Ref`, and — if the reply never comes (dropped cast, deposed
+%% leader) or no leader was reachable at all — re-drives the removal as a
+%% pid-guarded retract on the next snapshot/leadership event (`redrive_unregs`), so
+%% an explicit unregister is never silently lost.  Explicit unregisters are rare, so
+%% the extra round-trip costs nothing that matters.
 %%
 %% A `set_metadata` forward is also asynchronous: the follower stashes `From` under a
 %% `Ref`, casts `{set_meta_req, Ref, Self, Name, Index, Data}`, and answers the caller
@@ -104,15 +137,24 @@
 %%
 %% ## Leader role
 %%
-%% Assumed when the elector calls `{elector_assume_and_distribute, …}`.  On
-%% assuming leadership the member reconstructs its names map by gathering the
-%% freshest of every reachable member's replica (`gather_maps/3`) — the freshest
-%% map *is* the reconstructed state (there is no durable taken-set to reconcile
-%% against, §4.4), sets up `erlang:monitor/2` for every entry, and distributes
-%% `{apply_names_snapshot}` casts to all followers from its own process (same
-%% sender as future `{name_registered}` broadcasts — see elector moduledoc for the
-%% FIFO ordering guarantee).  Any stale Pid entries are removed when their DOWN
-%% signals arrive.
+%% Assumed when the elector calls `{elector_assume_and_distribute, …}`.  On a genuine
+%% leadership change the member reconstructs its names map by gathering the freshest of
+%% every reachable member's replica — the freshest map *is* the reconstructed state
+%% (there is no durable taken-set to reconcile against, §4.4), then sets up
+%% `erlang:monitor/2` for every entry and distributes `{apply_names_snapshot}` casts to
+%% all followers from its own process (same sender as future `{name_registered}`
+%% broadcasts — see elector moduledoc for the FIFO ordering guarantee).  Any stale Pid
+%% entries are removed when their DOWN signals arrive.
+%%
+%% The gather is a **network** fan-out (an RPC per peer, bounded by ?GATHER_TIMEOUT), so
+%% it runs **off the member's loop**: the elector's assume call is answered `ok`
+%% immediately, and the `{assume_gathered, …}` continuation finishes assuming when the
+%% gather returns (`spawn_assume_gather` → the assume_gathered handler, correlated by
+%% `assume_ref`).  This keeps the member responsive during a handoff — under churn an
+%% inline multi-second gather would freeze the loop, time out the elector's call, and
+%% stall every membership change queued behind it.  During the (sub-?GATHER_TIMEOUT)
+%% window the member is not yet leader/synced, so writes block (no reachable leader) and
+%% are re-driven by the continuation, never served against a half-built map.
 %%
 %% The leader is the sole writer for the name table. It:
 %%
@@ -131,12 +173,14 @@
 %%   When the worker reports back, each registration is answered through its origin
 %%   (a direct call via `gen_server:reply/2`, a forwarded one via a `{register_reply}`
 %%   cast to the forwarding follower), pids are monitored, and `{name_registered, …}` /
-%%   `{name_unregistered, …}` are replicated. In-batch duplicates and already-taken
-%%   names are rejected (`no`); a `DOWN` whose ref no longer matches the current
+%%   `{name_unregistered, …}` are replicated. A name already held by a *different* live
+%%   pid is rejected (`no`); re-registering the *same* pid under the same name is an
+%%   idempotent `yes` (see plan_op/3); a `DOWN` whose ref no longer matches the current
 %%   binding is ignored; a fenced commit (leadership lost) rejects the whole batch.
 %% - Handles `{whereis, LogicalName}` calls: consistent read from local map.
-%% - Handles `{unregister, LogicalName}` casts: updates the map, demonitors,
-%%   and replicates `{name_unregistered, …}`.
+%% - Handles `{unregister, LogicalName}` calls (and legacy casts): updates the map,
+%%   demonitors, replicates `{name_unregistered, …}`, and answers the tracked
+%%   caller `ok` once the removal has committed.
 %% - Monitors every registered Pid. When one dies, removes from the map
 %%   and replicates `{name_unregistered, …}` to followers.
 %%
@@ -208,43 +252,18 @@
 %% - **Full cluster restart**: all registered names are lost.  Applications
 %%   must re-register on startup.
 
-%% Maximum number of write ops coalesced into a single commit.  A larger pending
-%% buffer is split across successive commits, bounding transaction size.
--define(MAX_BATCH, 1000000).
-
-%% (The replicate-before-ack target and timeout are configurable per registry — see
-%% dgen_config:register_replicas/1, replicate_timeout/1, strict_replication/1.)
+%% (The group-commit batch size, the replicate-before-ack target, and the timeout
+%% are configurable per registry — see dgen_config:commit_batch_size/1,
+%% register_replicas/1, replicate_timeout/1, strict_replication/1.)
 
 %% Per-member bound on the handoff gather: a member that does not return its names
 %% map within this is skipped (its bindings are unavailable for this gather; a
 %% binding only that member held is then lost — single-fault uniqueness).
 -define(GATHER_TIMEOUT, 2000).
-
-%% How often each member proactively connects Erlang distribution to every other
-%% member node, so the cluster converges to a full mesh and `nodes()` returns all
-%% members (see the "Membership and connectivity" guarantee in the design doc).  This
-%% is a backstop; startup and `nodeup` also trigger an immediate pass.
--define(MESH_INTERVAL, 10000).
-
-%% After observing a node's `nodedown`, the mesh does *not* immediately reconnect it:
-%% it waits this long so the departure can be recorded as a `{member_down}` and settle,
-%% rather than fighting the partition machinery by healing a drop the instant it
-%% happens.  A genuine departure leaves the member set within the window (and so is not
-%% reconnected at all); a `{nodeup, _}` clears the suppression early.
--define(MESH_DOWN_COOLDOWN, 10000).
-
-%% After a node drops, this member reaps any registry member still stranded on that
-%% (still-disconnected) node from the elector's set — a backstop for the case where a
-%% member's own monitor `{member_down}` was fenced away as stale (e.g. a `{join}` the
-%% dead member enqueued on a nodeup just before its node vanished re-added it with a
-%% token this node never saw).  Each pass reads the elector and reports `member_down`
-%% for such members; it opens no distribution connection, so it cannot heal the very
-%% partition it is reacting to.  Retried a few times because the resurrecting `{join}`
-%% may not be processed until after the first pass; it stops early once the node
-%% reconnects (a live member re-announces and wins), leaves the set, or the attempts
-%% are exhausted.
--define(REAP_INTERVAL, 1000).
--define(REAP_ATTEMPTS, 6).
+%% Upper bound on the off-loop pull of durable subscriptions from the co-located elector
+%% during a handoff (§4.9).  Short and best-effort: a busy elector falls back to the
+%% empty set, reconciled by a later delta / the next handoff.
+-define(SUBS_PULL_TIMEOUT, 1000).
 
 %% How often the periodic maintenance pass runs: it prunes `recently_released`
 %% (the conflict-detector trail, §5.6 — TTL from `dgen_config:conflict_release_ttl/1`)
@@ -271,20 +290,6 @@
 %% Bound on the per-peer aliveness probe used when adjudicating a suspected conflict.
 -define(ALIVE_PROBE_TIMEOUT, 1000).
 
-%% Leader-liveness probe.  The normal failover trigger is `nodedown`, which only
-%% fires for a node this member was *connected to* and then lost.  A leader recovered
-%% from durable elector state whose node this member has *never* connected to — e.g. a
-%% whole-cluster cold restart where the previously-elected node is gone (killed while
-%% leader, new nodes come up under different names) — produces no `nodedown`, so the
-%% dead leader is never reaped and every write forwards to it forever.  This periodic
-%% probe closes that gap: if the elected leader's node is unreachable, it reaps that
-%% node through the same fenced `member_down` path a `nodedown` uses, letting a
-%% reachable member (re-)elect.  The first pass is delayed a grace window so a leader
-%% that is merely *not connected yet* (the mesh runs at startup but connect is async)
-%% is given time to become reachable before we could mistake "connecting" for "dead".
--define(LEADER_PROBE_GRACE, 4000).
--define(LEADER_PROBE_INTERVAL, 4000).
-
 -export([start_link/2]).
 -export([
     init/1,
@@ -309,6 +314,17 @@
 %% default `{#{}, undefined}`.  See §4.7 of the design doc.
 -type meta() :: {Index :: map(), Data :: term()}.
 
+%% A presence subscription's watch/notify queries, in the internal tagged form (see
+%% dgen_registry:query/0).  Extensible: only `{all, Constraints}` (AND-equal) exists today.
+-type query() :: {'all', #{term() => term()}}.
+
+%% An application-supplied presence subscription id (§4.9).  The durable subscriptions
+%% live in the elector's dgen_server state; the leader is fed the set and computes the
+%% notifications.  Keyed by this id so an application can tie a subscription to a
+%% database entity and re-address it (unsubscribe, re-subscribe) by the same stable key
+%% across a full cluster restart.
+-type sub_id() :: term().
+
 %% Where a write op came from, and how to answer it once committed:
 %%   - {local, From}:           a direct register/2,3 call to this leader; answered
 %%                              with gen_server:reply/2.
@@ -321,11 +337,19 @@
 %%                              with a {set_meta_reply, Ref, _} cast to that member,
 %%                              which then answers its own caller (after the FIFO-ordered
 %%                              {metadata_set} broadcast has updated the follower's row).
+%%   - {unreg, From}:           an unregister_name call made directly on this leader;
+%%                              answered `ok` with gen_server:reply/2 once committed.
+%%   - {forward_unreg, MemberId, Ref}: an unregister forwarded by a follower; answered
+%%                              with an {unregister_reply, Ref} cast to that member,
+%%                              which then answers its own caller `ok` (after the
+%%                              FIFO-ordered {name_unregistered} broadcast).
 -type origin() ::
     {local, gen_server:from()}
     | {forward, dgen_registry_elector:member_id(), reference()}
     | {meta, gen_server:from()}
-    | {forward_meta, dgen_registry_elector:member_id(), reference()}.
+    | {forward_meta, dgen_registry_elector:member_id(), reference()}
+    | {unreg, gen_server:from()}
+    | {forward_unreg, dgen_registry_elector:member_id(), reference()}.
 
 %% A leader write op awaiting the next group commit.  All ride one fenced commit (a
 %% single version-key bump) and are applied to the local replica in arrival order, so
@@ -338,15 +362,37 @@
 %%               captured before the leader removes it from the replica optimistically.
 %%               A non-`undefined` ReleasedPid both drives the durable clear and is
 %%               recorded in `recently_released` (the conflict-detector trail, §5.6).
+%%               Origin (or `undefined` for a legacy cast / salvaged re-drive) is
+%%               answered `ok` once the batch commits.
 %%   - down:     an auto-unregister from a monitored process exit; Ref-guarded so a
 %%               stale DOWN for an already-re-registered name is ignored.  The pid is
 %%               dead, so it is *not* recorded in `recently_released`.
 -type batch_op() ::
     {add, LogicalName :: term(), Pid :: pid(), Meta :: meta(), Origin :: origin()}
     | {set_meta, LogicalName :: term(), Index :: map(), Data :: term(), Origin :: origin()}
-    | {remove, LogicalName :: term(), ReleasedPid :: pid() | undefined}
+    | {remove, LogicalName :: term(), ReleasedPid :: pid() | undefined,
+        Origin :: origin() | undefined}
     | {retract, LogicalName :: term(), Pid :: pid()}
     | {down, LogicalName :: term(), Ref :: reference()}.
+
+%% A follower's in-flight forwarded call, keyed in `pending_forwards` by the `Ref` the
+%% leader echoes in its reply.  One map holds all three kinds so there is a single home
+%% for "calls I forwarded and am awaiting a verdict on", and a single resolution when
+%% leadership moves.  The kinds still differ in how they resolve — a register applies
+%% (or gap-defers) the optimistic row on `yes`; a set_meta just answers; an unregister
+%% is re-driven rather than rejected on a leadership change (see reject_forwards /
+%% redrive_unregs):
+%%   - {register, Name, Pid, Meta, From}: awaiting {register_reply}; on `yes` the row is
+%%                              written (making this member the second holder) and From
+%%                              answered — version-guarded, see handle_register_reply.
+%%   - {set_meta, From}:        awaiting {set_meta_reply}; From gets the leader's result.
+%%   - {unregister, Name, Pid, From}: awaiting {unregister_reply}; From gets `ok`.  Pid is
+%%                              the released pid (or `undefined` if unbound locally) so a
+%%                              re-drive can pid-guard the retract.
+-type pending_forward() ::
+    {register, term(), pid(), meta(), gen_server:from()}
+    | {set_meta, gen_server:from()}
+    | {unregister, term(), pid() | undefined, gen_server:from()}.
 
 -record(state, {
     member_id :: dgen_registry_elector:member_id(),
@@ -378,24 +424,68 @@
     %% rebuilt wholesale on a handoff / snapshot apply.  AND-equal queries intersect the
     %% per-clause posting sets (§4.7 of the design doc).
     inv_index = #{} :: #{term() => #{term() => #{term() => []}}},
+    %% Leader-only presence state (§4.9): the durable subscription set the elector feeds
+    %% this member — `#{SubId => {Watch, Notify}}`.  Seeded wholesale from the
+    %% `{elector_assume_and_distribute}` payload when this member assumes leadership, and
+    %% advanced by `{presence_update, …}` deltas the elector pushes as subscriptions are
+    %% created/removed.  A follower does not track it (only the leader fires
+    %% notifications); it is reseeded from the elector on the next assume.
+    subs = #{} :: #{sub_id() => {query(), query()}},
+    %% Leader-only: the current watch-set membership of each subscription —
+    %% `#{SubId => #{Name => Pid}}` — i.e. the names that satisfy the subscription's
+    %% watch query right now.  Recomputed wholesale from the replica on assuming
+    %% leadership (recompute_sub_matches) and advanced incrementally per commit
+    %% (apply_committed_plan): comparing a batch's post-state matches against this
+    %% pre-state is what yields the `joined`/`left` deltas.
+    sub_matches = #{} :: #{sub_id() => #{term() => pid()}},
+    %% Leader-only: the current *notify*-set membership of each subscription, the mirror
+    %% of `sub_matches` for the notify query — `#{SubId => #{Name => Pid}}`.  Its purpose
+    %% is the initial snapshot: a process that only starts matching the notify query later
+    %% (registered after the subscription was created) must still learn who is already
+    %% present, so when a pid **enters** this set it is sent the full current watch
+    %% snapshot — symmetric to a watch member entering triggering a `joined` delta.
+    %% Recomputed on assume and advanced per commit alongside sub_matches.
+    notify_matches = #{} :: #{sub_id() => #{term() => pid()}},
     %% Peer-member monitors (all members)
     members :: #{dgen_registry_elector:member_id() => reference()},
     monitors :: #{reference() => dgen_registry_elector:member_id()},
     %% Registered-process monitors (leader only)
     name_to_ref :: #{term() => reference()},
     ref_to_name :: #{reference() => term()},
-    %% Follower-only: registrations forwarded to the leader and awaiting their
-    %% {register_reply}.  Ref => {LogicalName, Pid, Meta, From}; on the reply we apply
-    %% the optimistic row update (yes), writing the full record (pid + metadata), and
-    %% answer From.  Cleared on a leadership change (the reply from the old leader will
-    %% never come — callers retry).
-    forwards = #{} :: #{reference() => {term(), pid(), meta(), gen_server:from()}},
-    %% Follower-only: set_metadata calls forwarded to the leader and awaiting their
-    %% {set_meta_reply}.  Ref => From.  The reply is routed back *through* this member
-    %% (not direct from the leader) so the leader's {metadata_set} broadcast — FIFO
-    %% ahead of the reply — has updated our row before we answer the caller, preserving
-    %% read-after-write.  Cleared on a leadership change (callers retry).
-    meta_forwards = #{} :: #{reference() => gen_server:from()},
+    %% Follower-only: calls forwarded to the leader and awaiting their reply, keyed by
+    %% the Ref the leader echoes back (`register` / `set_meta` / `unregister` kinds —
+    %% see the pending_forward() type).  One map for all three, so there is a single
+    %% place forwarded-call state lives and a single resolution when leadership moves:
+    %% register and set_meta are rejected so their callers retry (reject_forwards);
+    %% unregister is instead re-driven, since its intent is idempotent and must not be
+    %% lost (redrive_unregs).
+    pending_forwards = #{} :: #{reference() => pending_forward()},
+    %% Follower-only: forwarded registrations whose `yes` reply arrived while this
+    %% member's replica was **gapped** (the batch's {name_registered} broadcast was
+    %% refused pending a resync, so applied_version is behind the reply's commit
+    %% version).  Acking `yes` at that point would make the "second holder"
+    %% invisible to the freshest-wins handoff gather (§5.5/§5.7) — a leader crash
+    %% before the resync landed could then silently drop an acked binding.  The ack
+    %% is deferred as {Version, From} and released by flush_deferred/1 once
+    %% applied_version reaches Version (the resync snapshot both delivers the
+    %% binding and advances the version, making the second holder version-visible).
+    %% Rejected (`no`) on a leadership change, like the register forwards it came from.
+    deferred_yes = [] :: [{non_neg_integer(), gen_server:from()}],
+    %% Unregisters accepted while no leader was reachable (answered `ok` under the
+    %% CP contract — the commit must wait), kept as {Name, ReleasedPid} until
+    %% redrive_unregs/1 can hand them to a leader as pid-guarded retracts.  (Distinct
+    %% from an `unregister` entry in `pending_forwards`, which was successfully
+    %% forwarded and is awaiting a reply; these never reached a leader at all.)
+    pending_unregs = [] :: [{term(), pid()}],
+    %% Registrations received while there was **no reachable leader** (none elected
+    %% yet, or the elected one is unreachable).  Rather than answer a false `no` — which
+    %% OTP's via machinery reads as `already_started` — the register is *blocked*: its
+    %% caller is stashed here as {EnqueuedAtMs, Name, Pid, Meta, From} and re-driven
+    %% (redrive_registers/1) the moment a leader is established, so it succeeds if the
+    %% leader appears within the caller's `register_timeout` and otherwise the caller's
+    %% own call times out (§3 / §5.2).  Pruned by wall-clock age on the periodic pass so
+    %% the stash cannot grow unbounded while no leader ever appears (a partition).
+    pending_registers = [] :: [{integer(), term(), pid(), meta(), gen_server:from()}],
     %% Leader-only: direct (local-origin) registrations that have committed but are
     %% awaiting follower replica confirmation before being acked `yes` (the two-holder
     %% invariant, §5.5/§8).  BatchRef => {Direct, TimerRef, Needed, Acked}, where
@@ -464,21 +554,34 @@
     %% unreachable at a gather (see dgen_registry_elector's member_info doc).  On the
     %% first sync the member re-announces itself with `fresh = false`.
     synced = false :: boolean(),
+    %% Correlates the in-flight asynchronous handoff gather with the continuation that
+    %% finishes assuming leadership (§5.7).  When the elector asks this member to assume
+    %% (a genuine leadership change), the peer-snapshot gather runs off the loop; this
+    %% ref tags that gather, and the `{assume_gathered, …}` continuation applies its
+    %% reconstruction *only* if this ref still matches — so a newer assume, or a snapshot
+    %% that made us a follower meanwhile, harmlessly supersedes a stale gather.
+    %% `undefined` when no assume is in flight.
+    assume_ref = undefined :: undefined | reference(),
     %% Monotonically increasing leader term counter set by the elector.
     %% Broadcasts from a prior leader carry a smaller epoch and are discarded.
     epoch :: non_neg_integer(),
-    %% Conflict-detection trail (§5.6), kept on *every* member: pids explicitly
-    %% released (an unregister of a live process) → the wall-clock ms it happened.
-    %% The leader records them at commit; followers record them from the released
+    %% Conflict-detection trail (§5.6), kept on *every* member: name/pid pairs
+    %% explicitly released (an unregister of a live process) → the wall-clock ms it
+    %% happened.  Keyed by `{Name, Pid}` — not bare pid — so releasing a pid under
+    %% one of its names never masks a genuine conflict on *another* name the same
+    %% pid also holds (a pid may be registered under several names).  Bare-pid keys
+    %% from a pre-upgrade member's gathered trail are still honoured by the
+    %% detector during a rolling upgrade (see released_entry/3).
+    %% The leader records entries at commit; followers record them from the released
     %% pid carried on {name_unregistered} broadcasts; and at a handoff gather every
     %% reachable member's trail is merged into the new leader's, so the trail
-    %% survives leadership changes.  A gather suppresses a divergence on a pid still
-    %% in here (it was legitimately unregistered, a lagging member just has not
+    %% survives leadership changes.  A gather suppresses a divergence on an entry
+    %% still in here (it was legitimately unregistered, a lagging member just has not
     %% caught up), so only a reconstruction-drop divergence — which leaves no trail —
     %% is killed.  TTL-pruned (dgen_config:conflict_release_ttl/1) by a periodic
     %% self-message, with pruning suspended while any member is disconnected (a
     %% partition must not outlive the trail that protects against its lagging rows).
-    recently_released = #{} :: #{pid() => integer()},
+    recently_released = #{} :: #{{term(), pid()} | pid() => integer()},
     %% Leader-only kill budget (§5.6): name → recent kill timestamps (ms).  Bounds
     %% kills to `conflict_kill_budget` per name per window so a regenerating conflict
     %% escalates to an operator instead of looping.
@@ -493,10 +596,15 @@
     %% dgen_config with application-env and built-in-default fallbacks.  Scopes the
     %% replication, termination, and degraded-reject knobs to this registry.
     config = #{} :: dgen_config:config(),
-    %% Nodes whose `nodedown` we saw within the last ?MESH_DOWN_COOLDOWN ms → timestamp.
-    %% The proactive mesh skips these so it does not reconnect a node the instant it
-    %% drops (letting the departure settle as a {member_down}); cleared on {nodeup}.
-    recently_down = #{} :: #{node() => integer()}
+    %% Wall-clock ms of the most recent member departure this member observed
+    %% (remove_member/2).  Trail pruning (§5.6) is suspended not only while a
+    %% *current* member is disconnected but also within `conflict_release_ttl` of
+    %% any departure: a member dropped from the set during a partition is no
+    %% longer "a disconnected member", yet its stale rows can surface at a rejoin
+    %% gather — the trail that discriminates lag from divergence must outlive
+    %% that window too.  (A member that stays gone longer than the TTL is outside
+    %% the trail's protection horizon either way.)
+    last_departure = 0 :: integer()
 }).
 
 %% ---------------------------------------------------------------------------
@@ -525,17 +633,19 @@ init(#{name := Name, tenant := Tenant, tuid := Tuid} = Args) ->
     NamesTab = ets:new(dgen_registry:names_table(Name), [
         named_table, set, protected, {read_concurrency, true}
     ]),
+    %% Subscribe to node up/down: the member reacts to `{nodeup, _}` by re-announcing
+    %% its own `{join}` (partition-heal, membership identity).  The node-level mesh /
+    %% reap / probe machinery lives in the sibling `dgen_registry_connector`, which
+    %% subscribes independently — this member no longer meshes or reaps.
     net_kernel:monitor_nodes(true),
     %% Periodic maintenance: expire the conflict-detection trail (§5.6) and the
     %% per-name kill-budget timestamps.
     erlang:send_after(?PRUNE_INTERVAL, self(), prune_released),
-    %% Everything that needs the elector's pid (announcing presence, kicking off the
-    %% first mesh pass) is deferred to `discover_elector` below: the supervisor is
-    %% still synchronously waiting on *this* init/1 to return when it runs (this
-    %% process is the second of its two children to start), so `supervisor:which_children/1`
-    %% would deadlock if called from here directly. Returning via `{continue, ...}`
-    %% lets the supervisor consider this child started, unblocking it, before the
-    %% lookup runs.
+    %% Announcing presence needs the elector's pid, which is deferred to
+    %% `discover_elector` below: the supervisor is still synchronously waiting on *this*
+    %% init/1 to return when it runs, so `supervisor:which_children/1` would deadlock if
+    %% called from here directly. Returning via `{continue, ...}` lets the supervisor
+    %% consider this child started, unblocking it, before the lookup runs.
     {ok,
         #state{
             member_id = MemberId,
@@ -548,8 +658,10 @@ init(#{name := Name, tenant := Tenant, tuid := Tuid} = Args) ->
             monitors = #{},
             name_to_ref = #{},
             ref_to_name = #{},
-            forwards = #{},
-            meta_forwards = #{},
+            pending_forwards = #{},
+            deferred_yes = [],
+            pending_unregs = [],
+            pending_registers = [],
             pending_acks = #{},
             join_token = make_ref(),
             peer_tokens = #{},
@@ -563,7 +675,7 @@ init(#{name := Name, tenant := Tenant, tuid := Tuid} = Args) ->
             kill_budget = #{},
             degraded = false,
             config = Config,
-            recently_down = #{}
+            last_departure = 0
         },
         {continue, discover_elector}}.
 
@@ -574,8 +686,7 @@ init(#{name := Name, tenant := Tenant, tuid := Tuid} = Args) ->
 %% Finds the elector via the shared supervisor (see the moduledoc's "Process
 %% identity" note in dgen_registry) — safe here because the supervisor is no
 %% longer blocked on this process's own init/1 by the time this runs — then
-%% performs the elector-dependent startup steps init/1 could not: announcing
-%% presence and kicking off the first mesh-connect pass.
+%% announces presence.  The mesh/probe startup lives in the connector.
 handle_continue(
     discover_elector, State = #state{member_id = {_Node, Name} = MemberId, join_token = Token}
 ) ->
@@ -586,15 +697,6 @@ handle_continue(
     %% `fresh = true`: this member has never synced (empty replica), so an
     %% unreachable-at-gather window for it cannot be hiding any bindings.
     dgen_server:cast(Elector, {join, MemberId, Token, true}),
-    %% Proactively connect Erlang distribution to every member node, now and
-    %% periodically, so the cluster converges to a full mesh (see mesh_connect).  The
-    %% application only has to make the nodes *able* to connect (cookie, networking);
-    %% dgen does the connecting.
-    self() ! mesh_connect,
-    %% Backstop the `nodedown`-driven failover for a leader we never connected to
-    %% (a leader recovered from durable state whose node is gone) — see probe_leader.
-    %% Delayed so a genuinely-reachable leader is meshed before the first check.
-    erlang:send_after(?LEADER_PROBE_GRACE, self(), probe_leader),
     {noreply, State#state{elector = Elector}}.
 
 %% ---------------------------------------------------------------------------
@@ -610,44 +712,18 @@ handle_call(ready, _From, State = #state{leader = Leader, synced = Synced}) ->
     {reply, Leader =/= undefined andalso Synced, State};
 %% ---- Name registration ----------------------------------------------------
 
-%% Leader: park the registration in the group-commit buffer and answer later.
-%% The reply is deferred ({noreply}) until the batch commit completes and
-%% apply_committed_plan/3 answers this caller.  The origin is {local, From} — a
-%% direct registration, answered with gen_server:reply/2.  See enqueue_op/2.
-handle_call(
-    {register, LogicalName, Pid, Meta},
-    From,
-    State = #state{leader = Leader, member_id = Leader}
-) ->
-    case reject_new_when_degraded(LogicalName, State) of
-        true -> {reply, no, State};
-        false -> {noreply, enqueue_op({add, LogicalName, Pid, Meta, {local, From}}, State)}
-    end;
-%% Follower: forward to the leader **asynchronously** (cast, never a blocking
-%% call), stashing From so the eventual {register_reply} answers this caller.  A
-%% blocking call here would deadlock once the leader awaits a follower ack on the
-%% same path (see the moduledoc); casts keep every member's loop free.  The
-%% optimistic local row update happens when the yes reply arrives (which is also
-%% what makes the forwarding follower the binding's confirmed second holder).
-handle_call(
-    {register, LogicalName, Pid, Meta},
-    From,
-    State = #state{leader = Leader, member_id = Self, forwards = Forwards}
-) when Leader =/= undefined, Leader =/= Self ->
-    %% An unreachable leader means the cast would be dropped and the caller would
-    %% stall until its own call timeout — answer the verdict (`no`) immediately
-    %% instead, the same fast-fail the consistent-read forwards apply.
-    case member_reachable(Leader) of
-        true ->
-            Ref = make_ref(),
-            cast_to_member(Leader, {register_req, Ref, Self, LogicalName, Pid, Meta}),
-            {noreply, State#state{forwards = Forwards#{Ref => {LogicalName, Pid, Meta, From}}}};
-        false ->
-            {reply, no, State}
-    end;
-%% No leader yet.
-handle_call({register, _LogicalName, _Pid, _Meta}, _From, State) ->
-    {reply, no, State};
+%% All routing (leader/follower/no-leader) is handled by route_register/5, which
+%% either defers the reply (leader parks it in the commit buffer; a follower forwards
+%% it; a not-ready member stashes it to await a leader) or answers immediately for an
+%% adjudicated verdict.  The only immediate reply is `no`, and only when the name is
+%% genuinely refused — see route_register/5.  See the moduledoc "blocks until a leader
+%% exists" note.
+handle_call({register, LogicalName, Pid, Meta}, From, State) ->
+    {noreply, route_register(LogicalName, Pid, Meta, From, State)};
+%% ---- Name unregistration (leader-routed call, mirroring the register path) --
+
+handle_call({unregister, LogicalName}, From, State) ->
+    route_unregister(LogicalName, From, State);
 %% ---- Metadata write (set_metadata) ----------------------------------------
 
 %% Leader: park the metadata replacement in the group-commit buffer; the origin
@@ -665,14 +741,14 @@ handle_call(
 handle_call(
     {set_metadata, LogicalName, Index, Data},
     From,
-    State = #state{leader = Leader, member_id = Self, meta_forwards = MetaForwards}
+    State = #state{leader = Leader, member_id = Self, pending_forwards = PF}
 ) when Leader =/= undefined, Leader =/= Self ->
     %% Same unreachable-leader fast-fail as the register forward above.
     case member_reachable(Leader) of
         true ->
             Ref = make_ref(),
             cast_to_member(Leader, {set_meta_req, Ref, Self, LogicalName, Index, Data}),
-            {noreply, State#state{meta_forwards = MetaForwards#{Ref => From}}};
+            {noreply, State#state{pending_forwards = PF#{Ref => {set_meta, From}}}};
         false ->
             {reply, {error, no_leader}, State}
     end;
@@ -820,120 +896,67 @@ handle_call(
 %% message.  The full gather+distribute below is reserved for a genuine leadership
 %% change, where a new leader must reconstruct from the freshest surviving member.
 handle_call(
-    {elector_assume_and_distribute, MemberId, AllIds, Tokens, _FreshIds, Epoch},
+    {elector_assume_and_distribute, MemberId, AllIds, Tokens, FreshIds, Epoch},
     _From,
     State = #state{member_id = Self, leader = Self, epoch = Epoch, synced = true}
 ) when MemberId =/= undefined ->
     State1 = merge_peer_tokens(
         Tokens, add_member_monitors(extra_member_ids(MemberId, AllIds, Self), State)
     ),
-    %% Onboard the joiner with a full snapshot (unavoidable O(names) for a fresh
-    %% member), carrying the whole member list so it monitors every peer — exactly
-    %% what the full path would send this one member.
-    RecordsBin = encode_records(current_records(State1#state.names_tab)),
-    cast_to_member(
-        MemberId,
-        {apply_names_snapshot, RecordsBin, Self, AllIds, Tokens, Epoch,
-            State1#state.applied_version}
-    ),
-    %% Existing followers keep their (prefix-consistent) replica; they only need to
-    %% learn to monitor the new member and record its token so their own future
-    %% {member_down} for it is correctly fenced.  No records travel here.
-    lists:foreach(
-        fun(Id) -> cast_to_member(Id, {peer_joined, MemberId, Tokens}) end,
-        [Id || Id <- AllIds, Id =/= Self, Id =/= MemberId]
-    ),
-    {reply, ok, State1};
+    %% A joiner that has never synced (fresh — a brand-new member, zero cost to
+    %% skip), or our own no-op re-join, holds no bindings: onboard immediately.
+    %% A **rejoining** previously-synced member, however, may hold divergent live
+    %% bindings from before it dropped out of the member set — the §5.6
+    %% partition-heal case, which under a *continuing* leader never passes through
+    %% the full handoff gather.  Gather its replica first (off this loop, bounded
+    %% by ?GATHER_TIMEOUT) and adjudicate it against our authoritative table in
+    %% the {joiner_gathered} continuation before onboarding, so a name reissued
+    %% while the member was away is repaired by termination rather than silently
+    %% overwritten with the old claimant left running.  Detection is best-effort:
+    %% an unanswerable joiner is onboarded anyway (same posture as the full
+    %% gather skipping an unreachable member).
+    case MemberId =:= Self orelse lists:member(MemberId, FreshIds) of
+        true ->
+            {reply, ok, onboard_joiner(MemberId, AllIds, Tokens, State1)};
+        false ->
+            spawn_joiner_gather(MemberId, AllIds, Tokens, Epoch, self()),
+            {reply, ok, State1}
+    end;
 handle_call(
     {elector_assume_and_distribute, MemberId, AllIds, Tokens, FreshIds, Epoch},
     _From,
     State = #state{member_id = Self}
 ) ->
-    %% Reconstruct the pid bindings from the freshest of every reachable member's
-    %% names map (our own replica + an RPC to each peer).  The freshest map *is* the
-    %% reconstructed state — its highest-version owner holds the freshest binding for
-    %% every name (broadcasts are totally ordered + FIFO, and gap detection ensures
-    %% every replica is a *prefix* of that stream — see applied_version).  A binding
-    %% that reached no surviving member (a crash gap on the lost holder) is simply
-    %% absent and may be re-issued: single-fault uniqueness, backstopped by
-    %% termination (§5.6), not by a durable taken-set.  MaxVersion (the freshest
-    %% applied version) becomes our applied_version and re-baselines the followers.
+    %% Genuine leadership change (a fresh leader, or a member_down that moved
+    %% leadership).  The reconstruction gathers the freshest of every reachable member's
+    %% replica — a **network** fan-out bounded by ?GATHER_TIMEOUT — so it runs **off this
+    %% loop**: the member keeps draining messages during the wait, and the elector's call
+    %% is answered `ok` immediately (an inline multi-second gather would time the
+    %% elector's call out and stall any membership change queued behind it, the churn
+    %% collapse).  A *consistent* snapshot of our own replica and applied_version is
+    %% captured now (so a broadcast landing during the gather cannot skew freshest-wins),
+    %% and the `{assume_gathered, …}` continuation finishes assuming when the gather
+    %% returns — iff `assume_ref` still matches (a newer assume, or a snapshot making us a
+    %% follower, harmlessly supersedes it).  Until then we are not yet leader/synced, so
+    %% writes block (no reachable leader) and are re-driven by the continuation, never
+    %% served against a half-built map.
     Tab = State#state.names_tab,
     SelfRecords = current_records(Tab),
     OtherIds = lists:delete(Self, AllIds),
-    {FreshestRecords, MaxVersion, PeerResults} = gather_maps(
-        SelfRecords, State#state.applied_version, OtherIds
+    Ref = make_ref(),
+    spawn_assume_gather(
+        {MemberId, AllIds, Tokens, FreshIds, Epoch, Ref},
+        SelfRecords,
+        State#state.applied_version,
+        OtherIds,
+        State#state.elector,
+        self()
     ),
-    PeerRecordMaps = [Recs || {Recs, _V, _Rel} <- maps:values(PeerResults)],
-    %% The gather is *incomplete* if a committed member did not respond (unreachable):
-    %% we may be missing its bindings, so the leader is `degraded` (§5.6).  Under
-    %% reject_when_degraded it then refuses new names that could be that member's.
-    %% Members the elector marked *fresh* (never synced — e.g. a brand-new joiner
-    %% whose join committed before it could connect) hold no bindings by definition
-    %% and are excluded, so a healthy scale-up does not flag a false degrade.
-    Unreachable = OtherIds -- maps:keys(PeerResults),
-    Degraded = lists:any(fun(Id) -> not lists:member(Id, FreshIds) end, Unreachable),
-    %% Merge every reachable member's released-pid trail into our own (§5.6): the
-    %% trail is what distinguishes "legitimately unregistered, reported by a lagging
-    %% member" from a genuine divergence, and it must survive leadership changes —
-    %% the previous leader (or any member that heard its unregister broadcasts) may
-    %% hold trail entries this new leader never recorded itself.
-    MergedReleased = lists:foldl(
-        fun({_Recs, _V, Rel}, Acc) -> maps:merge_with(fun(_P, A, B) -> max(A, B) end, Acc, Rel) end,
-        State#state.recently_released,
-        maps:values(PeerResults)
-    ),
-    %% Resolve genuine uniqueness conflicts the gather exposes (§5.6): two different
-    %% live pids for one name, which a partition can produce now that there is no
-    %% durable taken-set.  Conflict detection is about *pid* uniqueness, so it runs over
-    %% pid-only views derived from the gathered records.  Kill-both + alarm + bounded
-    %% budget; conflicted names are dropped (the fan-out below propagates the drop).  In
-    %% the common conflict-free handoff this is a no-op.
-    FreshestNames = record_pids(FreshestRecords),
-    {CleanNames, State0} = resolve_conflicts(
-        detect_conflicts(
-            FreshestNames,
-            [record_pids(SelfRecords) | [record_pids(M) || M <- PeerRecordMaps]],
-            MergedReleased
-        ),
-        FreshestNames,
-        State#state{recently_released = MergedReleased}
-    ),
-    %% Carry metadata on the surviving bindings: resolve_conflicts only ever *drops*
-    %% names, so the reconstructed records are the freshest records restricted to the
-    %% names that survived.
-    Records = maps:with(maps:keys(CleanNames), FreshestRecords),
-    %% Reconstruct the local replica (pid + metadata) and the inverted index from the
-    %% freshest gathered records (wholesale), then become (or remain) leader, monitoring
-    %% the reconstructed names (read back from the table by assume_leadership).
-    State0a = records_replace(State0, Records),
-    State1 = relinquish_leadership(State0a),
-    State2 = assume_leadership(State1#state{
-        leader = Self,
-        epoch = Epoch,
-        applied_version = MaxVersion,
-        degraded = Degraded
-    }),
-    State3 = add_member_monitors(extra_member_ids(MemberId, AllIds, Self), State2),
-    State4 = merge_peer_tokens(Tokens, State3),
-    %% Encode the snapshot once; every follower's cast then shares the one refc binary.
-    RecordsBin = encode_records(Records),
-    lists:foreach(
-        fun(Id) ->
-            cast_to_member(
-                Id,
-                {apply_names_snapshot, RecordsBin, Self, extra_member_ids(MemberId, AllIds, Id),
-                    Tokens, Epoch, MaxVersion}
-            )
-        end,
-        lists:delete(Self, AllIds)
-    ),
-    %% We are the leader now: any registrations we forwarded as a follower will
-    %% never be answered by the old leader — reject them so callers retry against
-    %% us.  Then commit anything buffered while we were assuming leadership.  The
-    %% gather made us synced (we hold state), and any outstanding resync request is
-    %% moot.
-    {reply, ok, maybe_start_commit(reject_forwards(mark_synced(cancel_resync(State4))))};
+    %% Clear the leader for the window: we are mid-handoff with no stable leader, so
+    %% writes block (no reachable leader) and are re-driven by the continuation — rather
+    %% than forwarding to the old, possibly-dead leader.  The continuation sets
+    %% leader=Self.  `synced` is left as-is; the continuation's mark_synced handles it.
+    {reply, ok, State#state{assume_ref = Ref, leader = undefined}};
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
 
@@ -959,6 +982,36 @@ handle_cast(
 handle_cast({register_req, Ref, FollowerId, _LogicalName, _Pid, _Meta}, State) ->
     cast_to_member(FollowerId, {register_reply, Ref, no}),
     {noreply, State};
+%% Leader: an unregister forwarded by a follower.  Same shape as the direct
+%% unregister call: capture our (authoritative) bound pid, optimistic delete, and
+%% park the removal; the origin is answered via {unregister_reply} once committed.
+handle_cast(
+    {unregister_req, Ref, FollowerId, LogicalName},
+    State = #state{leader = Leader, member_id = Leader, names_tab = Tab}
+) ->
+    ReleasedPid = lookup_name(Tab, LogicalName),
+    {noreply,
+        enqueue_op(
+            {remove, LogicalName, ReleasedPid, {forward_unreg, FollowerId, Ref}},
+            row_delete(State, LogicalName)
+        )};
+handle_cast({unregister_req, _Ref, _FollowerId, _LogicalName}, State) ->
+    %% Not the leader (the follower's leader belief was stale).  Deliberately no
+    %% reply: the follower keeps the removal stashed, and redrive_unregs/1 hands it
+    %% (pid-guarded) to the leader it learns from the snapshot/leadership change.
+    {noreply, State};
+%% Follower: the leader committed a forwarded unregister — answer the caller `ok`.
+%% FIFO puts this behind the batch's {name_unregistered} broadcast, so this member's
+%% row state reflects the removal by the time the caller sees the reply.
+handle_cast({unregister_reply, Ref}, State = #state{pending_forwards = PF}) ->
+    case maps:take(Ref, PF) of
+        {{unregister, _Name, _ReleasedPid, From}, PF1} ->
+            gen_server:reply(From, ok),
+            {noreply, State#state{pending_forwards = PF1}};
+        _ ->
+            %% Unknown Ref — already answered (e.g. re-driven on a leadership change).
+            {noreply, State}
+    end;
 %% Leader: a set_metadata forwarded by a follower.  Park it as a set_meta op whose
 %% origin is the forwarding member, answered via {set_meta_reply} once committed.
 handle_cast(
@@ -974,12 +1027,12 @@ handle_cast({set_meta_req, Ref, FollowerId, _LogicalName, _Index, _Data}, State)
 %% Follower: the leader's answer to a forwarded set_metadata.  By now the matching
 %% {metadata_set} broadcast (FIFO ahead of this) has updated our row, so answering the
 %% caller here preserves read-after-write for a subsequent local get_metadata.
-handle_cast({set_meta_reply, Ref, Result}, State = #state{meta_forwards = MetaForwards}) ->
-    case maps:take(Ref, MetaForwards) of
-        {From, MetaForwards1} ->
+handle_cast({set_meta_reply, Ref, Result}, State = #state{pending_forwards = PF}) ->
+    case maps:take(Ref, PF) of
+        {{set_meta, From}, PF1} ->
             gen_server:reply(From, Result),
-            {noreply, State#state{meta_forwards = MetaForwards1}};
-        error ->
+            {noreply, State#state{pending_forwards = PF1}};
+        _ ->
             %% Unknown Ref — already answered (e.g. rejected on a leadership change).
             {noreply, State}
     end;
@@ -1021,23 +1074,22 @@ handle_cast(
 handle_cast({whereis_req, _LogicalName, From}, State) ->
     gen_server:reply(From, undefined),
     {noreply, State};
-%% Follower: the leader's answer to a forwarded registration.  Apply the optimistic
-%% names update on yes (making this member the binding's confirmed second holder),
-%% then answer the original caller.
-handle_cast({register_reply, Ref, Result}, State = #state{forwards = Forwards}) ->
-    case maps:take(Ref, Forwards) of
-        {{LogicalName, Pid, {Index, Data}, From}, Forwards1} ->
-            State1 =
-                case Result of
-                    yes -> row_insert(State, LogicalName, Pid, Index, Data);
-                    no -> State
-                end,
-            gen_server:reply(From, Result),
-            {noreply, State1#state{forwards = Forwards1}};
-        error ->
-            %% Unknown Ref — already answered (e.g. rejected on a leadership change).
-            {noreply, State}
-    end;
+%% Follower: the leader's answer to a forwarded registration.  The committed form
+%% carries the batch's commit Version so the ack can be **version-guarded** (§5.5):
+%% a `yes` is answered only when this member's replica has genuinely applied up to
+%% that version — normally already true, because the batch's {name_registered}
+%% broadcast precedes the reply (FIFO) — making the forwarding follower a
+%% version-visible second holder the handoff gather (§5.7) is guaranteed to see.
+%% If the broadcast was gap-refused (this member missed an earlier batch and is
+%% awaiting a resync), the ack is deferred until the resync lands rather than
+%% answered against a replica whose extra row freshest-wins reconstruction would
+%% ignore — the fix for the silent-loss window a single leader crash could open.
+handle_cast({register_reply, Ref, Result, Version}, State) ->
+    {noreply, handle_register_reply(Ref, Result, Version, State)};
+%% Legacy 3-tuple reply (a pre-version leader during a rolling upgrade): no version
+%% to guard on — apply the old immediate behaviour (Version 0 always =< applied).
+handle_cast({register_reply, Ref, Result}, State) ->
+    {noreply, handle_register_reply(Ref, Result, 0, State)};
 %% Follower: the leader asks us to confirm we hold a batch's bindings.  This cast
 %% arrives (FIFO) after the batch's {name_registered} casts, so normally we have
 %% applied them and hold the bindings — ack back to the leader.  The ack is
@@ -1095,16 +1147,19 @@ handle_cast(
     State
 ) ->
     %% ReleasedPid is the live pid this unregister explicitly released (`undefined`
-    %% for a death-driven cleanup).  Recording it keeps every member's copy of the
-    %% conflict-detector trail (§5.6) in step, so the trail survives leadership
-    %% changes via the handoff gather merge.
+    %% for a death-driven cleanup).  Recording it — keyed by {Name, Pid}, so a
+    %% release under one name never masks a conflict on another name the same pid
+    %% holds — keeps every member's copy of the conflict-detector trail (§5.6) in
+    %% step, so the trail survives leadership changes via the handoff gather merge.
     Apply = fun(S0) ->
         S1 = row_delete(S0, LogicalName),
         case is_pid(ReleasedPid) of
             true ->
                 Rel = S1#state.recently_released,
                 S1#state{
-                    recently_released = Rel#{ReleasedPid => erlang:system_time(millisecond)}
+                    recently_released = Rel#{
+                        {LogicalName, ReleasedPid} => erlang:system_time(millisecond)
+                    }
                 };
             false ->
                 S1
@@ -1158,6 +1213,13 @@ handle_cast({retract_req, LogicalName, Pid}, State = #state{leader = Leader}) wh
 ->
     cast_to_member(Leader, {retract_req, LogicalName, Pid}),
     {noreply, State};
+handle_cast({retract_req, LogicalName, Pid}, State) ->
+    %% No leader right now — most likely this member is mid-handoff (the assume
+    %% window, where leader is transiently `undefined`).  Stash the pid-guarded clear
+    %% in `pending_unregs` rather than dropping it, so the assume continuation
+    %% (redrive_unregs) re-drives it once a leader is established — otherwise a
+    %% re-driven unregister that lands during a handoff would be silently lost.
+    {noreply, stash_pending_unreg(LogicalName, Pid, State)};
 %% Leadership transition snapshot sent by the new leader to all followers.
 %% Applies the leader transition, the record update (pid + metadata per name), and
 %% extra member monitors atomically within a single cast — no other message can
@@ -1177,18 +1239,30 @@ handle_cast(
             %% this member synced (its first snapshot re-announces `fresh = false`).
             State0 = records_replace(cancel_resync(State), decode_records(RecordsPayload)),
             State1 = do_leader_changed(NewLeader, OldLeader, Self, State0),
-            State2 = State1#state{epoch = Epoch, applied_version = Version},
+            %% A leader's snapshot supersedes any assume gather we had in flight (we are
+            %% a follower of NewLeader now): drop its ref so the stale {assume_gathered}
+            %% continuation is ignored when it lands.
+            State2 = State1#state{epoch = Epoch, applied_version = Version, assume_ref = undefined},
             State3 = add_member_monitors(ExtraMembers, State2),
             State4 = merge_peer_tokens(Tokens, State3),
             %% Handle any buffered ops under the new leadership view: reject them
-            %% if we are now a follower, or commit them if we remain leader.
-            {noreply, maybe_start_commit(mark_synced(State4))};
+            %% if we are now a follower, or commit them if we remain leader.  The
+            %% snapshot advanced applied_version, so release any forwarded-`yes`
+            %% acks that were deferred on a gap (flush_deferred; a leadership
+            %% change already rejected them in do_leader_changed), and re-drive any
+            %% stashed unregisters and blocked registrations against the now-known
+            %% leader (redrive_unregs / redrive_registers).
+            {noreply,
+                maybe_start_commit(
+                    redrive_registers(redrive_unregs(flush_deferred(mark_synced(State4))))
+                )};
         false ->
             {noreply, State}
     end;
-%% Leader: optimistically remove from the local replica (ETS) so that whereis_name
-%% returns undefined immediately (a caller-side lookup sees the delete at once), then
-%% park the durable removal in the group-commit buffer.
+%% Legacy fire-and-forget unregister casts (from a pre-call node during a rolling
+%% upgrade).  The public API now routes unregisters as tracked calls (see the
+%% {unregister} handle_call clauses); these keep the old wire shape working with
+%% the old (silent-drop) semantics.
 handle_cast(
     {unregister, LogicalName},
     State = #state{leader = Leader, member_id = Leader, names_tab = Tab}
@@ -1199,10 +1273,8 @@ handle_cast(
     %% broadcast.  A bound pid is also recorded in `recently_released` on commit (the
     %% conflict-detector trail, §5.6).
     ReleasedPid = lookup_name(Tab, LogicalName),
-    {noreply, enqueue_op({remove, LogicalName, ReleasedPid}, row_delete(State, LogicalName))};
-%% Follower: delete from the local replica immediately, then forward to leader.
-%% The immediate table delete ensures a caller-side `whereis_name/1` on this node
-%% returns undefined before the replication cast arrives from the leader.
+    {noreply,
+        enqueue_op({remove, LogicalName, ReleasedPid, undefined}, row_delete(State, LogicalName))};
 handle_cast({unregister, LogicalName}, State = #state{leader = Leader}) when
     Leader =/= undefined
 ->
@@ -1215,8 +1287,34 @@ handle_cast({unregister, LogicalName}, State = #state{leader = Leader}) when
 %% genuine leadership change the new leader still re-snapshots everyone the full way.)
 handle_cast({peer_joined, MemberId, Tokens}, State) ->
     {noreply, merge_peer_tokens(Tokens, add_member_monitors([MemberId], State))};
+%% A durable presence subscription changed (§4.9): the elector pushes the delta to the
+%% current leader.  Apply it only if we are still the leader for a current-or-newer
+%% epoch — a stale push (we were deposed) is dropped and the survivor gets the full set
+%% reseeded on its assume.  A `subscribe` seeds the subscription's watch membership and
+%% fires its initial snapshot; an `unsubscribe` drops it.
+handle_cast(
+    {presence_update, Update, Epoch},
+    State = #state{member_id = Self, leader = Self, epoch = Cur}
+) when Epoch >= Cur ->
+    {noreply, apply_presence_update(Update, State)};
+handle_cast({presence_update, _Update, _Epoch}, State) ->
+    {noreply, State};
 handle_cast(_, State) ->
     {noreply, State}.
+
+%% Apply a pushed subscription delta to the leader's live presence state.
+apply_presence_update({subscribe, SubId, Watch, Notify}, State = #state{subs = Subs}) ->
+    seed_subscription(SubId, State#state{subs = Subs#{SubId => {Watch, Notify}}});
+apply_presence_update(
+    {unsubscribe, SubId}, State = #state{subs = Subs, sub_matches = SM, notify_matches = NM}
+) ->
+    State#state{
+        subs = maps:remove(SubId, Subs),
+        sub_matches = maps:remove(SubId, SM),
+        notify_matches = maps:remove(SubId, NM)
+    };
+apply_presence_update(unsubscribe_all, State) ->
+    State#state{subs = #{}, sub_matches = #{}, notify_matches = #{}}.
 
 %% ---------------------------------------------------------------------------
 %% handle_info/2
@@ -1340,92 +1438,173 @@ handle_info({'DOWN', Ref, process, _Pid, _Reason}, State) ->
             spawn_member_down(Elector, DeadMemberId, Cached),
             {noreply, remove_member(DeadMemberId, State)}
     end;
-handle_info({nodeup, Node}, State = #state{elector = Elector, member_id = Self}) ->
+handle_info({nodeup, _Node}, State = #state{elector = Elector, member_id = Self, leader = Leader}) ->
     %% Re-announce to the elector — this member may have been removed from the
     %% member set while the node was unreachable (partition).  A fresh token is
     %% generated so any stale {member_down, Self, OldToken} already in the queue
-    %% is discarded by the elector when it is eventually processed.
+    %% is discarded by the elector when it is eventually processed.  (The mesh
+    %% re-connect and probe-gate bookkeeping for this nodeup live in the connector,
+    %% which subscribes to node events independently.)
     NewToken = make_ref(),
     dgen_server:cast(Elector, {join, Self, NewToken, not State#state.synced}),
-    %% The node is reachable again — clear any mesh suppression for it and re-run the
-    %% mesh pass so we also reconnect to any other members we may have lost touch with.
-    RD = maps:remove(Node, State#state.recently_down),
-    self() ! mesh_connect,
-    {noreply, State#state{join_token = NewToken, recently_down = RD}};
-%% A node dropped: remember it briefly so the mesh does not immediately reconnect it
-%% (let the departure settle as a {member_down}).  Departure itself is driven by the
-%% per-member erlang:monitor DOWN; the delayed reap below is only a backstop for when
-%% that DOWN's {member_down} is fenced away as stale (see ?REAP_INTERVAL).
-handle_info({nodedown, Node}, State = #state{recently_down = RD}) ->
-    schedule_reap(Node, ?REAP_ATTEMPTS),
-    {noreply, State#state{recently_down = RD#{Node => erlang:system_time(millisecond)}}};
-%% Backstop reap: while `Node` is still disconnected, report `member_down` for any member
-%% the elector still lists on it, then re-arm for a few attempts.  Stops as soon as the
-%% node reconnects (a live member re-announces and its `{join}` wins over our
-%% `{member_down}` regardless of ordering) or the attempts run out.  Reads the elector and
-%% casts only — it never opens a connection, so it is safe alongside partition detection.
-handle_info({reap_down, _Node, 0}, State) ->
+    %% A nodeup is a partition heal: if the leader we already know is now reachable
+    %% again, re-drive any unregisters retained while it was unreachable *immediately*,
+    %% rather than waiting for the re-onboarding snapshot that also triggers
+    %% redrive_unregs/1.  This covers both ways an unregister survives a partition — a
+    %% removal *stashed* because the leader was already seen unreachable (`pending_unregs`)
+    %% and one *forwarded into the dying link* before the disconnect propagated
+    %% (`pending_forwards`) — so the Non-goal-5 guarantee ("an explicit unregister is
+    %% never silently lost") does not hinge on the snapshot arriving.  Pid-guarded and
+    %% stash-clearing, so it composes harmlessly with the snapshot path.
+    %%
+    %% Guarded on the leader being reachable (or us): redrive_unregs/1 forwards and clears
+    %% the stash unconditionally (safe on the snapshot path, where the snapshot's sender
+    %% is by definition reachable), so calling it here while the leader is still
+    %% unreachable would drop the retract into a dropped cast *and* clear the stash —
+    %% losing it.  A different node's nodeup with our leader still unreachable is left for
+    %% the snapshot / a later heal.
+    State1 = State#state{join_token = NewToken},
+    LeaderReachable =
+        Leader =:= Self orelse (Leader =/= undefined andalso member_reachable(Leader)),
+    {noreply,
+        case LeaderReachable of
+            true -> redrive_unregs(State1);
+            false -> State1
+        end};
+%% Continuation of the continuing-leader fast path for a rejoining (non-fresh)
+%% member: its replica snapshot arrived from the gather helper.  Adjudicate it
+%% against our authoritative table (§5.6) — a name a rejoiner still binds to a
+%% *different, live, un-trailed* pid than ours is a genuine conflict, resolved by
+%% kill-both under the usual budget/alarm/config — then onboard the joiner with
+%% our snapshot.  The killed authority's monitor DOWN drives the normal
+%% unregister/broadcast cleanup, so no bespoke removal path is needed.  The
+%% joiner's release trail is merged either way (the same merge the full-path
+%% gather does), so a legitimately-unregistered-but-lagging row is suppressed,
+%% not killed.  Guarded on leadership, epoch, and current membership: a handoff
+%% or re-join that superseded this gather owns the onboarding instead.
+handle_info(
+    {joiner_gathered, MemberId, AllIds, Tokens, Epoch, Result},
+    State = #state{member_id = Self, leader = Self, epoch = Epoch, members = Members}
+) when is_map_key(MemberId, Members) ->
+    State1 =
+        case Result of
+            {ok, {Records, _Version, Released}} ->
+                MergedReleased = maps:merge_with(
+                    fun(_K, A, B) -> max(A, B) end,
+                    State#state.recently_released,
+                    Released
+                ),
+                OwnPids = record_pids(current_records(State#state.names_tab)),
+                Conflicts = detect_conflicts(OwnPids, [record_pids(Records)], MergedReleased),
+                {_Names, S1} = resolve_conflicts(
+                    Conflicts, OwnPids, State#state{recently_released = MergedReleased}
+                ),
+                S1;
+            error ->
+                %% The joiner did not answer in time — onboard it regardless; a
+                %% divergence it still holds will surface at the next gather.
+                State
+        end,
+    {noreply, onboard_joiner(MemberId, AllIds, Tokens, State1)};
+handle_info({joiner_gathered, _MemberId, _AllIds, _Tokens, _Epoch, _Result}, State) ->
+    %% Superseded (leadership/epoch moved, or the joiner left the set) while the
+    %% gather was in flight — whatever superseded it re-snapshots the member.
     {noreply, State};
-handle_info({reap_down, Node, N}, State = #state{elector = Elector, member_id = {SelfNode, _}}) ->
-    case Node =:= SelfNode orelse lists:member(Node, nodes()) of
-        true ->
-            ok;
-        false ->
-            spawn_reap(Elector, Node),
-            schedule_reap(Node, N - 1)
-    end,
-    {noreply, State};
-%% Periodic leader-liveness probe (see ?LEADER_PROBE_GRACE).  If the elector's current
-%% leader sits on a node that is neither ours nor connected, reap that node so a
-%% reachable member re-elects.  This is the only failover trigger for a leader we were
-%% never connected to (no `nodedown` ever fired for it).  Reachable, self, or
-%% not-yet-elected leaders are left untouched.  Runs off the loop — `spawn_probe_leader`
-%% reads the elector and casts only, opening no connection, so like the reap backstop it
-%% cannot heal the partition it reacts to.
-handle_info(probe_leader, State = #state{elector = Elector, member_id = {SelfNode, _}}) ->
-    erlang:send_after(?LEADER_PROBE_INTERVAL, self(), probe_leader),
-    spawn_probe_leader(Elector, SelfNode),
-    {noreply, State};
-%% Converge Erlang distribution to a full mesh: read the authoritative member set
-%% from the elector (a DB-backed read, so it is the same on every node regardless of
-%% which one consumed the joins) and connect to every member node not currently
-%% suppressed (recently down).  The read runs in a short-lived helper so the
-%% (potentially slow, durable-queue) `get_members` call never blocks the member's
-%% loop; the helper reports the member set back as `{mesh_members, _}`, and the
-%% suppression decision + connect are made *there* — in this process's mailbox,
-%% strictly ordered after any `{nodedown, _}` — so an in-flight fetch cannot
-%% reconnect a node that went down while it was running (see the mesh_members
-%% clause).  A connect that succeeds fires `nodeup`, which drives the rejoin +
-%% snapshot so a freshly-meshed node is brought fully up to date.
-handle_info(mesh_connect, State = #state{elector = Elector}) ->
-    erlang:send_after(?MESH_INTERVAL, self(), mesh_connect),
-    Now = erlang:system_time(millisecond),
-    RD = maps:filter(
-        fun(_Node, Ts) -> Ts >= Now - ?MESH_DOWN_COOLDOWN end, State#state.recently_down
+%% The asynchronous handoff gather (spawn_assume_gather) has returned: finish assuming
+%% leadership with the freshest reconstruction, off the critical path the elector's call
+%% was on.  Applied only if `assume_ref` still matches — a newer assume, or a snapshot
+%% that made us a follower, has since replaced it and owns reconstruction instead.
+%%
+%% This is exactly the reconstruction the inline handler used to do, just deferred to
+%% here: the freshest map *is* the reconstructed state (its highest-version owner holds
+%% the freshest binding for every name — broadcasts are totally ordered + FIFO, and gap
+%% detection keeps every replica a prefix of that stream; a binding no surviving member
+%% held is absent and may be re-issued, single-fault uniqueness backstopped by §5.6, not
+%% a durable taken-set).  MaxVersion becomes our applied_version and re-baselines the
+%% followers.
+handle_info(
+    {assume_gathered, {MemberId, AllIds, Tokens, FreshIds, Epoch, Ref}, SelfRecords,
+        FreshestRecords, MaxVersion, PeerResults, Subs},
+    State = #state{member_id = Self, assume_ref = Ref}
+) ->
+    OtherIds = lists:delete(Self, AllIds),
+    PeerRecordMaps = [Recs || {Recs, _V, _Rel} <- maps:values(PeerResults)],
+    %% Incomplete gather (a committed, non-fresh member did not respond → unreachable):
+    %% we may be missing its bindings, so the leader is `degraded` (§5.6).  A member the
+    %% elector marked *fresh* (never synced) holds nothing, so its absence is not a
+    %% degrade — a healthy scale-up does not flag one.
+    Unreachable = OtherIds -- maps:keys(PeerResults),
+    Degraded = lists:any(fun(Id) -> not lists:member(Id, FreshIds) end, Unreachable),
+    %% Merge every reachable member's released-pid trail into our own (§5.6): the trail
+    %% distinguishes "legitimately unregistered, reported by a lagging member" from a
+    %% genuine divergence, and must survive leadership changes.
+    MergedReleased = lists:foldl(
+        fun({_Recs, _V, Rel}, Acc) -> maps:merge_with(fun(_P, A, B) -> max(A, B) end, Acc, Rel) end,
+        State#state.recently_released,
+        maps:values(PeerResults)
     ),
-    spawn_mesh_fetch(Elector, self()),
-    {noreply, State#state{recently_down = RD}};
-%% The mesh fetch helper reports the authoritative member node list.  Deciding
-%% suppression *here* (not in the helper, at spawn time) is what makes partition
-%% detection reliable: a mesh fetch spawned just before a node dropped carries no
-%% knowledge of the drop, and computing the suppression set from its stale snapshot
-%% would reconnect the very node the member is trying to remove — healing the
-%% partition before the `{member_down}` can settle, so the departure is never
-%% observed.  Because this message is processed on the member's mailbox, it is
-%% strictly ordered after the `{nodedown, Node}` the drop enqueued, so `recently_down`
-%% already reflects the drop and the node is suppressed.  The actual `connect_node`
-%% handshakes run off-process (they can block on an unreachable node).
-handle_info({mesh_members, MemberNodes}, State = #state{member_id = {SelfNode, _}}) ->
-    Now = erlang:system_time(millisecond),
-    RD = maps:filter(
-        fun(_Node, Ts) -> Ts >= Now - ?MESH_DOWN_COOLDOWN end, State#state.recently_down
+    %% Resolve genuine uniqueness conflicts the gather exposes (§5.6) — kill-both +
+    %% alarm + bounded budget; conflicted names are dropped (the fan-out propagates the
+    %% drop).  A no-op in the common conflict-free handoff.
+    FreshestNames = record_pids(FreshestRecords),
+    {CleanNames, State0} = resolve_conflicts(
+        detect_conflicts(
+            FreshestNames,
+            [record_pids(SelfRecords) | [record_pids(M) || M <- PeerRecordMaps]],
+            MergedReleased
+        ),
+        FreshestNames,
+        State#state{recently_released = MergedReleased}
     ),
-    Targets = [
-        Node
-     || Node <- MemberNodes, Node =/= SelfNode, not maps:is_key(Node, RD)
-    ],
-    spawn_mesh_connect(Targets),
-    {noreply, State#state{recently_down = RD}};
+    %% Metadata rides the surviving bindings (resolve_conflicts only ever *drops* names).
+    Records = maps:with(maps:keys(CleanNames), FreshestRecords),
+    %% Reconstruct the local replica (pid + metadata) + inverted index wholesale, then
+    %% become leader, monitoring the reconstructed names.  Clearing assume_ref marks the
+    %% assume complete.
+    State0a = records_replace(State0, Records),
+    State1 = relinquish_leadership(State0a),
+    %% Seed the durable presence subscriptions (§4.9) with the set the gather helper
+    %% pulled from the co-located elector off this loop (`Subs`) — *before* assuming, so
+    %% assume_leadership -> recompute_sub_matches computes each watch set against the
+    %% reconstructed replica.  A silent reseed — it does not re-fire initial snapshots;
+    %% subscribers keep their view, and a subscribe racing the last moment of the handoff
+    %% pushes a {presence_update} delta we apply once established as leader below.
+    State2 = assume_leadership(State1#state{
+        leader = Self,
+        epoch = Epoch,
+        applied_version = MaxVersion,
+        degraded = Degraded,
+        assume_ref = undefined,
+        subs = Subs
+    }),
+    State3 = add_member_monitors(extra_member_ids(MemberId, AllIds, Self), State2),
+    State4 = merge_peer_tokens(Tokens, State3),
+    %% Encode the snapshot once; every follower's cast shares the one refc binary.
+    RecordsBin = encode_records(Records),
+    lists:foreach(
+        fun(Id) ->
+            cast_to_member(
+                Id,
+                {apply_names_snapshot, RecordsBin, Self, extra_member_ids(MemberId, AllIds, Id),
+                    Tokens, Epoch, MaxVersion}
+            )
+        end,
+        OtherIds
+    ),
+    %% We are the leader now: reject any registrations we forwarded as a follower (the
+    %% old leader will never answer them), re-drive stashed unregisters and blocked
+    %% registrations into our own commit buffer, then commit anything buffered while we
+    %% assumed.  The gather made us synced; any outstanding resync is moot.
+    {noreply,
+        maybe_start_commit(
+            redrive_registers(
+                redrive_unregs(reject_forwards(mark_synced(cancel_resync(State4))))
+            )
+        )};
+handle_info({assume_gathered, _Ctx, _SelfRecords, _Freshest, _MaxV, _PeerResults, _Subs}, State) ->
+    %% Superseded (a newer assume, or a snapshot made us a follower) while the gather
+    %% was in flight — the current assume, or the leader, owns reconstruction now.
+    {noreply, State};
 %% Periodic maintenance: expire stale entries from the conflict-detection trail
 %% (§5.6) and the per-name kill-budget timestamps, then re-arm.  Trail pruning is
 %% suspended while any current member is disconnected: a disconnected member misses
@@ -1439,14 +1618,21 @@ handle_info(
     erlang:send_after(?PRUNE_INTERVAL, self(), prune_released),
     Now = erlang:system_time(millisecond),
     AllConnected = lists:all(
-        fun({Node, _Name}) -> Node =:= node() orelse lists:member(Node, nodes()) end,
+        fun({Node, _Name}) -> dgen_utils:node_reachable(Node) end,
         maps:keys(Members)
     ),
+    TTL = dgen_config:conflict_release_ttl(Config),
+    %% Pruning is also suspended within a TTL of the most recent member departure:
+    %% a member dropped from the set (so no longer "a disconnected member") may
+    %% rejoin with stale rows, and the trail must still discriminate lag from
+    %% divergence at that rejoin's gather (§5.6).  A member gone longer than the
+    %% TTL is outside the trail's protection horizon either way.
+    RecentDeparture = Now - State#state.last_departure < TTL,
     Rel1 =
-        case AllConnected of
+        case AllConnected andalso not RecentDeparture of
             true ->
-                Cutoff = Now - dgen_config:conflict_release_ttl(Config),
-                maps:filter(fun(_Pid, Ts) -> Ts >= Cutoff end, Rel);
+                Cutoff = Now - TTL,
+                maps:filter(fun(_Key, Ts) -> Ts >= Cutoff end, Rel);
             false ->
                 Rel
         end,
@@ -1455,7 +1641,9 @@ handle_info(
         fun(_Name, Tss) -> Tss =/= [] end,
         maps:map(fun(_Name, Tss) -> [Ts || Ts <- Tss, Ts >= Now - Window] end, KB)
     ),
-    {noreply, State#state{recently_released = Rel1, kill_budget = KB1}};
+    %% Also drop stashed registrations whose callers have timed out (bounds
+    %% pending_registers while no leader appears — see the field doc).
+    {noreply, prune_pending_registers(State#state{recently_released = Rel1, kill_budget = KB1})};
 %% The resync request we sent went unanswered (dropped cast, deposed target) —
 %% clear the guard so the next gap-observing broadcast requests again.
 handle_info(resync_timeout, State) ->
@@ -1473,7 +1661,7 @@ handle_info({requeue_ops, Ops}, State = #state{leader = Leader, member_id = Self
 handle_info({requeue_ops, Ops}, State = #state{leader = Leader}) when Leader =/= undefined ->
     lists:foreach(
         fun
-            ({remove, Name, Pid}) when is_pid(Pid) -> forward_retract(Leader, Name, Pid);
+            ({remove, Name, Pid, _Origin}) when is_pid(Pid) -> forward_retract(Leader, Name, Pid);
             ({retract, Name, Pid}) -> forward_retract(Leader, Name, Pid);
             %% A remove that never had a bound pid nets to nothing; a down is the
             %% new leader's to observe via its own monitor.
@@ -1482,9 +1670,22 @@ handle_info({requeue_ops, Ops}, State = #state{leader = Leader}) when Leader =/=
         Ops
     ),
     {noreply, State};
-handle_info({requeue_ops, _Ops}, State) ->
-    %% No leader to hand these to — drop; a later handoff gather reconciles.
-    {noreply, State};
+handle_info({requeue_ops, Ops}, State) ->
+    %% No leader right now (likely mid-handoff — the assume window, leader =
+    %% undefined).  Stash the pid-guarded clears in `pending_unregs` so the assume
+    %% continuation (or the next snapshot) re-drives them, rather than dropping them
+    %% and leaving a divergence until an unrelated handoff.  Downs are dropped — the
+    %% new leader monitors those pids itself.
+    Stashed = lists:foldl(
+        fun
+            ({remove, Name, Pid, _Origin}, S) when is_pid(Pid) -> stash_pending_unreg(Name, Pid, S);
+            ({retract, Name, Pid}, S) -> stash_pending_unreg(Name, Pid, S);
+            (_, S) -> S
+        end,
+        State,
+        Ops
+    ),
+    {noreply, Stashed};
 %% Periodic durable-epoch check (piggybacked on the mesh pass): the election record
 %% in the database is ahead of what this member has heard.  That means a leadership
 %% handoff happened that never reached us — the elector's post-commit assume action
@@ -1550,7 +1751,27 @@ assume_leadership(State = #state{names_tab = Tab}) ->
         {#{}, #{}},
         Names
     ),
-    State#state{name_to_ref = NTR, ref_to_name = RTN}.
+    %% Seed each subscription's watch-set membership from the reconstructed replica, so
+    %% the first commit under this leadership computes its deltas against the true
+    %% current state (§4.9).  Leader-only derived state — a follower never reads it.
+    recompute_sub_matches(State#state{name_to_ref = NTR, ref_to_name = RTN}).
+
+%% Recompute every subscription's watch-set and notify-set membership
+%% (`#{SubId => #{Name => Pid}}` each) by running its watch/notify queries against the
+%% current replica.  Called on assuming leadership (the only time the maps must be rebuilt
+%% from scratch); thereafter apply_committed_plan keeps them current incrementally.  A
+%% silent reseed — it does not re-fire snapshots; the new leader just advances deltas
+%% correctly from here (subscribers keep the view they already had).
+recompute_sub_matches(State = #state{subs = Subs, names_tab = Tab, inv_index = Inv}) ->
+    SM = maps:map(
+        fun(_SubId, {Watch, _Notify}) -> query_match_names(Watch, Tab, Inv) end,
+        Subs
+    ),
+    NM = maps:map(
+        fun(_SubId, {_Watch, Notify}) -> query_match_names(Notify, Tab, Inv) end,
+        Subs
+    ),
+    State#state{sub_matches = SM, notify_matches = NM}.
 
 %% Demonitor all registered Pids; keep the names map for snapshot reads.  The
 %% cached commit version is dropped too — it is this member's term and must not pin a
@@ -1592,6 +1813,80 @@ gather_maps(SelfNames, SelfVersion, OtherIds) ->
         PeerResults
     ),
     {FreshestNames, MaxVersion, PeerResults}.
+
+%% Onboard a joining member on the continuing-leader fast path: ship it our full
+%% snapshot (unavoidable O(names) for one member — exactly what the full path would
+%% send it), carrying the member list so it monitors every peer, and tell the
+%% existing followers to monitor the joiner via a small token-only {peer_joined}
+%% (their prefix-consistent replicas are untouched — no records travel there).
+onboard_joiner(MemberId, AllIds, Tokens, State = #state{member_id = Self, epoch = Epoch}) ->
+    RecordsBin = encode_records(current_records(State#state.names_tab)),
+    cast_to_member(
+        MemberId,
+        {apply_names_snapshot, RecordsBin, Self, AllIds, Tokens, Epoch, State#state.applied_version}
+    ),
+    lists:foreach(
+        fun(Id) -> cast_to_member(Id, {peer_joined, MemberId, Tokens}) end,
+        [Id || Id <- AllIds, Id =/= Self, Id =/= MemberId]
+    ),
+    State.
+
+%% Fetch a rejoining member's replica snapshot off the leader's loop (bounded by
+%% member_names/1's ?GATHER_TIMEOUT; an unreachable joiner fast-fails), reporting
+%% back as {joiner_gathered, …} for the fast-path §5.6 adjudication.  AllIds/Tokens
+%% ride along so the continuation onboards with exactly the member list the elector
+%% committed for this join event.
+spawn_joiner_gather(MemberId, AllIds, Tokens, Epoch, Owner) ->
+    _ = spawn(fun() ->
+        Owner ! {joiner_gathered, MemberId, AllIds, Tokens, Epoch, member_names(MemberId)}
+    end),
+    ok.
+
+%% Run the full handoff gather (the peer-snapshot RPCs, bounded overall by
+%% ?GATHER_TIMEOUT) off the member's loop, reporting the freshest reconstruction back as
+%% {assume_gathered, …} for the continuation to finish assuming leadership (§5.7).
+%% `SelfRecords` / `SelfVersion` are captured by the caller — a consistent snapshot of
+%% our own replica — so a broadcast that lands during the gather cannot skew the
+%% freshest-wins comparison.  `Ctx` carries the elector's assume payload plus the
+%% correlation ref the continuation matches against `assume_ref`.
+%%
+%% The durable presence subscriptions (§4.9) are pulled from the co-located `Elector`
+%% here too — **off the member's loop, deliberately**: doing it in the continuation
+%% (on the loop) would be a synchronous member→elector call that can dead-lock against
+%% the elector's own synchronous assume call back into this member (both block until a
+%% timeout fires).  Pulling in this helper keeps the member loop responsive, and reading
+%% after the gather means any subscribe committed during the (up to ~?GATHER_TIMEOUT)
+%% gather is captured; a subscribe racing the final millisecond pushes a
+%% {presence_update} delta the now-established leader applies.
+spawn_assume_gather(Ctx, SelfRecords, SelfVersion, OtherIds, Elector, Owner) ->
+    _ = spawn(fun() ->
+        %% Fall back to a self-only reconstruction if the gather ever throws, so the
+        %% continuation still fires and the member is never stranded leaderless (it
+        %% assumes with its own replica, degraded — a later handoff reconciles).
+        {FreshestRecords, MaxVersion, PeerResults} =
+            try
+                gather_maps(SelfRecords, SelfVersion, OtherIds)
+            catch
+                _:_ -> {SelfRecords, SelfVersion, #{}}
+            end,
+        Subs = fetch_subscriptions(Elector),
+        Owner ! {assume_gathered, Ctx, SelfRecords, FreshestRecords, MaxVersion, PeerResults, Subs}
+    end),
+    ok.
+
+%% Read the durable subscription set from the (co-located) elector — best-effort, under a
+%% short bound so a momentarily-busy elector cannot stall the gather helper: on timeout
+%% the leader assumes with the empty set and a later {presence_update} delta / the next
+%% handoff reconciles.  Called only from off-loop helpers (never the member loop).
+fetch_subscriptions(Elector) when is_pid(Elector) ->
+    try dgen_server:priority_call(Elector, get_subscriptions, ?SUBS_PULL_TIMEOUT) of
+        Subs when is_map(Subs) -> Subs;
+        _ -> #{}
+    catch
+        _:_ -> #{}
+    end;
+fetch_subscriptions(_Elector) ->
+    #{}.
 
 %% Fan out one member_names/1 helper per peer and collect the answers under a
 %% single overall deadline.  Late answers (a peer that responds after the deadline)
@@ -1656,7 +1951,7 @@ detect_conflicts(FreshestNames, AllMaps, Released) ->
             Authority = maps:get(Name, FreshestNames, undefined),
             Others = [
                 P
-             || P <- maps:keys(PidSet), P =/= Authority, not maps:is_key(P, Released)
+             || P <- maps:keys(PidSet), P =/= Authority, not released_entry(Name, P, Released)
             ],
             case Others =:= [] orelse not (is_pid(Authority) andalso is_pid_alive(Authority)) of
                 true ->
@@ -1671,6 +1966,15 @@ detect_conflicts(FreshestNames, AllMaps, Released) ->
         [],
         ByName
     ).
+
+%% Was this pid explicitly released *from this name* recently?  Trail keys are
+%% {Name, Pid} pairs, so releasing a pid under one of its names never suppresses a
+%% genuine conflict on another name the same pid also holds.  Bare-pid keys — the
+%% legacy trail shape, seen in a pre-upgrade member's gathered trail during a
+%% rolling upgrade — are honoured too (the coarser, name-agnostic suppression the
+%% old code applied), until the mixed entries age out of the TTL.
+released_entry(Name, Pid, Released) ->
+    maps:is_key({Name, Pid}, Released) orelse maps:is_key(Pid, Released).
 
 %% Resolve detected conflicts (§5.6).  Kill-both (terminate the authority pid and
 %% every divergent pid), drop the name from the reconstructed map (the snapshot
@@ -1781,6 +2085,135 @@ reject_new_when_degraded(Name, #state{degraded = true, names_tab = Tab, config =
 reject_new_when_degraded(_Name, _State) ->
     false.
 
+%% Route a registration to wherever it must go, deferring the caller's reply in every
+%% case except an adjudicated refusal.  `no` is answered *only* when the name is
+%% genuinely refused — held by a different pid is decided downstream by the leader; the
+%% one immediate `no` here is the `reject_when_degraded` prevention mode (§5.6), an
+%% explicit opt-in.  Crucially, **no leader (or an unreachable one) does not answer
+%% `no`** — that would be a false `already_started` to OTP.  Instead the caller is
+%% *blocked*: the registration is stashed to await a leader (redrive_registers/1), so
+%% it succeeds if one appears within the caller's `register_timeout` and otherwise the
+%% caller's own call times out.  Returns the new state; the reply is either already
+%% sent (immediate `no`) or deferred.
+route_register(Name, Pid, Meta, From, State = #state{leader = Leader, member_id = Self}) ->
+    if
+        Leader =:= Self ->
+            %% Leader: park in the group-commit buffer, answered on commit — unless the
+            %% degraded-prevention mode refuses it outright.
+            case reject_new_when_degraded(Name, State) of
+                true ->
+                    gen_server:reply(From, no),
+                    State;
+                false ->
+                    enqueue_op({add, Name, Pid, Meta, {local, From}}, State)
+            end;
+        Leader =:= undefined ->
+            %% No leader elected yet (startup, or a brief handoff window) — block.
+            stash_pending_register(Name, Pid, Meta, From, State);
+        true ->
+            %% A different member leads.  Forward if reachable (the caller blocks on the
+            %% eventual {register_reply}); if unreachable (partition), block and stash
+            %% rather than forward into a dropped cast — the removal-style re-drive picks
+            %% it up when a leader is reachable again.
+            case member_reachable(Leader) of
+                true ->
+                    Ref = make_ref(),
+                    cast_to_member(Leader, {register_req, Ref, Self, Name, Pid, Meta}),
+                    State#state{
+                        pending_forwards =
+                            (State#state.pending_forwards)#{
+                                Ref => {register, Name, Pid, Meta, From}
+                            }
+                    };
+                false ->
+                    stash_pending_register(Name, Pid, Meta, From, State)
+            end
+    end.
+
+%% Route an unregister (or unsubscribe — the reserved subscription name) to wherever it
+%% must go, mirroring route_register.  Returns a handle_call reply tuple.  The bound pid
+%% is captured *before* any optimistic row_delete so the leader can seed the durable
+%% clear and the conflict trail (§5.6):
+%%   - Leader: optimistically remove the local row (a caller-side whereis_name/1 on this
+%%     node sees the delete at once) and park the durable removal in the group-commit
+%%     buffer with the caller as origin — answered `ok` on commit.  A batch that fails
+%%     salvages its removes, so `ok` means "accepted and re-driven", never "dropped".
+%%   - Follower, reachable leader: delete the local row and forward as a *tracked*
+%%     request stashed under Ref (a dropped forward or deposed leader is recovered by
+%%     redrive_unregs/1 — a pid-guarded retract to the then-current leader).
+%%   - Follower, unreachable leader / no leader: answer `ok` now and stash the intent;
+%%     it is re-driven once a leader is reachable (CP — the commit waits, the intent is
+%%     never lost).
+route_unregister(
+    LogicalName, From, State = #state{leader = Leader, member_id = Self, names_tab = Tab}
+) ->
+    ReleasedPid = lookup_name(Tab, LogicalName),
+    if
+        Leader =:= Self ->
+            {noreply,
+                enqueue_op(
+                    {remove, LogicalName, ReleasedPid, {unreg, From}},
+                    row_delete(State, LogicalName)
+                )};
+        Leader =/= undefined ->
+            State1 = row_delete(State, LogicalName),
+            case member_reachable(Leader) of
+                true ->
+                    Ref = make_ref(),
+                    cast_to_member(Leader, {unregister_req, Ref, Self, LogicalName}),
+                    {noreply, State1#state{
+                        pending_forwards = (State1#state.pending_forwards)#{
+                            Ref => {unregister, LogicalName, ReleasedPid, From}
+                        }
+                    }};
+                false ->
+                    {reply, ok, stash_pending_unreg(LogicalName, ReleasedPid, State1)}
+            end;
+        true ->
+            {reply, ok,
+                stash_pending_unreg(LogicalName, ReleasedPid, row_delete(State, LogicalName))}
+    end.
+
+%% Stash a registration that could not be routed (no reachable leader), tagged with
+%% the wall-clock ms it arrived so the periodic prune can drop it once its caller has
+%% (about) timed out.
+stash_pending_register(Name, Pid, Meta, From, State = #state{pending_registers = PR}) ->
+    Now = erlang:system_time(millisecond),
+    State#state{pending_registers = [{Now, Name, Pid, Meta, From} | PR]}.
+
+%% Re-drive every stashed registration now that a leader may be known — called on the
+%% leadership-establishing events (assuming leadership, applying a leader's snapshot).
+%% Each entry is re-routed: it commits (we are leader), forwards (a follower with a
+%% reachable leader), or re-stashes (still no reachable leader).  An entry whose caller
+%% has already timed out (older than `register_timeout`) is dropped without a reply.
+redrive_registers(State = #state{pending_registers = []}) ->
+    State;
+redrive_registers(State = #state{pending_registers = PR, config = Config}) ->
+    TTL = dgen_config:register_timeout(Config),
+    Now = erlang:system_time(millisecond),
+    %% Clear first; route_register re-stashes any that still cannot proceed.  Oldest
+    %% first (the list is newest-first) for rough FIFO fairness among waiters.
+    lists:foldl(
+        fun({At, Name, Pid, Meta, From}, S) ->
+            case Now - At >= TTL of
+                true -> S;
+                false -> route_register(Name, Pid, Meta, From, S)
+            end
+        end,
+        State#state{pending_registers = []},
+        lists:reverse(PR)
+    ).
+
+%% Drop stashed registrations whose callers have (about) timed out — the periodic
+%% bound on `pending_registers` so a prolonged no-leader window (a partition) cannot
+%% grow it without limit.  No reply is sent (the caller has moved on).
+prune_pending_registers(State = #state{pending_registers = []}) ->
+    State;
+prune_pending_registers(State = #state{pending_registers = PR, config = Config}) ->
+    TTL = dgen_config:register_timeout(Config),
+    Now = erlang:system_time(millisecond),
+    State#state{pending_registers = [E || {At, _, _, _, _} = E <- PR, Now - At < TTL]}.
+
 %% Append a write op to the pending queue (FIFO), then try to start a commit.  If
 %% one is already in flight, the op just accumulates and rides the next batch
 %% (started when the in-flight commit completes).
@@ -1810,11 +2243,25 @@ maybe_start_commit(State = #state{member_id = Self, leader = Leader, pending = P
     %% pids itself and observes their exits directly.
     lists:foreach(
         fun
-            ({add, _N, _P, _Meta, Origin}) -> deliver_reply(Origin, reject_value(Origin));
-            ({set_meta, _N, _I, _D, Origin}) -> deliver_reply(Origin, reject_value(Origin));
-            ({remove, N, P}) when is_pid(P) -> forward_retract(Leader, N, P);
-            ({retract, N, P}) -> forward_retract(Leader, N, P);
-            (_) -> ok
+            ({add, _N, _P, _Meta, Origin}) ->
+                deliver_reply(Origin, reject_value(Origin));
+            ({set_meta, _N, _I, _D, Origin}) ->
+                deliver_reply(Origin, reject_value(Origin));
+            ({remove, N, P, Origin}) ->
+                %% Forward the pid-guarded clear, and answer the tracked caller `ok`
+                %% (the forwarded retract carries the removal onward).
+                case is_pid(P) of
+                    true -> forward_retract(Leader, N, P);
+                    false -> ok
+                end,
+                case Origin of
+                    undefined -> ok;
+                    _ -> deliver_reply(Origin, reject_value(Origin))
+                end;
+            ({retract, N, P}) ->
+                forward_retract(Leader, N, P);
+            (_) ->
+                ok
         end,
         queue:to_list(Pending)
     ),
@@ -1829,11 +2276,15 @@ maybe_start_commit(State) ->
         name_to_ref = NTR,
         pending = Pending,
         num_pending = NumPending,
-        last_version = LastVersion
+        last_version = LastVersion,
+        config = Config
     } = State,
-    %% Take up to ?MAX_BATCH oldest ops (front of the queue); the rest ride the
-    %% following batch.  num_pending keeps the size O(1), so no length/1 scan.
-    BatchSize = min(NumPending, ?MAX_BATCH),
+    %% Take up to `commit_batch_size` oldest ops (front of the queue); the rest ride
+    %% the following batch.  num_pending keeps the size O(1), so no length/1 scan.
+    %% Bounding the batch keeps a burst (e.g. a departing node's DOWN flood) from
+    %% coalescing into one enormous commit whose O(batch) plan/apply/broadcast would
+    %% freeze the loop — see dgen_config:commit_batch_size/1.
+    BatchSize = min(NumPending, dgen_config:commit_batch_size(Config)),
     {ThisBatch, Rest} = take_n(Pending, BatchSize),
     State1 = State#state{pending = Rest, num_pending = NumPending - BatchSize},
     %% plan_batch resolves each op's binding lazily (its own batch-local overlay, falling
@@ -1905,7 +2356,8 @@ apply_committed_plan(Plan, Version, State) ->
         lists:reverse(BcastsRev)
     ),
     Now = erlang:system_time(millisecond),
-    Rel1 = lists:foldl(fun(P, Acc) -> Acc#{P => Now} end, Rel0, Released),
+    %% Trail entries are {Name, Pid} pairs (§5.6 — see the recently_released doc).
+    Rel1 = lists:foldl(fun(NamePid, Acc) -> Acc#{NamePid => Now} end, Rel0, Released),
     State1 = State0#state{
         name_to_ref = NTR1,
         ref_to_name = RTN1,
@@ -1919,14 +2371,142 @@ apply_committed_plan(Plan, Version, State) ->
     %% leader as a holder, so it waits for a follower to confirm a replica before
     %% acking — the two-holder invariant.  See the moduledoc for the caveats.
     {DirectYes, Immediate} = lists:partition(fun is_direct_yes/1, lists:reverse(RepliesRev)),
-    lists:foreach(fun({Origin, Result}) -> deliver_reply(Origin, Result) end, Immediate),
+    lists:foreach(
+        fun({Origin, Result}) -> deliver_committed_reply(Origin, Result, Version) end, Immediate
+    ),
     %% Enrich each direct `yes` with its {Name, Pid} (from the plan) so the replicate
     %% path can roll the binding back under strict_replication.
     EnrichedDirect = [
         {Origin, Name, Pid}
      || {Origin, yes} <- DirectYes, {Name, Pid} <- [maps:get(Origin, DirectMeta)]
     ],
-    confirm_direct(EnrichedDirect, Version, State1).
+    %% Fire presence notifications for this batch (§4.9): the replica now reflects the
+    %% committed batch, so the watch-set deltas are computed against it and delivered to
+    %% each subscription's notify targets.  Advances sub_matches.
+    State2 = fire_presence(DBOp, State1),
+    confirm_direct(EnrichedDirect, Version, State2).
+
+%% Deliver presence notifications for a just-applied committed batch (leader only, §4.9)
+%% and advance the leader-only `sub_matches` / `notify_matches`.  The batch's durable
+%% delta `DBOp` names every registration that changed, and `State` already reflects the
+%% post-batch replica (apply_dbop ran first).  For each subscription two things happen,
+%% both driven by diffing the changed names:
+%%   - watch side: a name entering/leaving the watch set yields a `joined`/`left` delta,
+%%     delivered to the subscription's *continuing* notify targets;
+%%   - notify side: a pid entering the notify set is a **new** viewer and is sent the
+%%     full current watch snapshot, so a notifier that registered after the subscription
+%%     still learns who is already present.
+fire_presence(_DBOp, State = #state{subs = Subs}) when map_size(Subs) =:= 0 ->
+    State;
+fire_presence(DBOp, State = #state{names_tab = Tab, subs = Subs}) ->
+    RealNames = maps:keys(DBOp),
+    maps:fold(
+        fun(SubId, {Watch, Notify}, S) ->
+            diff_subscription(SubId, Watch, Notify, RealNames, Tab, S)
+        end,
+        State,
+        Subs
+    ).
+
+%% Seed a subscription (on the elector's push): compute its full watch and notify sets
+%% from the current replica, record them, and deliver the watch set as an initial
+%% `joined` snapshot to the current notify targets.  A re-subscribe (upsert with changed
+%% queries) reseeds and re-delivers.  (Notify targets that appear *later* are handled by
+%% diff_subscription, not here.)
+seed_subscription(
+    SubId,
+    State = #state{
+        subs = Subs, names_tab = Tab, inv_index = Inv, sub_matches = SM, notify_matches = NM
+    }
+) ->
+    case Subs of
+        #{SubId := {Watch, Notify}} ->
+            WatchMatches = query_match_names(Watch, Tab, Inv),
+            NotifyMatches = query_match_names(Notify, Tab, Inv),
+            send_presence(SubId, snapshot_events(WatchMatches), pidset(NotifyMatches)),
+            State#state{
+                sub_matches = SM#{SubId => WatchMatches},
+                notify_matches = NM#{SubId => NotifyMatches}
+            };
+        _ ->
+            State
+    end.
+
+%% Diff one subscription against the batch's row changes and fire its notifications,
+%% advancing both tracked sets.  The watch diff yields `joined`/`left` deltas; the notify
+%% diff yields the current notify-target set.  A pid that newly *entered* the notify set
+%% (a viewer that just appeared) gets the full current watch snapshot; every *continuing*
+%% notify target gets the watch delta.  Computed on pid-sets, so a pid already a target
+%% under another name is not treated as new (no duplicate snapshot).
+diff_subscription(SubId, Watch, Notify, RealNames, Tab, State) ->
+    #state{sub_matches = SM, notify_matches = NM} = State,
+    {WatchEvents, WatchAfter} = diff_query_matches(Watch, RealNames, maps:get(SubId, SM, #{}), Tab),
+    NotifyBefore = maps:get(SubId, NM, #{}),
+    {_NotifyEvents, NotifyAfter} = diff_query_matches(Notify, RealNames, NotifyBefore, Tab),
+    AfterPids = pidset(NotifyAfter),
+    NewTargets = AfterPids -- pidset(NotifyBefore),
+    ContinuingTargets = AfterPids -- NewTargets,
+    send_presence(SubId, WatchEvents, ContinuingTargets),
+    send_presence(SubId, snapshot_events(WatchAfter), NewTargets),
+    State#state{sub_matches = SM#{SubId => WatchAfter}, notify_matches = NM#{SubId => NotifyAfter}}.
+
+%% Diff a query's membership over the batch's changed names: fold each changed name's
+%% post-batch match (present in the replica *and* satisfying the query) against whether it
+%% was a member before, yielding `joined`/`left` events and the updated `#{Name => Pid}`
+%% membership.  Used for both the watch and notify queries.
+diff_query_matches(Query, RealNames, Before, Tab) ->
+    lists:foldl(
+        fun(Name, {EvAcc, MatchAcc}) ->
+            WasPid = maps:get(Name, Before, undefined),
+            NowMatch =
+                case ets:lookup(Tab, Name) of
+                    [{_N, RowPid, Index, _Data} | _] ->
+                        case query_satisfies(Query, Index) of
+                            true -> {true, RowPid};
+                            false -> false
+                        end;
+                    [] ->
+                        false
+                end,
+            case {WasPid, NowMatch} of
+                {undefined, {true, Pid}} ->
+                    {[{joined, Name, Pid} | EvAcc], MatchAcc#{Name => Pid}};
+                {undefined, false} ->
+                    {EvAcc, MatchAcc};
+                {WasPid, {true, WasPid}} ->
+                    {EvAcc, MatchAcc};
+                {OldPid, {true, NewPid}} ->
+                    {[{joined, Name, NewPid}, {left, Name, OldPid} | EvAcc], MatchAcc#{
+                        Name => NewPid
+                    }};
+                {OldPid, false} ->
+                    {[{left, Name, OldPid} | EvAcc], maps:remove(Name, MatchAcc)}
+            end
+        end,
+        {[], Before},
+        RealNames
+    ).
+
+%% The current watch set (`#{Name => Pid}`) as a list of `joined` events — the initial
+%% snapshot payload.
+snapshot_events(Matches) ->
+    [{joined, Name, Pid} || {Name, Pid} <- maps:to_list(Matches)].
+
+%% The distinct pids of a `#{Name => Pid}` membership map (a pid registered under several
+%% matching names is one recipient).
+pidset(Matches) ->
+    lists:usort(maps:values(Matches)).
+
+%% Send one `{dgen_presence, SubId, Events}` message to each recipient pid.  Keyed by the
+%% subscription's application-supplied id, so a durable subscriber re-addresses its feed
+%% by the same stable key across restarts.  A no-op with no events or no recipients.
+send_presence(_SubId, [], _Pids) ->
+    ok;
+send_presence(_SubId, _Events, []) ->
+    ok;
+send_presence(SubId, Events, Pids) ->
+    Msg = {dgen_presence, SubId, Events},
+    lists:foreach(fun(Pid) -> Pid ! Msg end, Pids).
 
 is_direct_yes({{local, _From}, yes}) -> true;
 is_direct_yes(_Other) -> false.
@@ -2015,34 +2595,175 @@ reject_plan(#{replies := RepliesRev}, State) ->
 
 reject_value({meta, _From}) -> {error, no_leader};
 reject_value({forward_meta, _MemberId, _Ref}) -> {error, no_leader};
+%% A rejected batch's removes are salvaged and re-driven (salvage_failed_plan), so
+%% `ok` remains the truthful answer for an unregister even when its batch failed.
+reject_value({unreg, _From}) -> ok;
+reject_value({forward_unreg, _MemberId, _Ref}) -> ok;
 reject_value(_Origin) -> no.
 
-%% Answer a write op's origin.  A direct (local) registration or set_metadata is
-%% answered with gen_server:reply/2; a forwarded registration with a {register_reply}
-%% cast, and a forwarded set_metadata with a {set_meta_reply} cast, to the forwarding
-%% member, which then answers its own caller.
+%% Answer a write op's origin.  A direct (local) registration, set_metadata, or
+%% unregister is answered with gen_server:reply/2; a forwarded one with the matching
+%% reply cast ({register_reply} / {set_meta_reply} / {unregister_reply}) to the
+%% forwarding member, which then answers its own caller.
 deliver_reply({local, From}, Result) ->
     gen_server:reply(From, Result);
 deliver_reply({meta, From}, Result) ->
     gen_server:reply(From, Result);
+deliver_reply({unreg, From}, Result) ->
+    gen_server:reply(From, Result);
 deliver_reply({forward, MemberId, Ref}, Result) ->
     cast_to_member(MemberId, {register_reply, Ref, Result});
 deliver_reply({forward_meta, MemberId, Ref}, Result) ->
-    cast_to_member(MemberId, {set_meta_reply, Ref, Result}).
+    cast_to_member(MemberId, {set_meta_reply, Ref, Result});
+deliver_reply({forward_unreg, MemberId, Ref}, _Result) ->
+    cast_to_member(MemberId, {unregister_reply, Ref}).
 
-%% Follower: reject every forwarded registration and set_metadata still awaiting a reply
-%% (the leader they were sent to is no longer current), so callers retry against the new
-%% leader.  Registrations get `no`; set_metadata gets `{error, no_leader}`.
-reject_forwards(State = #state{forwards = Forwards, meta_forwards = MetaForwards}) ->
-    maps:foreach(
-        fun(_Ref, {_Name, _Pid, _Meta, From}) -> gen_server:reply(From, no) end,
-        Forwards
+%% Post-commit reply delivery: a forwarded registration's reply is stamped with the
+%% batch's commit version so the forwarding follower can version-guard its `yes` ack
+%% (see the {register_reply, _, _, _} handler).  Every other origin (and every
+%% rejection path, which has no commit version) uses the plain deliver_reply/2.
+deliver_committed_reply({forward, MemberId, Ref}, Result, Version) ->
+    cast_to_member(MemberId, {register_reply, Ref, Result, Version});
+deliver_committed_reply(Origin, Result, _Version) ->
+    deliver_reply(Origin, Result).
+
+%% Follower: the leader these were forwarded to is no longer current.  Reject the
+%% register and set_metadata forwards so their callers retry against the new leader
+%% (registrations `no`, including the gap-deferred `yes` acks whose resync will never
+%% arrive from the deposed leader; set_metadata `{error, no_leader}`).  Unregister
+%% forwards are **kept** — their intent is idempotent and must not be lost, so
+%% redrive_unregs re-drives them to the new leader rather than failing the caller.
+reject_forwards(State = #state{pending_forwards = PF, deferred_yes = Deferred}) ->
+    Kept = maps:fold(
+        fun
+            (_Ref, {register, _Name, _Pid, _Meta, From}, Acc) ->
+                gen_server:reply(From, no),
+                Acc;
+            (_Ref, {set_meta, From}, Acc) ->
+                gen_server:reply(From, {error, no_leader}),
+                Acc;
+            (Ref, {unregister, _, _, _} = Unreg, Acc) ->
+                Acc#{Ref => Unreg}
+        end,
+        #{},
+        PF
     ),
-    maps:foreach(
-        fun(_Ref, From) -> gen_server:reply(From, {error, no_leader}) end,
-        MetaForwards
-    ),
-    State#state{forwards = #{}, meta_forwards = #{}}.
+    lists:foreach(fun({_Version, From}) -> gen_server:reply(From, no) end, Deferred),
+    State#state{pending_forwards = Kept, deferred_yes = []}.
+
+%% Resolve the leader's answer to a forwarded registration (see the
+%% {register_reply, _, _, _} handler doc).  `yes` at-or-behind our applied version:
+%% the FIFO-ordered broadcast already applied the binding — insert (idempotent) and
+%% answer, the normal path.  `yes` ahead of it: our replica is gapped (the broadcast
+%% was refused pending a resync), so defer the ack until applied_version reaches the
+%% batch's version — answering now would create a second holder the freshest-wins
+%% gather cannot see (§5.5/§5.7).  The gap-refused broadcast already requested the
+%% resync; re-request here as a belt-and-braces (request_resync no-ops while one is
+%% outstanding).
+handle_register_reply(Ref, Result, Version, State = #state{pending_forwards = PF}) ->
+    case maps:take(Ref, PF) of
+        {{register, LogicalName, Pid, {Index, Data}, From}, PF1} ->
+            State1 = State#state{pending_forwards = PF1},
+            case Result of
+                yes when Version =< State1#state.applied_version ->
+                    gen_server:reply(From, yes),
+                    row_insert(State1, LogicalName, Pid, Index, Data);
+                yes ->
+                    State2 =
+                        case State1#state.leader of
+                            undefined -> State1;
+                            Leader -> request_resync(Leader, State1)
+                        end,
+                    State2#state{
+                        deferred_yes = [{Version, From} | State2#state.deferred_yes]
+                    };
+                no ->
+                    gen_server:reply(From, no),
+                    State1
+            end;
+        _ ->
+            %% Unknown Ref — already answered (e.g. rejected on a leadership change).
+            State
+    end.
+
+%% Release gap-deferred forwarded-`yes` acks whose batch version the replica has now
+%% genuinely applied (the resync snapshot, or a contiguous broadcast run, advanced
+%% applied_version past them).  The binding itself is guaranteed present: reaching
+%% the version contiguously means the batch's own broadcast was applied, and a
+%% snapshot at-or-past it carries the committed binding.
+flush_deferred(State = #state{deferred_yes = []}) ->
+    State;
+flush_deferred(State = #state{deferred_yes = Deferred, applied_version = Applied}) ->
+    {Due, Rest} = lists:partition(fun({Version, _From}) -> Version =< Applied end, Deferred),
+    lists:foreach(fun({_Version, From}) -> gen_server:reply(From, yes) end, Due),
+    State#state{deferred_yes = Rest}.
+
+%% Stash an unregister accepted while no leader was reachable (nothing to retract if
+%% the name was locally unbound — matching the old nets-to-nothing semantics); it is
+%% re-driven by redrive_unregs/1 once a leader is known.
+stash_pending_unreg(_Name, undefined, State) ->
+    State;
+stash_pending_unreg(Name, Pid, State = #state{pending_unregs = Pending}) ->
+    State#state{pending_unregs = [{Name, Pid} | Pending]}.
+
+%% Re-drive every stashed unregister — the follower-side counterpart of the leader's
+%% salvage_failed_plan: forwarded removals whose reply never came (dropped cast,
+%% deposed leader) and removals accepted while no leader was reachable are handed to
+%% the current leader as **pid-guarded retracts** (or enqueued directly if this
+%% member is now the leader itself), and any still-waiting caller is answered `ok`.
+%% Pid-guarding makes the re-drive idempotent and reissue-safe: a name since
+%% re-registered to a different pid is never clobbered, and a removal the old leader
+%% did commit after all nets to nothing.  Called on every snapshot apply and on
+%% assuming leadership — the events that establish who the leader is.
+redrive_unregs(State = #state{pending_forwards = PF, pending_unregs = Pending}) ->
+    {Unregs, RestPF} = take_unreg_forwards(PF),
+    case Unregs =:= [] andalso Pending =:= [] of
+        true ->
+            State;
+        false ->
+            redrive_unregs(State, Unregs, RestPF)
+    end.
+
+%% No leader to hand these to yet — leave everything stashed (RestPF/Pending
+%% untouched) for the next snapshot/leadership event.
+redrive_unregs(State = #state{leader = undefined}, _Unregs, _RestPF) ->
+    State;
+redrive_unregs(State = #state{leader = Leader, member_id = Self}, Unregs, RestPF) ->
+    Entries =
+        Unregs ++ [{Name, Pid, undefined} || {Name, Pid} <- State#state.pending_unregs],
+    State1 = State#state{pending_forwards = RestPF, pending_unregs = []},
+    lists:foldl(
+        fun({Name, Pid, From}, S) ->
+            From =/= undefined andalso gen_server:reply(From, ok),
+            case is_pid(Pid) of
+                false ->
+                    %% Nothing was bound locally at call time — nothing to retract.
+                    S;
+                true when Leader =:= Self ->
+                    enqueue_op({retract, Name, Pid}, S);
+                true ->
+                    forward_retract(Leader, Name, Pid),
+                    S
+            end
+        end,
+        State1,
+        Entries
+    ).
+
+%% Split `pending_forwards` into its unregister entries (as {Name, Pid, From} for the
+%% re-drive) and the remaining register/set_meta forwards (kept in flight — a
+%% snapshot refresh that did not change leadership must not disturb them).
+take_unreg_forwards(PF) ->
+    maps:fold(
+        fun
+            (_Ref, {unregister, Name, Pid, From}, {Acc, Rest}) ->
+                {[{Name, Pid, From} | Acc], Rest};
+            (Ref, Other, {Acc, Rest}) ->
+                {Acc, Rest#{Ref => Other}}
+        end,
+        {[], #{}},
+        PF
+    ).
 
 %% Dequeue exactly N ops from the front of the queue (oldest first), returning
 %% {OpsInOrder, RestQueue}.  The caller guarantees N =< the queue's length
@@ -2117,7 +2838,19 @@ plan_op({add, Name, Pid, {Index, Data} = Meta, Origin}, Epoch, Acc) ->
         direct_meta := DM
     } = Acc,
     case seed_lookup(WN, Tab, Name) of
-        undefined ->
+        Taken when is_pid(Taken), Taken =/= Pid ->
+            %% Held by a *different* live pid — reject (the singleton contract).
+            Acc#{replies := [{Origin, no} | Rs]};
+        _Free_or_same ->
+            %% Free (`undefined`) or already this same pid: bind it and answer `yes`.
+            %% Re-registering the *same* pid under the *same* name is an idempotent
+            %% success, not a conflict — so a caller whose register call timed out (or
+            %% raced a failover) but whose registration actually committed can simply
+            %% redrive and get a decisive `yes` for its own binding, rather than a
+            %% confusing `no`.  It rides the normal bind path (a same-pid re-register
+            %% re-writes the identical row, refreshes the monitor, and re-applies the
+            %% call's metadata — use set_metadata/2 to change metadata independently).
+            %%
             %% Record {Name, Pid} for a direct-origin reg so the replicate-before-ack
             %% path (confirm_direct) can roll the binding back under strict_replication.
             DM1 =
@@ -2133,9 +2866,7 @@ plan_op({add, Name, Pid, {Index, Data} = Meta, Origin}, Epoch, Acc) ->
                 replies := [{Origin, yes} | Rs],
                 bcasts := [{name_registered, Name, Pid, Index, Data, Epoch} | Bs],
                 direct_meta := DM1
-            };
-        _TakenPid ->
-            Acc#{replies := [{Origin, no} | Rs]}
+            }
     end;
 plan_op({set_meta, Name, Index, Data, Origin}, Epoch, Acc) ->
     #{tab := Tab, names := WN, meta := WMeta, dbop := DB, replies := Rs, bcasts := Bs} = Acc,
@@ -2159,21 +2890,32 @@ plan_op({set_meta, Name, Index, Data, Origin}, Epoch, Acc) ->
                 bcasts := [{metadata_set, Name, Index, Data, Epoch} | Bs]
             }
     end;
-plan_op({remove, Name, ReleasedPid}, Epoch, Acc) ->
-    #{tab := Tab, names := WN, wntr := WNTR, dbop := DB, bcasts := Bs, released := Rel} = Acc,
+plan_op({remove, Name, ReleasedPid, Origin}, Epoch, Acc) ->
+    #{
+        tab := Tab,
+        names := WN,
+        wntr := WNTR,
+        dbop := DB,
+        replies := Rs,
+        bcasts := Bs,
+        released := Rel
+    } = Acc,
     %% Clear durably if the name was bound at enqueue (ReleasedPid is a pid) or is bound
     %% now, as of this point in the batch (seed_lookup — overlay first, ETS fallback).
     %% ReleasedPid covers the leader's optimistic removal (already gone from ETS); the
     %% seed_lookup covers a name added earlier in this same batch (ETS would not show
     %% that yet — only unregister's own optimistic delete updates ETS immediately).
-    %% Record the released pid in the conflict-detector trail so a lagging member
-    %% reporting it is not later mistaken for a divergence.
+    %% Record the released {Name, Pid} in the conflict-detector trail so a lagging
+    %% member reporting it is not later mistaken for a divergence.  The origin (a
+    %% tracked unregister call, if any) is answered `ok` either way — clearing an
+    %% already-unbound name is an idempotent no-op, not a failure.
+    Rs1 = unreg_reply(Origin, Rs),
     WasBound = is_pid(ReleasedPid),
     case WasBound orelse (seed_lookup(WN, Tab, Name) =/= undefined) of
         true ->
             Rel1 =
                 case WasBound of
-                    true -> [ReleasedPid | Rel];
+                    true -> [{Name, ReleasedPid} | Rel];
                     false -> Rel
                 end,
             %% The broadcast carries the released pid so every member records it in
@@ -2187,18 +2929,20 @@ plan_op({remove, Name, ReleasedPid}, Epoch, Acc) ->
                 names := WN#{Name => removed},
                 wntr := maps:remove(Name, WNTR),
                 dbop := DB#{Name => clear},
+                replies := Rs1,
                 bcasts := [{name_unregistered, Name, ReleasedOut, Epoch} | Bs],
                 released := Rel1
             };
         false ->
-            Acc
+            Acc#{replies := Rs1}
     end;
 plan_op({retract, Name, Pid}, Epoch, Acc) ->
     #{tab := Tab, names := WN, wntr := WNTR, dbop := DB, bcasts := Bs, released := Rel} = Acc,
     %% Pid-guarded retract (strict_replication fail-closed): clear the binding only if
     %% it is *still* this pid's, so a name re-registered to someone else since the
-    %% failed reg is not clobbered.  Trail the retracted pid so a lagging follower that
-    %% still holds the transient binding is not later mistaken for a conflict (§5.6).
+    %% failed reg is not clobbered.  Trail the retracted {Name, Pid} so a lagging
+    %% follower that still holds the transient binding is not later mistaken for a
+    %% conflict (§5.6).
     case seed_lookup(WN, Tab, Name) of
         Pid ->
             Acc#{
@@ -2206,7 +2950,7 @@ plan_op({retract, Name, Pid}, Epoch, Acc) ->
                 wntr := maps:remove(Name, WNTR),
                 dbop := DB#{Name => clear},
                 bcasts := [{name_unregistered, Name, Pid, Epoch} | Bs],
-                released := [Pid | Rel]
+                released := [{Name, Pid} | Rel]
             };
         _ ->
             %% Binding changed since the failed registration — nothing to retract.
@@ -2229,6 +2973,11 @@ plan_op({down, Name, Ref}, Epoch, Acc) ->
             %% Stale DOWN (name re-registered, or already removed) — ignore.
             Acc
     end.
+
+%% Append an `ok` reply for a tracked unregister's origin; a legacy/salvaged remove
+%% (origin `undefined`) has no caller to answer.
+unreg_reply(undefined, Rs) -> Rs;
+unreg_reply(Origin, Rs) -> [{Origin, ok} | Rs].
 
 %% Apply the durable delta's monitor side effects: for a clear, demonitor the name's
 %% prior ref; for a set (new/changed binding), demonitor the old ref and monitor the
@@ -2305,9 +3054,10 @@ cancel_resync(State = #state{resync_timer = Ref}) ->
 
 %% Advance applied_version to the highest version applied (within an epoch a leader's
 %% broadcasts carry non-decreasing versions, and apply_bcast only lets contiguous
-%% ones through, but max/2 keeps this robust regardless).
+%% ones through, but max/2 keeps this robust regardless).  Advancing may release
+%% gap-deferred forwarded-`yes` acks (flush_deferred) — a no-op when none are held.
 bump_applied(Version, State = #state{applied_version = Applied}) ->
-    State#state{applied_version = max(Applied, Version)}.
+    flush_deferred(State#state{applied_version = max(Applied, Version)}).
 
 %% Record that this member now holds synced registry state, announcing the
 %% transition to the elector once (`fresh = false`) so the membership record's
@@ -2321,7 +3071,7 @@ mark_synced(State = #state{elector = Elector, member_id = Self, join_token = Tok
 %% Is a peer member's node currently connected (so a cast to it will not be
 %% dropped and a forward will actually be answered)?
 member_reachable({Node, _Name}) ->
-    Node =:= node() orelse lists:member(Node, nodes()).
+    dgen_utils:node_reachable(Node).
 
 %% Report a peer's death to the elector, fencing the `{member_down}` with the token the
 %% elector currently holds for that member (read fresh from durable state via a priority
@@ -2330,74 +3080,8 @@ member_reachable({Node, _Name}) ->
 %% DOWN handler for the deadlock this avoids and why the fresh read matters.
 spawn_member_down(Elector, MemberId, Cached) ->
     _ = spawn(fun() ->
-        Token =
-            try dgen_server:priority_call(Elector, {get_member_token, MemberId}) of
-                T when is_reference(T) -> T;
-                _ -> Cached
-            catch
-                _:_ -> Cached
-            end,
+        Token = dgen_registry_elector:member_token(Elector, MemberId, Cached),
         dgen_server:cast(Elector, {member_down, MemberId, Token})
-    end),
-    ok.
-
-schedule_reap(Node, N) ->
-    erlang:send_after(?REAP_INTERVAL, self(), {reap_down, Node, N}),
-    ok.
-
-%% Report `member_down` for every member the elector currently lists on `Node`, fenced
-%% with each member's current durable token (so a member that has genuinely rejoined is
-%% not clobbered — the fresh token already advanced past what we send, or the rejoin's
-%% own `{join}` re-adds it).  Runs off the member loop; reads the elector and casts only.
-spawn_reap(Elector, Node) ->
-    _ = spawn(fun() ->
-        try dgen_server:priority_call(Elector, get_members) of
-            Members when is_list(Members) ->
-                lists:foreach(
-                    fun
-                        ({N, _} = MemberId) when N =:= Node ->
-                            Token =
-                                try
-                                    dgen_server:priority_call(
-                                        Elector, {get_member_token, MemberId}
-                                    )
-                                of
-                                    T when is_reference(T) -> T;
-                                    _ -> undefined
-                                catch
-                                    _:_ -> undefined
-                                end,
-                            dgen_server:cast(Elector, {member_down, MemberId, Token});
-                        (_) ->
-                            ok
-                    end,
-                    Members
-                );
-            _ ->
-                ok
-        catch
-            _:_ -> ok
-        end
-    end),
-    ok.
-
-%% Read the elector's current leader; if it is a *different* node that is not
-%% connected, reap every member stranded there (fenced `member_down`, via spawn_reap),
-%% which triggers re-election.  A leader that is ourselves, unset, or on a connected
-%% node is left alone.  Runs off the member loop and never opens a connection.
-spawn_probe_leader(Elector, SelfNode) ->
-    _ = spawn(fun() ->
-        try dgen_server:priority_call(Elector, get_leader) of
-            {LeaderNode, _} when LeaderNode =/= SelfNode ->
-                case lists:member(LeaderNode, nodes()) of
-                    true -> ok;
-                    false -> spawn_reap(Elector, LeaderNode)
-                end;
-            _ ->
-                ok
-        catch
-            _:_ -> ok
-        end
     end),
     ok.
 
@@ -2448,7 +3132,7 @@ forward_retract(Leader, Name, Pid) ->
 %% Scheduled after a short delay so a persistently failing backend does not spin.
 salvage_failed_plan(State, #{ops := Ops}) ->
     Destructive = [
-        Op
+        strip_remove_origin(Op)
      || Op <- Ops,
         element(1, Op) =:= remove orelse element(1, Op) =:= retract orelse
             element(1, Op) =:= down
@@ -2458,6 +3142,11 @@ salvage_failed_plan(State, #{ops := Ops}) ->
         _ -> erlang:send_after(?REQUEUE_DELAY, self(), {requeue_ops, Destructive})
     end,
     State.
+
+%% A salvaged remove's caller was already answered by reject_plan (`ok` — see
+%% reject_value); strip the origin so the re-driven op does not answer it twice.
+strip_remove_origin({remove, Name, Pid, _Origin}) -> {remove, Name, Pid, undefined};
+strip_remove_origin(Op) -> Op.
 
 %% Losing leadership with direct registrations still awaiting replica acks: resolve
 %% them now, by the same policy as a replicate timeout (§8).  Degrade-open answers
@@ -2739,6 +3428,25 @@ materialize(Names, Constraints, Tab) ->
         Names
     ).
 
+%% ---------------------------------------------------------------------------
+%% Tagged queries (§4.9) — the extensible query() form used by presence
+%% subscriptions.  Only `{all, Constraints}` (AND-equal, the run_query semantics)
+%% exists today; new kinds slot in here without touching call sites.
+%% ---------------------------------------------------------------------------
+
+%% Run a query against the replica, returning the full `#{name, pid, index, data}`
+%% matches (the run_query shape).
+query_run({all, Constraints}, Tab, Inv) ->
+    run_query(Constraints, Tab, Inv).
+
+%% Does `Index` (a row's indexed-attribute map) satisfy the query?
+query_satisfies({all, Constraints}, Index) ->
+    map_size(Constraints) > 0 andalso satisfies(Constraints, Index).
+
+%% The watch-set membership `#{Name => Pid}` a query currently resolves to.
+query_match_names(Query, Tab, Inv) ->
+    maps:from_list([{N, P} || #{name := N, pid := P} <- query_run(Query, Tab, Inv)]).
+
 %% Does `Index` (a row's indexed-attribute map) satisfy every clause exactly?
 satisfies(Constraints, Index) ->
     maps:fold(
@@ -2774,11 +3482,15 @@ remove_member(MemberId, State = #state{members = Members, monitors = Monitors}) 
             %% Drop the peer's token too, so `peer_tokens` does not accumulate stale
             %% entries across node churn (it is repopulated from the snapshot on
             %% rejoin).  The caller reads the token for its {member_down} cast before
-            %% calling this, so pruning here is safe.
+            %% calling this, so pruning here is safe.  The departure timestamp keeps
+            %% trail pruning suspended for a TTL window (§5.6): the departed member
+            %% is no longer "a disconnected member", but its stale rows can still
+            %% surface at a rejoin gather within that window.
             State#state{
                 members = maps:remove(MemberId, Members),
                 monitors = maps:remove(Ref, Monitors),
-                peer_tokens = maps:remove(MemberId, State#state.peer_tokens)
+                peer_tokens = maps:remove(MemberId, State#state.peer_tokens),
+                last_departure = erlang:system_time(millisecond)
             }
     end.
 
@@ -2809,59 +3521,6 @@ merge_peer_tokens(Tokens, State = #state{peer_tokens = PeerTokens}) ->
 
 broadcast_to_peers(Members, Msg) ->
     maps:foreach(fun(MemberId, _) -> cast_to_member(MemberId, Msg) end, Members).
-
-%% Read the authoritative member set from the elector and report it back to the
-%% member as `{mesh_members, MemberNodes}`, in a short-lived helper so the
-%% (potentially slow, durable-queue) read never blocks the member's loop.  The
-%% member set is read via a regular `call` (not `priority_call`): it rides the
-%% elector's durable queue in order with the membership changes, rather than
-%% bypassing it on the urgent lane, so the mesh sees a just-joined node as soon as
-%% its join is processed and does not jump ahead of or add bypass load to the
-%% membership work.  The set is authoritative — the same on every node — including a
-%% brand-new member that has only committed its join to the database and is not yet
-%% reachable any other way.
-%%
-%% Crucially, the helper does *not* itself decide which nodes to connect: it just
-%% reports the set back, and the member applies the recently-down suppression on its
-%% own mailbox (see the `mesh_members` clause).  A fetch spawned before a node
-%% dropped therefore cannot reconnect that node with a stale suppression snapshot.
-spawn_mesh_fetch(Elector, Owner) ->
-    _ = spawn(fun() ->
-        %% Piggyback a durable-epoch check on the periodic pass: read the committed
-        %% election epoch (a priority read — its own transaction, bypassing the
-        %% queue) and report it to the member.  If it is ahead of what the member
-        %% has heard, a leadership handoff never reached this node (the post-commit
-        %% assume action failed, or the snapshot was dropped) — the member re-joins
-        %% to trigger a fresh assume/fan-out.  Without this, a missed handoff could
-        %% leave a new leader unaware of its role (all writes failing) until an
-        %% unrelated membership event.
-        try dgen_server:priority_call(Elector, get_epoch) of
-            DurableEpoch when is_integer(DurableEpoch) ->
-                Owner ! {durable_epoch, DurableEpoch};
-            _ ->
-                ok
-        catch
-            _:_ -> ok
-        end,
-        try dgen_server:call(Elector, get_members) of
-            Members when is_list(Members) ->
-                Owner ! {mesh_members, [Node || {Node, _Name} <- Members]};
-            _ ->
-                ok
-        catch
-            _:_ -> ok
-        end
-    end),
-    ok.
-
-%% Connect Erlang distribution to each target member node, off the member's loop
-%% (the handshake can block on an unreachable node).  `connect_node/1` is idempotent
-%% (an already-connected node is a no-op) and a node that cannot be reached simply
-%% returns `false`; either way the next mesh pass retries.  The targets have already
-%% been filtered against the current recently-down suppression by the caller.
-spawn_mesh_connect(Targets) ->
-    _ = spawn(fun() -> lists:foreach(fun net_kernel:connect_node/1, Targets) end),
-    ok.
 
 %% Cast to a peer member.  A fire-and-forget cast to `{Name, Node}` on a
 %% currently-disconnected node would trigger an automatic distribution reconnect
