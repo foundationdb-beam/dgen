@@ -50,6 +50,18 @@
     snapshot (never a half-applied commit) at the cost of serialising — a deliberate
     trade, since single-key reads stay lock-free. An empty constraint map is rejected;
     `data` is not queryable.
+  - **Durable presence.** A caller registers a *watch*
+    query and a *notify* query under an application-chosen `SubId`; whenever a committed
+    batch changes which processes satisfy the watch query, the registry pushes
+    `{dgen_presence, SubId, Events}` (events `{joined | left, Name, Pid}`) to every process
+    matching the notify query — a live feed built on the one-shot `query/2` (§4.7).
+    Subscribing delivers an initial snapshot of the current watch set, and the feed is
+    correct for every way the set can move: register, unregister, process death, or a
+    `set_metadata` that shifts a row in or out of the query. **Subscriptions are durable**
+    — stored in the elector's backend-backed `dgen_server` state (keyed by `SubId`, an
+    idempotent upsert), so they outlive the whole cluster: an application can tie a
+    subscription to a database entity and have presence come back intact after a
+    scale-to-zero.
 
 - **`dgen_transaction` (new behaviour).** Owns a single backend transaction in its
   own process (create → body → commit → retry, with caller-controlled retry
@@ -66,7 +78,7 @@
 
 ### Behavioral notes
 
-- **The registry may forcibly terminate a registered process to enforce uniqueness.**
+- **In rare cases, the registry may forcibly terminate a registered process to enforce uniqueness.**
   Register only processes that can withstand being forcibly killed — supervised and
   restart-safe, or transient by design. This is intentional (a singleton registry)
   and configurable (`terminate_on_conflict`, default `true`). See §5.6 of the design
@@ -84,6 +96,13 @@
   returns the elector's current pid via supervisor lookup rather than a registered
   name (the elector no longer has one). `member_name/1` and `names_table/1` are kept
   for compatibility but are now identity functions (`member_name(Name) =:= Name`).
+- **`dgen_registry:register_name/2,3` exits on a call timeout instead of answering
+  `no`.** `no` is now strictly an adjudicated verdict (name taken / no leader /
+  leader unreachable); a timeout — where the registration may or may not have
+  committed — propagates as a call exit, matching `global`/`syn`/`gproc`
+  conventions, so a supervisor restarts the caller rather than acting on a wrong
+  "already taken" answer. The bound is configurable via the new `register_timeout`
+  application-environment knob (default `5000` ms; §8 of the design doc).
 
 ## v0.3.0 (2026-06-17)
 

@@ -6,9 +6,11 @@
     conflict_kill_budget/1,
     conflict_release_ttl/1,
     register_replicas/1,
+    register_timeout/1,
     replicate_timeout/1,
     strict_replication/1,
-    reject_when_degraded/1
+    reject_when_degraded/1,
+    commit_batch_size/1
 ]).
 
 -type config() :: #{atom() => term()}.
@@ -44,6 +46,31 @@ get(Config, Key, Default) ->
 -spec register_replicas(config()) -> non_neg_integer().
 register_replicas(Config) ->
     get(Config, register_replicas, 1).
+
+%% Maximum number of write ops (registrations, unregisters, auto-unregisters) the
+%% leader coalesces into a single group commit.  Ops beyond this ride the following
+%% commit.  This bounds the *inline* per-commit work — plan, replica apply, and the
+%% broadcast fan-out are all O(batch) — so a burst (a node with many names leaving
+%% floods the leader with DOWNs) is split across several bounded commits and the
+%% leader's message loop stays responsive *between* them, instead of freezing under
+%% one enormous batch.  Lower it to cap the burst; raise it to coalesce more
+%% aggressively (fewer commits, larger inline bursts).  Milliseconds of latency, not
+%% correctness: the batched outcome equals sequential processing at any size.
+-spec commit_batch_size(config()) -> pos_integer().
+commit_batch_size(Config) ->
+    get(Config, commit_batch_size, 5000).
+
+%% Caller-side bound (ms) on how long `dgen_registry:register_name/2,3` waits for
+%% its verdict before **exiting** with a call timeout (§3 of the design doc): a
+%% timeout is not converted to `no` — `no` means the leader adjudicated (taken /
+%% no leader / unreachable), a timeout means nothing was adjudicated, and masking
+%% it as `no` would hand OTP's via machinery a wrong `already_started` error.
+%% Unlike the other knobs this one is resolved in the *calling* process, which has
+%% no handle on the per-registry options map — so only the `dgen` application
+%% environment and the built-in default apply (no per-registry override).
+-spec register_timeout(config()) -> pos_integer().
+register_timeout(Config) ->
+    get(Config, register_timeout, 5000).
 
 %% How long a direct registration waits for its replica acks before the timeout
 %% policy (`strict_replication`) fires.  Milliseconds.
@@ -91,6 +118,12 @@ terminate_on_conflict(Config) ->
 %% Kill budget for conflict termination: at most `Count` kills per name per
 %% `WindowMs`, after which the registry stops killing that name and escalates to an
 %% operator (alarm only), so a bug that regenerates a conflict cannot loop.
+%%
+%% Scope caveat: the budget is tracked in the *current leader's* process state and
+%% is not merged across a handoff (unlike the release trail, §5.6) — a leadership
+%% change starts the new leader with a fresh budget for every name.  The bound is
+%% therefore per-name *per leader term*, not global; a conflict that regenerates
+%% across failovers can be killed up to `Count` times per term.
 -spec conflict_kill_budget(config()) -> {pos_integer(), pos_integer()}.
 conflict_kill_budget(Config) ->
     get(Config, conflict_kill_budget, {3, 60000}).
