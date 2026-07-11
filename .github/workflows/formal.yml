@@ -1,0 +1,52 @@
+name: Formal
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+# No `paths` filter on purpose: the spec asserts properties of
+# src/dgen_registry_member.erl, so it should run on code changes too, as a
+# prompt to keep spec and code in step.
+
+env:
+  TLA_VERSION: v1.8.0
+  TLA_SHA256: "33de7da9ce1b7fffb9d1c184021178dbb051747be48504e65c584c423721a32e"
+
+jobs:
+  tlc:
+    runs-on: ubuntu-latest
+    name: TLC ${{ matrix.cfg }} (expect ${{ matrix.expect }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cfg: DgenRegistryReplication
+            expect: pass
+          - cfg: DgenRegistryReplicationHandoffRace
+            expect: fail
+          - cfg: DgenRegistryReplicationNoGuard
+            expect: fail
+          - cfg: DgenRegistryReplicationDegradeOpen
+            expect: fail
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Cache tla2tools.jar
+        id: cache-tla
+        uses: actions/cache@v3
+        with:
+          path: formal/tla2tools.jar
+          key: tla2tools-${{ env.TLA_VERSION }}
+      - name: Download tla2tools.jar
+        if: steps.cache-tla.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL -o formal/tla2tools.jar \
+            "https://github.com/tlaplus/tlaplus/releases/download/${TLA_VERSION}/tla2tools.jar"
+      - name: Verify checksum
+        run: echo "${TLA_SHA256}  formal/tla2tools.jar" | sha256sum -c -
+      - name: Model-check
+        run: formal/check.sh ${{ matrix.cfg }} ${{ matrix.expect }}

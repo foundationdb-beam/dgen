@@ -24,3 +24,7 @@ dgen-*.tar
 
 /.elixir_ls/
 /.erlfdb_sandbox/
+
+# TLA+ model checker jar and TLC scratch directory (formal/PLAN.md §4).
+formal/tla2tools.jar
+formal/states/
