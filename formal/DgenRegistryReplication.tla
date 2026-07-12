@@ -26,6 +26,8 @@ CONSTANTS
     MaxChanLen,         \* state constraint on channel length, e.g. 2
     VersionGuardedAck,  \* TRUE = current code; FALSE = pre-guard bug (mutation)
     DegradeOpen,        \* FALSE = strict_replication; TRUE = degrade-open (mutation)
+    SafeAssume,         \* TRUE = fixed code (version-key-fenced handoff + monotonic
+                        \* snapshot); FALSE = the pre-fix handoff-gather race (mutation)
     NoPid, NoMember     \* model values
 
 ASSUME NoPid \notin Pids
@@ -132,12 +134,26 @@ Elect(m) ==
 \* acks are rejected and pending direct acks resolved-as-rejected, matching
 \* do_leader_changed/reject_forwards; then snapshots fan out to every other
 \* live member from this process (FIFO with later broadcasts).
+\* THE FIX (SafeAssume): the assuming leader must not reconstruct from a gather
+\* that is behind the durable version key.  `maxV` is the freshest applied_version
+\* any live member reports; `dbVersion` is the committed frontier (the version
+\* key, §4.4).  A live member can never be ahead of the frontier, so
+\* `maxV >= dbVersion` means "the freshest live member has applied every committed
+\* batch" — only then does its replica equal the true current map, so freshest-wins
+\* is sound.  Without this guard, a gather that races an in-flight (committed but
+\* not-yet-applied) broadcast reconstructs a *stale* map and then overwrites the
+\* very followers that are about to hold the missing binding — the handoff-gather
+\* race (see formal/README.md).  In the real code this is the new leader comparing
+\* its gathered MaxVersion against the durable version key and retrying/waiting the
+\* gather until caught up (bounded, then assume-degraded — the availability
+\* tradeoff, out of this safety model's scope, analogous to DegradeOpen).
 AssumeGather(m) ==
     /\ alive[m]
     /\ dbLeader = m
     /\ epoch[m] < dbEpoch
     /\ LET maxV == MaxOf({appliedVer[x] : x \in Live})
-       IN \E src \in Live :
+       IN /\ (SafeAssume => maxV >= dbVersion)
+          /\ \E src \in Live :
             /\ appliedVer[src] = maxV
             /\ rep' = [rep EXCEPT ![m] = rep[src]]
             /\ appliedVer' = [appliedVer EXCEPT ![m] = maxV]
@@ -370,12 +386,25 @@ DegradeTimeout(l) ==
 \* leadership change the deferred acks are rejected (do_leader_changed);
 \* on a same-leader snapshot (a resync) the version advance releases them
 \* (flush_deferred).  A member that believed it led relinquishes.
+\*
+\* THE FIX (SafeAssume), second half: the re-baseline must be version-monotonic
+\* — a snapshot may not move a follower BACKWARD in applied_version.  The pre-fix
+\* code guarded only on epoch, so a stale snapshot (an old assume/resync snapshot
+\* delivered late, after the follower already applied a newer broadcast) would
+\* wholesale-overwrite the follower back to older state, silently dropping a row
+\* it — or a peer — had already acked.  With SafeAssume the apply requires
+\* `m.ver >= appliedVer[f]`.  This is sound with the AssumeGather guard above:
+\* a legitimate new leader is caught up (its snapshot's version is >= the durable
+\* frontier >= any follower's applied_version), and a legitimate resync only ever
+\* moves a gapped follower FORWARD, so the guard rejects only genuinely stale
+\* snapshots.  In the real code: add a version check beside the `Epoch >= CurrentEpoch`
+\* check in handle_cast({apply_names_snapshot, ...}).
 RecvSnap(s, f) ==
     /\ alive[f]
     /\ HeadIs(s, f, "snap")
     /\ LET m == Head(chan[s][f]) IN
        /\ chan' = Consume(s, f)
-       /\ IF m.epoch >= epoch[f]
+       /\ IF m.epoch >= epoch[f] /\ (SafeAssume => m.ver >= appliedVer[f])
           THEN LET changed == leaderView[f] # m.ldr
                    flushed == IF changed THEN {}
                               ELSE {d \in deferred[f] : d[3] <= m.ver}

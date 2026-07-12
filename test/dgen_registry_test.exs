@@ -1158,6 +1158,74 @@ defmodule DGen.RegistryTest do
   end
 
   # ---------------------------------------------------------------------------
+  # apply_names_snapshot version-monotonicity — regression for the handoff-gather
+  # race proven in formal/DgenRegistryReplication.tla. A snapshot re-baselines the
+  # whole replica; the pre-fix code guarded only on epoch, so a STALE snapshot (an
+  # old assume/resync snapshot delivered late, after the member applied a newer
+  # broadcast) would overwrite the replica *backward* and silently drop an already
+  # -acked binding. The fix requires the snapshot's version to be >= the member's
+  # applied version. See formal/README.md "Discovered finding and the fix".
+  # ---------------------------------------------------------------------------
+
+  describe "apply_names_snapshot version-monotonicity (handoff-gather race)" do
+    test "a stale-version snapshot does not overwrite a fresher replica", %{reg: reg} do
+      member = :dgen_registry.member_name(reg)
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+
+      # A live, acked binding held at the member's current applied version.
+      :yes = :dgen_registry.register_name({reg, :race_name}, pid)
+      epoch = :dgen_registry.get_epoch(reg)
+      leader = :dgen_registry.get_leader(reg)
+      v = applied_version(member)
+      assert v > 0
+
+      # A newly-assumed leader whose handoff gather raced an in-flight broadcast and
+      # reconstructed a STALE (empty, lower-version) map — the exact shape TLC found.
+      # The higher epoch would let the pre-fix (epoch-only) guard apply it and wipe
+      # the binding; the version-monotonic guard rejects it because its version is
+      # behind what the member has already applied.
+      GenServer.cast(
+        member,
+        {:apply_names_snapshot, %{}, leader, [], %{}, epoch + 1, v - 1}
+      )
+
+      # Barrier: ensure the member has processed (and rejected) the stale snapshot.
+      :sys.get_state(member)
+
+      # The acked binding survived — the stale snapshot was ignored.
+      assert pid == :dgen_registry.whereis_name({reg, :race_name})
+    end
+
+    test "a fresh-version snapshot still re-baselines the replica", %{reg: reg} do
+      member = :dgen_registry.member_name(reg)
+      old_pid = spawn(fn -> Process.sleep(:infinity) end)
+      new_pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(old_pid, :kill) end)
+      on_exit(fn -> Process.exit(new_pid, :kill) end)
+
+      :yes = :dgen_registry.register_name({reg, :old_name}, old_pid)
+      epoch = :dgen_registry.get_epoch(reg)
+      leader = :dgen_registry.get_leader(reg)
+      v = applied_version(member)
+
+      # A legitimate re-baseline at a >= version replaces the whole map (records are
+      # #{Name => {Pid, Index, Data}}, Index the queryable-attr map, Data the metadata).
+      # It must be applied: :old_name is gone, :new_name is present — the monotonic
+      # guard does not block a forward snapshot.
+      GenServer.cast(
+        member,
+        {:apply_names_snapshot, %{new_name: {new_pid, %{}, %{}}}, leader, [], %{}, epoch, v + 1}
+      )
+
+      :sys.get_state(member)
+
+      assert new_pid == :dgen_registry.whereis_name({reg, :new_name})
+      assert :undefined == :dgen_registry.whereis_name({reg, :old_name})
+    end
+  end
+
+  # ---------------------------------------------------------------------------
 
   describe "member_name/1, names_table/1, and elector_pid/1" do
     test "member process is alive after start", %{reg: reg} do

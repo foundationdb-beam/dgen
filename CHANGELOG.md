@@ -62,6 +62,11 @@
     idempotent upsert), so they outlive the whole cluster: an application can tie a
     subscription to a database entity and have presence come back intact after a
     scale-to-zero.
+  - **Formally verified replication.** The replication protocol's core safety
+    properties — prefix consistency, unique binding, two-holder durability across
+    a single node failure, and leader-epoch fencing — are checked exhaustively
+    against a TLA+ model of the protocol (`formal/`), not just tested. See
+    `formal/README.md` for how to run the checker and what it covers.
 
 - **`dgen_transaction` (new behaviour).** Owns a single backend transaction in its
   own process (create → body → commit → retry, with caller-controlled retry

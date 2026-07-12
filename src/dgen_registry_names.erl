@@ -80,7 +80,7 @@
 
 -behaviour(dgen_transaction).
 
--export([read_version/2, start_commit/4, verify_leader/4]).
+-export([read_version/2, read_committed_frontier/2, start_commit/4, verify_leader/4]).
 %% dgen_transaction callbacks (the async, non-blocking, cached-GRV commit path).
 -export([init/1, handle_begin/2, handle_retry/2, handle_committed/2]).
 
@@ -105,6 +105,29 @@ read_version(Tenant = {_Handle, Dir}, Tuid) ->
             Bin -> binary:decode_unsigned(Bin, big)
         end
     end).
+
+-if(?DOCATTRS).
+-doc """
+Reads the durable version key as the **committed frontier on the same scale as a
+member's `applied_version`** (`get_committed_version`).
+
+The version key holds a 10-byte FDB versionstamp — an 8-byte commit version
+followed by a 2-byte in-transaction batch order — so `read_version/2` returns the
+commit version left-shifted 16 bits plus the batch. A member stamps its maps with
+the bare 8-byte commit version, so the two are not directly comparable; this
+shifts the batch bytes off to recover the commit version. Each registry commit is
+its own transaction (a single versionstamp write), so the batch order is always 0,
+but the shift is correct regardless.
+
+Used by the leadership-handoff fence (`dgen_registry_member:gather_caught_up/6`):
+a new leader whose gathered `MaxVersion` is behind this frontier has an incomplete
+reconstruction and re-gathers before assuming — the fix for the handoff-gather
+race (formal/DgenRegistryReplication.tla). Returns `0` if no batch has committed.
+""".
+-endif.
+-spec read_committed_frontier(dgen_backend:tenant(), dgen_server:tuid()) -> non_neg_integer().
+read_committed_frontier(Tenant, Tuid) ->
+    read_version(Tenant, Tuid) bsr 16.
 
 -if(?DOCATTRS).
 -doc """

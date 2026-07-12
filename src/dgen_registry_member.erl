@@ -260,6 +260,15 @@
 %% map within this is skipped (its bindings are unavailable for this gather; a
 %% binding only that member held is then lost — single-fault uniqueness).
 -define(GATHER_TIMEOUT, 2000).
+%% How long the off-loop assume gather keeps re-gathering while its reconstruction is
+%% behind the durable version key (the committed frontier), and how long it pauses
+%% between attempts.  This closes the handoff-gather race proven in
+%% formal/DgenRegistryReplication.tla (the SafeAssume fence): a gather can momentarily
+%% race an in-flight broadcast still queued in a peer's mailbox and reconstruct a stale
+%% map; the peer applies that broadcast within milliseconds, so a brief re-gather
+%% catches up.  Bounded overall by ?GATHER_TIMEOUT (past it the missing version's holder
+%% is genuinely unreachable — a real degrade — so we proceed with what we have).
+-define(ASSUME_CATCHUP_INTERVAL, 25).
 %% Upper bound on the off-loop pull of durable subscriptions from the co-located elector
 %% during a handoff (§4.9).  Short and best-effort: a busy elector falls back to the
 %% empty set, reconciled by a later delta / the next handoff.
@@ -950,7 +959,9 @@ handle_call(
         State#state.applied_version,
         OtherIds,
         State#state.elector,
-        self()
+        self(),
+        State#state.tenant,
+        State#state.tuid
     ),
     %% Clear the leader for the window: we are mid-handoff with no stable leader, so
     %% writes block (no reachable leader) and are re-driven by the continuation — rather
@@ -1228,9 +1239,23 @@ handle_cast({retract_req, LogicalName, Pid}, State) ->
 %% `[{Name, {Pid, Index, Data}}]` list is also accepted — see decode_records/1).
 handle_cast(
     {apply_names_snapshot, RecordsPayload, NewLeader, ExtraMembers, Tokens, Epoch, Version},
-    State = #state{member_id = Self, leader = OldLeader, epoch = CurrentEpoch}
+    State = #state{
+        member_id = Self, leader = OldLeader, epoch = CurrentEpoch, applied_version = CurrentVersion
+    }
 ) ->
-    case Epoch >= CurrentEpoch of
+    %% The re-baseline must be version-MONOTONIC, not merely epoch-guarded.  A snapshot
+    %% carries the sending leader's applied_version; applying one whose version is BEHIND
+    %% what we have already applied would wholesale-overwrite our replica *backward*,
+    %% silently dropping a row we (or a peer) may have already acked.  That is exactly the
+    %% handoff-gather race proven in formal/DgenRegistryReplication.tla: an old assume /
+    %% resync snapshot delivered late — after we applied a newer broadcast — must be
+    %% ignored, not obeyed.  A legitimate re-baseline never moves us backward: a genuine
+    %% new leader is caught up to the durable version key before it fans out (see
+    %% gather_caught_up/6), and a resync only ever carries the leader's current (>=)
+    %% version.  So `Version >= CurrentVersion` rejects only genuinely stale snapshots;
+    %% a rejected one is harmless — the normal gap/resync machinery re-baselines us from
+    %% the current leader.
+    case Epoch >= CurrentEpoch andalso Version >= CurrentVersion of
         true ->
             %% Overwrite the local replica and inverted index with the leader's snapshot
             %% before the leader transition: do_leader_changed -> assume_leadership (if we
@@ -1858,21 +1883,65 @@ spawn_joiner_gather(MemberId, AllIds, Tokens, Epoch, Owner) ->
 %% after the gather means any subscribe committed during the (up to ~?GATHER_TIMEOUT)
 %% gather is captured; a subscribe racing the final millisecond pushes a
 %% {presence_update} delta the now-established leader applies.
-spawn_assume_gather(Ctx, SelfRecords, SelfVersion, OtherIds, Elector, Owner) ->
+spawn_assume_gather(Ctx, SelfRecords, SelfVersion, OtherIds, Elector, Owner, Tenant, Tuid) ->
     _ = spawn(fun() ->
         %% Fall back to a self-only reconstruction if the gather ever throws, so the
         %% continuation still fires and the member is never stranded leaderless (it
         %% assumes with its own replica, degraded — a later handoff reconciles).
         {FreshestRecords, MaxVersion, PeerResults} =
-            try
-                gather_maps(SelfRecords, SelfVersion, OtherIds)
-            catch
-                _:_ -> {SelfRecords, SelfVersion, #{}}
-            end,
+            gather_caught_up(SelfRecords, SelfVersion, OtherIds, Tenant, Tuid),
         Subs = fetch_subscriptions(Elector),
         Owner ! {assume_gathered, Ctx, SelfRecords, FreshestRecords, MaxVersion, PeerResults, Subs}
     end),
     ok.
+
+%% Gather, then ensure the reconstruction is at least as fresh as the durable version
+%% key before returning — the handoff-gather race fix proven in
+%% formal/DgenRegistryReplication.tla (the SafeAssume fence).  The committed frontier is
+%% the durable version key (dgen_registry_names:read_committed_frontier/2); a live member
+%% can never be ahead of it, so a gathered MaxVersion below it means the gather is
+%% incomplete — most
+%% often because it raced an in-flight (committed but not-yet-applied) broadcast still
+%% queued in a reachable peer's mailbox.  Reconstructing from that stale map and fanning
+%% it out would overwrite the very follower about to hold the missing binding, silently
+%% dropping an already-acked registration (the finding).  The lagging peer applies its
+%% queued broadcast within milliseconds, so we briefly re-gather until MaxVersion catches
+%% up to the frontier or ?GATHER_TIMEOUT elapses.  Past the deadline the missing version's
+%% holder is genuinely unreachable (a real degrade / multi-fault, not a race), so we
+%% proceed with what we have — the continuation flags `degraded` and §5.6 backstops any
+%% conflict.  Runs entirely in the off-loop gather helper, so the member loop stays
+%% responsive and healthy handoffs (where MaxVersion already equals the frontier on the
+%% first pass) pay nothing beyond one durable read.
+gather_caught_up(SelfRecords, SelfVersion, OtherIds, Tenant, Tuid) ->
+    Deadline = erlang:monotonic_time(millisecond) + ?GATHER_TIMEOUT,
+    gather_caught_up(SelfRecords, SelfVersion, OtherIds, Tenant, Tuid, Deadline).
+
+gather_caught_up(SelfRecords, SelfVersion, OtherIds, Tenant, Tuid, Deadline) ->
+    Result =
+        {_FreshestRecords, MaxVersion, _PeerResults} =
+        try
+            gather_maps(SelfRecords, SelfVersion, OtherIds)
+        catch
+            _:_ -> {SelfRecords, SelfVersion, #{}}
+        end,
+    %% Best-effort read of the committed frontier — normalised to the same scale as a
+    %% member's applied_version (read_committed_frontier strips the versionstamp's batch
+    %% bytes).  A backend hiccup (or a test double without a real tenant) falls back to 0,
+    %% which disables the fence rather than wedging the handoff — the pre-fix behaviour,
+    %% never worse.
+    DurableVersion =
+        try
+            dgen_registry_names:read_committed_frontier(Tenant, Tuid)
+        catch
+            _:_ -> 0
+        end,
+    case MaxVersion >= DurableVersion orelse erlang:monotonic_time(millisecond) >= Deadline of
+        true ->
+            Result;
+        false ->
+            timer:sleep(?ASSUME_CATCHUP_INTERVAL),
+            gather_caught_up(SelfRecords, SelfVersion, OtherIds, Tenant, Tuid, Deadline)
+    end.
 
 %% Read the durable subscription set from the (co-located) elector — best-effort, under a
 %% short bound so a momentarily-busy elector cannot stall the gather helper: on timeout
