@@ -1,0 +1,325 @@
+# DGen.Registry with Presence
+
+```elixir
+Mix.install([
+  {:erlfdb, "~> 1.0"},
+  {:dgen, github: "foundationdb-beam/dgen"},
+  {:phoenix_playground, "~> 0.1.8"}
+])
+```
+
+## Intro
+
+`DGen.Registry` is a distributed Elixir process registry that is built to
+gracefully and automatically handle nodes joining and leaving your cluster.
+
+If you're already running `DGen`, all you have to do to use the registry is
+
+1. Ensure your nodes are capable of communication (e.g. VM config, network, cookie)
+2. Add a new child to your supervision tree
+
+As long as you do this, `DGen.Registry` will take care of clustering the
+Elixir VMs with each other and will ensure that the dataset they share
+(namely process registrations) is consistent across the cluster.
+
+> **Reminder:** The `DGen` project is a set of OTP-like utilities that inherit
+> their distributed consensus from a backend database. As of the time of
+> writing, the single supported backend is FoundationDB. Thus,
+> `DGen.Registry` requires that your application connects to a running
+> FoundationDB cluster.
+
+## Why a Process Registry?
+
+Elixir natively supports the registration of a process to the local BEAM
+VM via a built-in Erlang implementation. You've likely seen this in code
+that specifies an option like `name: :my_gen_server` to `GenServer.start_link/3`,
+such as this example from the GenServer documentation:
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+# Start the server and register it locally with name MyStack
+{:ok, _} = GenServer.start_link(Stack, "hello", name: MyStack)
+
+# Now messages can be sent directly to MyStack
+GenServer.call(MyStack, :pop)
+#=> "hello"
+```
+
+<!-- livebook:{"break_markdown":true} -->
+
+This is very handy for addressing certain processes in your app, but there is
+something very powerful here that's easy to miss: not only does the registration
+name the process; when the process exits, that registration is automatically
+and immediately cleaned up. This provides a scoping of that piece of
+information to exactly match the lifetime of the process itself.
+
+`DGen.Registry` accomplishes two things for your app:
+
+1. A distributed multi-node registry that's easy to set up
+2. A process <-> metadata linking system for pubsub and presence
+
+## Getting Started
+
+We're going to lay out the skeleton for a real-time chat application. Our users
+will be able to see who is online in real-time, and send a "wave" directly to
+another user - a friendly way to say hello.
+
+We'll start by creating an FDB sandbox and a directory inside which we can
+write some data. We're only going to use a single node for this guide, but
+the instructions don't change at all for the other nodes. There's no
+additional setup.
+
+```elixir
+tenant = :dgen_erlfdb.sandbox_open("livebook", "my_chat_app")
+```
+
+Next, we start the `DGen.Registry` process. This would be added to your
+app's supervision tree.
+
+```elixir
+DGen.Registry.start_link(:chat_registry, tenant)
+```
+
+Any number of Elixir nodes can participate in the `DGen.Registry`. They
+must each specify the same FDB Directory and the same registry name
+(here: `:chat_registry`).
+
+Our chat app will have a simple data model. We allow users to create and
+join rooms. The `DataModel` module allows us to manage the rooms in the
+database.
+
+```elixir
+defmodule DataModel do
+  def read_all_rooms({db, dir}) do
+    rooms = :erlfdb_directory.subspace(dir, {<<"rooms">>})
+    {s, e} = :erlfdb_subspace.range(rooms)
+    :erlfdb.get_range(db, s, e)
+    |> Enum.map(fn {_k, v} -> v end)
+  end
+
+  def write_room({db, dir}, id) do
+    rooms = :erlfdb_directory.subspace(dir, {<<"rooms">>})
+    k = :erlfdb_subspace.pack(rooms, {id})
+    :erlfdb.set(db, k, id)
+  end
+
+  def clear_all_rooms({db, dir}) do
+    rooms = :erlfdb_directory.subspace(dir, {<<"rooms">>})
+    {s, e} = :erlfdb_subspace.range(rooms)
+    :erlfdb.clear_range(db, s, e)
+  end
+end
+```
+
+Our application is more than what is in the database. Rooms don't stay
+empty. Whenever a user joins a room, their presence is a temporary
+and transient property of the room. Let's use the features of `DGen.Registry`
+to tie the room-membership property to the Elixir Process lifetime of
+the user's connection.
+
+Before we continue with the code, let's think about
+the correct scoping of this information. The room exists in the database, and
+our app specifies that for any change to the room membership, we'll alert
+other members of that room. This property is actually tied to the room itself,
+not to the transient members! Therefore, `DGen.Registry` takes the opinionated
+stance that presence **subscriptions are durable** and process **metadata is transient** because processes themselves are transient.
+
+For this reason, the calls to `DGen.Registry.subscribe/4` and `DGen.Registry.unsubscribe/2`
+are colocated with the database updates themselves, whereas the metadata management is reserved for the LiveView itself.
+
+We've used 2 modules to demonstrate this idea, but we could have just as easily
+put all of this into `DataModel`.
+
+We'll see how `DGen.Registry` deals with these subscriptions later.
+
+```elixir
+defmodule Rooms do
+  def read_all_rooms(tenant), do: DataModel.read_all_rooms(tenant)
+
+  def write_room!(tenant, id) do
+    :ok = DataModel.write_room(tenant, id)
+
+    # The subscription defines 2 queries on the metadata:
+    #  - Watch: whenever the set of processes with %{in_room: id}
+    #    changes, the subscription is activated.
+    #  - Notify: When the subscription is activated, we query
+    #    the metadata with %{in_room: id} to find the set of
+    #    processes that must be notified.
+    #
+    # In short, this subscription says that all processes registered
+    # to %{in_room: id} are interested in each other.
+    :ok = DGen.Registry.subscribe(:chat_registry, id,
+      %{in_room: id},  # Watch for changes
+      %{in_room: id}   # Notify these listeners
+    )
+  end
+
+  def clear_all_rooms!(tenant) do
+    read_all_rooms(tenant)
+    |> Enum.each(&DGen.Registry.unsubscribe(:chat_registry, &1))
+    DataModel.clear_all_rooms(tenant)
+  end
+end
+```
+
+Let's create some rooms.
+
+```elixir
+Rooms.clear_all_rooms!(tenant)
+Rooms.write_room!(tenant, "Elixir fans")
+Rooms.write_room!(tenant, "Erlang fans")
+Rooms.write_room!(tenant, "Gleam fans")
+```
+
+Next, we'll confirm that the subscriptions are live.
+
+```elixir
+DGen.Registry.subscriptions(:chat_registry)
+```
+
+Finally, here's the LiveView bringing it all together.
+
+**Key takeaways:**
+
+1. Presence **subscriptions are durable** and associated
+   with the lifetime of the database object, and process **metadata is transient** and associated with the lifetime of the process. The subscription defines a relationship between processes who may
+   not exist yet.
+2. This all works the same way for multi-node clusters.
+
+```elixir
+defmodule ChatLive do
+  use Phoenix.LiveView
+
+  @default_assigns self: nil, count: 0, room_id: nil, rooms: [], members: []
+
+  def mount(_params, _session, socket) do
+    socket = assign(socket, @default_assigns)
+
+    socket = if connected?(socket) do
+      ref = "member_#{id()}"
+
+      # Register this view with DGen.Registry. No metadata yet,
+      # because we haven't joined a room yet. See the "join" event.
+      :yes = DGen.Registry.register_name({:chat_registry, ref}, self())
+
+      tenant = tenant()
+      socket
+        |> put_private(:tenant, tenant)
+        |> assign(
+          self: ref,
+          rooms: Rooms.read_all_rooms(tenant)
+        )
+    else
+      socket
+    end
+    {:ok, socket}
+  end
+
+  def render(assigns) do
+    ~H"""
+    <div>I am {@self}.</div>
+    <div>Wave Count: {@count}</div>
+    <div>Rooms</div>
+    <ul>
+      <li :for={id <- @rooms}>
+        <button phx-click="join" phx-value-id={id}>Join</button>
+        {id}
+      </li>
+    </ul>
+    <div :if={@room_id}>
+      <div>In Room: {@room_id}</div>
+      <div>Members online now:</div>
+      <ul>
+        <li :for={pname <- @members}>
+          <button phx-click="wave" phx-value-pname={pname}>Wave</button>
+          {pname}
+        </li>
+      </ul>
+    </div>
+    <style type="text/css">
+      body { padding: 1em; }
+    </style>
+    """
+  end
+
+  def handle_event("join", %{"id" => id}, socket=%{assigns: %{room_id: id}}) do
+    {:noreply, socket}
+  end
+
+  def handle_event("join", %{"id" => id}, socket) do
+
+    # Joining a room simply means that we set our metadata
+    # to %{in_room: id}. The DGen.Registry subscription takes
+    # care of the rest. See handle_info({:dgen_presence, ...}, ...)
+    # for the message delivery.
+    DGen.Registry.set_metadata(
+      {:chat_registry, socket.assigns.self},
+      %{index: %{in_room: id}}
+    )
+
+    {:noreply, socket
+      |> assign(
+        room_id: id,
+        members: []
+      )
+    }
+  end
+
+  def handle_event("wave", %{"pname" => pname}, socket) do
+
+    # Waving to another member of the room means we just
+    # need to find the pid and send a direct message. This
+    # is essentially pubsub without a middleman. This idea
+    # can be easily enhanced to a full pubsub feature by using
+    # :topic metadata.
+    pid = DGen.Registry.whereis_name({:chat_registry, pname})
+    send(pid, {:wave_from, socket.assigns.self})
+
+    {:noreply, socket}
+  end
+
+  def handle_info({:dgen_presence, id, presence},
+    socket=%{assigns: %{room_id: id}}) do
+
+    # The :dgen_presence message describes changes to
+    # the set of processes with {:joined, ...} and {:left, ...}
+    # tuples. We use MapSet to update our list of members.
+    members = MapSet.new(socket.assigns.members)
+    members = Enum.reduce(presence, members,
+      fn
+        {:joined, pname, _pid}, acc ->
+          MapSet.put(acc, pname)
+        {:left, pname, _pid}, acc ->
+          MapSet.delete(acc, pname)
+      end
+    )
+
+    {:noreply,
+      socket
+      |> assign(members: Enum.into(members, []))
+    }
+  end
+
+  def handle_info({:wave_from, _other}, socket) do
+    # Receive the friendly wave. Update a counter for demo feedback.
+    count = socket.assigns.count
+    {:noreply, assign(socket, :count, count+1)}
+  end
+
+  defp tenant() do
+    :dgen_erlfdb.sandbox_open("livebook", "my_chat_app")
+  end
+
+  defp id(), do: :erlang.unique_integer([:positive])
+end
+
+
+```
+
+We're ready to execute our app. You can open multiple tabs to
+experiment with the presence flows.
+
+```elixir
+PhoenixPlayground.start(live: ChatLive)
+```

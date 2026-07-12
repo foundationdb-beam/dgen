@@ -49,6 +49,7 @@ defmodule Dgen.MixProject do
         "docs/design/dgen_registry_design.md",
         "docs/getting_started/dgen-intro.livemd",
         "docs/getting_started/dgen-registry-intro.livemd",
+        "docs/getting_started/presence-demo.livemd",
         {"formal/README.md",
          [filename: "dgen_registry_formal", title: "dgen_registry Formal Model"]}
       ],

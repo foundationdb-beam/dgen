@@ -1,4 +1,4 @@
-# Distributed GenServer Introduction
+# DGen.Server
 
 ```elixir
 Mix.install([
