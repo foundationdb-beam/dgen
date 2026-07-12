@@ -44,14 +44,18 @@ defmodule Dgen.MixProject do
       extras: [
         "README.md",
         "CHANGELOG.md",
+        "LICENSE.md",
         "docs/design/dgen_server_design.md",
         "docs/design/dgen_registry_design.md",
         "docs/getting_started/dgen-intro.livemd",
-        "docs/getting_started/dgen-registry-intro.livemd"
+        "docs/getting_started/dgen-registry-intro.livemd",
+        {"formal/README.md",
+         [filename: "dgen_registry_formal", title: "dgen_registry Formal Model"]}
       ],
       groups_for_extras: [
         "Getting Started": ~r/getting_started/,
-        Design: ~r/design/
+        Design: ~r/design/,
+        "Formal Methods": ~r/formal/
       ]
     ]
   end

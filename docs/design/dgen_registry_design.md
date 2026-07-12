@@ -736,6 +736,40 @@ application's responsibility (§5.4). The one thing that *is* repaired automatic
 a resulting **conflict**: if such a name was reissued while the holder was away, the
 two live claimants are reconciled by termination (§5.6) when the member returns.
 
+Two subtleties make that freshest-wins claim watertight rather than merely
+usual-case. A reachable member's report can be *transiently* behind an
+already-committed batch still in flight to it from the deposed leader — a
+broadcast cast queued but not yet processed, since Erlang gives no ordering
+guarantee between messages sent by different processes (the deposed leader's
+broadcast and the gather's own request are independent senders, and the
+network is free to deliver either first). Left unhandled, a gather that races
+ahead of that in-flight broadcast would reconstruct a map missing a binding
+its second holder was about to record — and then, worse, its resulting
+snapshot would overwrite that follower once the broadcast finally landed,
+silently erasing the very copy that made the registration two-holder in the
+first place. Two guards close this:
+
+- The gather is **fenced against the durable version key** (§4.4): a live
+  member can never be ahead of it, so the assuming leader compares its
+  gathered maximum version against the version key and re-gathers — bounded,
+  short retries — until it catches up, rather than finalizing on a report it
+  knows is stale. Past the bound it proceeds anyway (a genuinely unreachable
+  holder, not a race, is the ordinary degraded case and is backstopped by
+  §5.6).
+- Any wholesale re-baseline a member applies — a handoff snapshot or a resync
+  answer — is **version-monotonic**: a member accepts it only if its version
+  is at least as fresh as what the member already holds. A snapshot computed
+  before a batch was gathered but delivered after the member independently
+  applied that batch is therefore rejected rather than obeyed, so a handoff
+  can never roll a member's replica backward.
+
+Together these mean the handoff reconstruction is sound not just in the
+common case where every reachable member has already drained its mailbox, but
+under the interleaving where it hasn't. This is exactly the class of
+correctness argument formal methods are suited to; see
+[`formal/README.md`](../../formal/README.md) for the TLA+ model that checks it
+(and the counterexample it produces if either guard above is disabled).
+
 Two smaller handoff properties are worth stating. First, a handoff always reaches its
 new leader eventually: the membership change and the new leadership record commit
 atomically, and if the notification that follows is lost (the notifying process

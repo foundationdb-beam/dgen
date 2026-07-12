@@ -3,6 +3,8 @@ defmodule DGen.RegistryClusterTest do
   # transactions from multiple nodes — run sequentially.
   use DGen.Case, async: false
 
+  require Logger
+
   import DGen.ClusterHelper, only: [await_leader!: 1, eventually: 1, eventually: 2]
 
   # ---------------------------------------------------------------------------
@@ -129,6 +131,32 @@ defmodule DGen.RegistryClusterTest do
     :peer.call(peer_pid, :erlang, :spawn, [:timer, :sleep, [:infinity]])
   end
 
+  # Raw materials for `cp_refusals_hold?/4` and the diagnostic dump below: issue
+  # both probes against `side` and return what actually came back, uncollapsed,
+  # so a diagnostic snapshot can show the real register/read results instead of
+  # just the pass/fail verdict.
+  defp raw_cp_probe(side, peer_pid, reg, held_name) do
+    probe_pid = side_spawn(side, peer_pid)
+    probe_name = {:cp_probe, :erlang.unique_integer([:positive])}
+
+    register =
+      try do
+        side_call(side, peer_pid, :dgen_registry, :register_name, [{reg, probe_name}, probe_pid])
+      catch
+        # Blocked past register_timeout and exited — a refusal.
+        kind, reason -> {:caught, kind, reason}
+      end
+
+    read =
+      try do
+        side_call(side, peer_pid, :dgen_registry, :whereis_name_consistent, [{reg, held_name}])
+      catch
+        kind, reason -> {:caught, kind, reason}
+      end
+
+    %{register: register, read: read}
+  end
+
   # Do both CP refusals hold on `side` right now?
   #
   # (1) A write must NOT succeed (`:yes`). Depending on what that side believes,
@@ -142,26 +170,49 @@ defmodule DGen.RegistryClusterTest do
   #     `:undefined` (Guarantee 5's denial path) — never the stale pid as
   #     authoritative.
   defp cp_refusals_hold?(side, peer_pid, reg, held_name) do
-    probe_pid = side_spawn(side, peer_pid)
-    probe_name = {:cp_probe, :erlang.unique_integer([:positive])}
+    %{register: register, read: read} = raw_cp_probe(side, peer_pid, reg, held_name)
+    register != :yes and read == :undefined
+  end
 
-    reg_refused =
-      try do
-        side_call(side, peer_pid, :dgen_registry, :register_name, [{reg, probe_name}, probe_pid]) !=
-          :yes
-      catch
-        # Blocked past register_timeout and exited — a refusal.
-        _, _ -> true
-      end
+  # Best-effort forensic snapshot for when the CP-refusal settle poll times out.
+  # Logged (not printed) so ExUnit's `capture_log` only surfaces it on a failing
+  # test — passing runs never see this. Every call here is independently
+  # try/rescued: a diagnostic probe must never itself raise and obscure the
+  # original assertion failure. Taken immediately after the settle poll gives
+  # up, so it reflects the stuck state, not necessarily the exact instant of
+  # the 30s deadline — but the poll ran every 20ms right up to it, so the two
+  # are effectively the same moment.
+  defp log_cp_settle_diagnostics(peer_node, peer_pid, reg, held_name) do
+    primary_view = %{
+      leader: safe(fn -> :dgen_registry.get_leader(reg) end),
+      epoch: safe(fn -> :dgen_registry.get_epoch(reg) end),
+      members: safe(fn -> :dgen_registry.get_members(reg) end),
+      connected_nodes: safe(fn -> Node.list() end)
+    }
 
-    read =
-      try do
-        side_call(side, peer_pid, :dgen_registry, :whereis_name_consistent, [{reg, held_name}])
-      catch
-        _, _ -> :not_undefined
-      end
+    peer_view = %{
+      leader: safe(fn -> :peer.call(peer_pid, :dgen_registry, :get_leader, [reg], 5_000) end),
+      epoch: safe(fn -> :peer.call(peer_pid, :dgen_registry, :get_epoch, [reg], 5_000) end),
+      members: safe(fn -> :peer.call(peer_pid, :dgen_registry, :get_members, [reg], 5_000) end),
+      connected_nodes: safe(fn -> :peer.call(peer_pid, :erlang, :nodes, [], 5_000) end)
+    }
 
-    reg_refused and read == :undefined
+    primary_probe = safe(fn -> raw_cp_probe(:primary, peer_pid, reg, held_name) end)
+    peer_probe = safe(fn -> raw_cp_probe(:peer, peer_pid, reg, held_name) end)
+
+    Logger.error("""
+    CP-refusal settle timed out — post-failure diagnostic snapshot:
+      primary (#{inspect(node())}): #{inspect(primary_view)}
+      peer    (#{inspect(peer_node)}): #{inspect(peer_view)}
+      primary probe (writes/reads issued locally):        #{inspect(primary_probe)}
+      peer probe (writes/reads issued via :peer channel):  #{inspect(peer_probe)}
+    """)
+  end
+
+  defp safe(fun) do
+    fun.()
+  catch
+    kind, reason -> {:caught, kind, reason}
   end
 
   # Boots a 3-member cluster where `leader_node` becomes leader *before* the
@@ -822,17 +873,38 @@ defmodule DGen.RegistryClusterTest do
       # there simultaneously. Mid-storm iterations simply return false.
       primary = node()
 
-      assert eventually(
-               fn ->
-                 case :dgen_registry.get_leader(reg) do
-                   {^primary, _} -> cp_refusals_hold?(:peer, peer_pid, reg, :cp_name)
-                   {^peer_node, _} -> cp_refusals_hold?(:primary, peer_pid, reg, :cp_name)
-                   _ -> false
-                 end
-               end,
-               30_000
-             ),
-             "the non-leader side never settled into the CP refusals"
+      settled? =
+        eventually(
+          fn ->
+            # dgen's own mesh actively reconnects a still-committed member roughly
+            # MESH_DOWN_COOLDOWN..MESH_DOWN_COOLDOWN + MESH_INTERVAL (10-20s) after a
+            # nodedown, by design (dgen_registry_connector.erl) -- this test's peer
+            # never leaves the durable member set, so it is exactly the case that
+            # self-heal targets. Left unchecked, that reconnect races this 30s
+            # observation window: under load (slower leader settle eating into the
+            # window) it can silently heal the simulated partition before, or while,
+            # we're checking for the refusal -- producing a fully converged, agreeing
+            # cluster at diagnostic time instead of a stuck one (see the flake this
+            # replaced). Re-assert the disconnect on every tick so the partition is
+            # continuously sustained regardless of how long settling takes; probing
+            # the peer still works because it goes over the separate :peer stdio
+            # channel, not Erlang distribution.
+            :net_kernel.disconnect(peer_node)
+
+            case :dgen_registry.get_leader(reg) do
+              {^primary, _} -> cp_refusals_hold?(:peer, peer_pid, reg, :cp_name)
+              {^peer_node, _} -> cp_refusals_hold?(:primary, peer_pid, reg, :cp_name)
+              _ -> false
+            end
+          end,
+          30_000
+        )
+
+      unless settled? do
+        log_cp_settle_diagnostics(peer_node, peer_pid, reg, :cp_name)
+      end
+
+      assert settled?, "the non-leader side never settled into the CP refusals"
 
       # Heal: the cluster reconstitutes and serves writes again.
       Node.connect(peer_node)
