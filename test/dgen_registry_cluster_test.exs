@@ -876,6 +876,21 @@ defmodule DGen.RegistryClusterTest do
       settled? =
         eventually(
           fn ->
+            # dgen's own mesh actively reconnects a still-committed member roughly
+            # MESH_DOWN_COOLDOWN..MESH_DOWN_COOLDOWN + MESH_INTERVAL (10-20s) after a
+            # nodedown, by design (dgen_registry_connector.erl) -- this test's peer
+            # never leaves the durable member set, so it is exactly the case that
+            # self-heal targets. Left unchecked, that reconnect races this 30s
+            # observation window: under load (slower leader settle eating into the
+            # window) it can silently heal the simulated partition before, or while,
+            # we're checking for the refusal -- producing a fully converged, agreeing
+            # cluster at diagnostic time instead of a stuck one (see the flake this
+            # replaced). Re-assert the disconnect on every tick so the partition is
+            # continuously sustained regardless of how long settling takes; probing
+            # the peer still works because it goes over the separate :peer stdio
+            # channel, not Erlang distribution.
+            :net_kernel.disconnect(peer_node)
+
             case :dgen_registry.get_leader(reg) do
               {^primary, _} -> cp_refusals_hold?(:peer, peer_pid, reg, :cp_name)
               {^peer_node, _} -> cp_refusals_hold?(:primary, peer_pid, reg, :cp_name)

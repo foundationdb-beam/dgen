@@ -103,10 +103,4 @@ jobs:
       - run: mix deps.get --only test
       - run: mix deps.compile
       - run: mix compile --warnings-as-errors
-      # --max-cases caps how many async test modules run concurrently. CI runners
-      # share a real fdbserver process and a handful of CPUs (the default here is
-      # 2x schedulers, i.e. ~8), so heavy async concurrency contends with the
-      # cluster tests' real timing budgets (leadership settle, elector probes) and
-      # makes them flaky under load in a way they never are on a quieter local
-      # machine. Local `mix test` is untouched (still defaults to 2x schedulers).
-      - run: mix test --max-cases 2
+      - run: mix test
