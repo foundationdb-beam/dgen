@@ -1,4 +1,4 @@
-# Formal model: `dgen_registry_member` replication
+# dgen_registry Formal Model
 
 ## Why this exists
 
