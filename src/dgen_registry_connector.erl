@@ -45,6 +45,38 @@
 %% `net_kernel:monitor_nodes/1` (multiple subscribers each receive the events): the
 %% member reacts to `{nodeup, _}` by re-announcing its own `{join}` (membership
 %% identity); this connector reacts by clearing suppression and re-meshing.
+%%
+%% ## Connectivity modes (`connectivity`, §8)
+%%
+%% The connector runs in one of two modes, resolved once at `init/1` from the
+%% registry's `connectivity` option (`dgen_config:connectivity/1`):
+%%
+%% - **`self_managed`** (default) — the full behaviour described above: the proactive
+%%   mesh reads the authoritative member set on a timer and connects to every member
+%%   node, so this registry is self-sufficient for distribution convergence.
+%%
+%% - **`provided_externally`** — the **mesh is off**.  The connector opens no
+%%   distribution connections and never reads the member set on a timer; it assumes the
+%%   links it needs are established by something else on the node (typically another,
+%%   `self_managed`, "system" registry whose member set spans a superset of this
+%%   registry's nodes — distribution links are node-global, so a tenant registry
+%%   free-rides on them).  What it still does is exactly the set of duties that are
+%%   **registry-scoped and cannot be delegated**: the stranded-member reap (`nodedown`
+%%   → fenced `{member_down}`), the leader-liveness probe, and the `{durable_epoch, _}`
+%%   nudge.  Because the epoch nudge normally piggybacks on the mesh fetch, in this mode
+%%   it is re-homed onto its own `epoch_check` timer.  The connector still subscribes to
+%%   `net_kernel:monitor_nodes/1` — `nodedown` drives the reap and `nodeup` feeds the
+%%   probe's `ever_connected` gate — it simply never *initiates* a connection.
+%%
+%%   This mode trades a guarantee for a saving: it sheds the per-registry mesh work
+%%   (the periodic durable `get_members` read and the redundant `connect_node` calls),
+%%   which is the bulk of a co-located registry's connectivity overhead, in exchange for
+%%   the deployer's promise that connectivity is provided.  If that promise is broken —
+%%   a member on a node the provider does not span — the node is silently isolated and
+%%   answers the CP write refusals (§5.3).  As a cheap backstop against that footgun, a
+%%   `provided_externally` connector that observes **no elected leader for a sustained
+%%   window** logs a warning naming the delegated-connectivity contract, rather than
+%%   failing quietly.  See §4.6 of the design doc for the full rationale and contract.
 
 -export([start_link/2]).
 -export([
@@ -101,21 +133,44 @@
 -define(LEADER_PROBE_GRACE, 4000).
 -define(LEADER_PROBE_INTERVAL, 4000).
 
+%% `provided_externally` only (§8): how often the connector nudges its member with the
+%% committed election epoch (the missed-handoff backstop), re-homed here because the
+%% nudge normally piggybacks on the — now absent — mesh fetch.  The same tick drives the
+%% isolation-warning check below.  Matches the mesh cadence it replaces.
+-define(EPOCH_CHECK_INTERVAL, 10000).
+
+%% `provided_externally` only: after this many consecutive `epoch_check` ticks with no
+%% elected leader, log a warning that connectivity may not be provided (the footgun of
+%% delegating the mesh to a provider that does not span this node).  At
+%% ?EPOCH_CHECK_INTERVAL this is ~60 s — long enough that ordinary startup and handoff
+%% windows do not trip it, short enough to surface a real isolation quickly.
+-define(ISOLATION_WARN_TICKS, 6).
+
 -record(state, {
     %% The member's registered name — also this registry's name, and the target of the
     %% `{durable_epoch, _}` nudge.  Self node is always `node()`.
     name :: atom(),
+    %% Connectivity mode (§8), resolved once at init from `dgen_config:connectivity/1`.
+    %% `self_managed` runs the proactive mesh; `provided_externally` turns it off and
+    %% runs the epoch-nudge/isolation-warning timer instead.  See the moduledoc.
+    mode = self_managed :: self_managed | provided_externally,
     %% The elector pid, discovered once via the shared supervisor in `discover_elector`
     %% (like the member).  `undefined` only between init/1 and that continuation.
     elector :: pid() | undefined,
     %% Nodes whose `nodedown` we saw within the last ?MESH_DOWN_COOLDOWN ms → timestamp.
     %% The proactive mesh skips these so it does not reconnect a node the instant it
     %% drops (letting the departure settle as a {member_down}); cleared on {nodeup}.
+    %% Unused in `provided_externally` mode (no mesh consults it).
     recently_down = #{} :: #{node() => integer()},
     %% Nodes connected to at least once in this connector's lifetime — seeded from
     %% nodes() at init, extended on every {nodeup, _}, never pruned.  Gates the
     %% leader-liveness probe (see ?LEADER_PROBE_GRACE).
-    ever_connected = #{} :: #{node() => true}
+    ever_connected = #{} :: #{node() => true},
+    %% `provided_externally` only: consecutive `epoch_check` ticks observed with no
+    %% elected leader, and whether the isolation warning has already been logged (a
+    %% latch, reset when a leader is next seen).  See ?ISOLATION_WARN_TICKS.
+    no_leader_ticks = 0 :: non_neg_integer(),
+    isolation_warned = false :: boolean()
 }).
 
 %% ---------------------------------------------------------------------------
@@ -133,14 +188,17 @@ start_link(Name, Args) ->
 %% gen_server callbacks
 %% ---------------------------------------------------------------------------
 
-init(#{name := Name}) ->
+init(#{name := Name} = Args) ->
     net_kernel:monitor_nodes(true),
+    Mode = dgen_config:connectivity(maps:get(config, Args, #{})),
     %% The elector pid cannot be resolved from init/1: the supervisor is still
     %% synchronously inside start_child for *this* process, so which_children would
-    %% deadlock.  Defer to discover_elector, which also kicks off the first mesh pass.
+    %% deadlock.  Defer to discover_elector, which also kicks off the first mesh pass
+    %% (self_managed) or the epoch-nudge timer (provided_externally).
     {ok,
         #state{
             name = Name,
+            mode = Mode,
             elector = undefined,
             recently_down = #{},
             %% A node connected at connector start counts as "ever connected".
@@ -152,14 +210,23 @@ init(#{name := Name}) ->
 %% longer blocked on this process's init/1) and start the connectivity loops.  The
 %% member is started before this connector (see the supervisor child order), so it is
 %% already registered and `dgen_registry:elector_pid/1` can walk from it to the elector.
-handle_continue(discover_elector, State = #state{name = Name}) ->
+handle_continue(discover_elector, State = #state{name = Name, mode = Mode}) ->
     Elector = dgen_registry:elector_pid(Name),
     true = is_pid(Elector),
-    %% Proactively connect distribution to every member node, now and periodically, so
-    %% the cluster converges to a full mesh (see mesh_connect).
-    self() ! mesh_connect,
+    case Mode of
+        self_managed ->
+            %% Proactively connect distribution to every member node, now and
+            %% periodically, so the cluster converges to a full mesh (see mesh_connect).
+            self() ! mesh_connect;
+        provided_externally ->
+            %% No mesh: connectivity is provided elsewhere (§4.6).  Drive only the
+            %% epoch nudge (normally piggybacked on the mesh fetch) and the isolation
+            %% warning on the epoch tick.
+            erlang:send_after(?EPOCH_CHECK_INTERVAL, self(), epoch_check)
+    end,
     %% Backstop the nodedown-driven failover for a leader we never connected to (see
-    %% probe_leader).  Delayed so a genuinely-reachable leader is meshed first.
+    %% probe_leader).  Delayed so a genuinely-reachable leader is meshed first.  Active
+    %% in both modes — it is a registry-scoped duty, not part of the mesh.
     erlang:send_after(?LEADER_PROBE_GRACE, self(), probe_leader),
     {noreply, State#state{elector = Elector}}.
 
@@ -169,20 +236,56 @@ handle_call(_Request, _From, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-%% A node became reachable: clear any mesh suppression for it, record it as
-%% ever-connected (the probe gate), and re-mesh so we also reconnect to any other
-%% members we lost touch with.  The member independently handles {nodeup, _} to
-%% re-announce its own {join}; that is its concern, not ours.
+%% A node became reachable: record it as ever-connected (the probe gate) always, and —
+%% in `self_managed` mode — clear any mesh suppression for it and re-mesh so we also
+%% reconnect to any other members we lost touch with.  In `provided_externally` mode
+%% there is no mesh to drive; the ever_connected update (for the leader probe) is the
+%% only reaction.  The member independently handles {nodeup, _} to re-announce its own
+%% {join}; that is its concern, not ours.
+handle_info({nodeup, Node}, State = #state{mode = provided_externally}) ->
+    Ever = maps:put(Node, true, State#state.ever_connected),
+    {noreply, State#state{ever_connected = Ever}};
 handle_info({nodeup, Node}, State) ->
     RD = maps:remove(Node, State#state.recently_down),
     Ever = maps:put(Node, true, State#state.ever_connected),
     self() ! mesh_connect,
     {noreply, State#state{recently_down = RD, ever_connected = Ever}};
-%% A node dropped: remember it briefly so the mesh does not immediately reconnect it
-%% (let the departure settle as a {member_down}), and start the backstop reap.
+%% A node dropped: start the backstop reap (both modes — it is registry-scoped).  In
+%% `self_managed` mode also remember it briefly so the mesh does not immediately
+%% reconnect it (let the departure settle as a {member_down}); `provided_externally`
+%% opens no connections, so it keeps no suppression state.
+handle_info({nodedown, Node}, State = #state{mode = provided_externally}) ->
+    schedule_reap(Node, ?REAP_ATTEMPTS),
+    {noreply, State};
 handle_info({nodedown, Node}, State = #state{recently_down = RD}) ->
     schedule_reap(Node, ?REAP_ATTEMPTS),
     {noreply, State#state{recently_down = RD#{Node => erlang:system_time(millisecond)}}};
+%% `provided_externally` only: the mesh's epoch nudge is re-homed here.  Read the
+%% committed epoch (nudge the member on a missed handoff) and the current leader (drive
+%% the isolation warning), both off the loop; the leader observation is reported back as
+%% `{connectivity_leader, _}`.  Re-arm the tick.
+handle_info(epoch_check, State = #state{elector = Elector, name = Name}) ->
+    erlang:send_after(?EPOCH_CHECK_INTERVAL, self(), epoch_check),
+    spawn_epoch_check(Elector, Name, self()),
+    {noreply, State};
+%% Isolation warning (provided_externally): a leader observation from spawn_epoch_check.
+%% No leader for ?ISOLATION_WARN_TICKS consecutive ticks latches a one-shot warning that
+%% names the delegated-connectivity contract (§4.6) — the cheap backstop for a member on
+%% a node the external provider does not span.  Seeing a leader resets the counter and
+%% re-arms the latch.
+handle_info({connectivity_leader, undefined}, State = #state{no_leader_ticks = N}) ->
+    N1 = N + 1,
+    Warned1 =
+        case N1 >= ?ISOLATION_WARN_TICKS andalso not State#state.isolation_warned of
+            true ->
+                warn_possible_isolation(State#state.name, N1),
+                true;
+            false ->
+                State#state.isolation_warned
+        end,
+    {noreply, State#state{no_leader_ticks = N1, isolation_warned = Warned1}};
+handle_info({connectivity_leader, _Leader}, State) ->
+    {noreply, State#state{no_leader_ticks = 0, isolation_warned = false}};
 %% Backstop reap: while `Node` is still disconnected, report `member_down` for any
 %% member the elector still lists on it, then re-arm for a few attempts.  Stops as soon
 %% as the node reconnects (a live member re-announces and its `{join}` wins) or the
@@ -327,14 +430,7 @@ spawn_probe_leader(Elector, SelfNode, EverConnected) ->
 %% a fetch spawned before a node dropped cannot reconnect it with a stale snapshot.
 spawn_mesh_fetch(Elector, Connector, MemberName) ->
     _ = spawn(fun() ->
-        try dgen_server:priority_call(Elector, get_epoch) of
-            DurableEpoch when is_integer(DurableEpoch) ->
-                MemberName ! {durable_epoch, DurableEpoch};
-            _ ->
-                ok
-        catch
-            _:_ -> ok
-        end,
+        nudge_durable_epoch(Elector, MemberName),
         try dgen_server:call(Elector, get_members) of
             Members when is_list(Members) ->
                 Connector ! {mesh_members, [Node || {Node, _Name} <- Members]};
@@ -344,6 +440,53 @@ spawn_mesh_fetch(Elector, Connector, MemberName) ->
             _:_ -> ok
         end
     end),
+    ok.
+
+%% `provided_externally` counterpart to spawn_mesh_fetch's epoch half.  With no mesh to
+%% ride, the epoch nudge gets its own off-loop pass, and the same pass reads the current
+%% leader and reports it back as `{connectivity_leader, _}` so the connector can drive
+%% the isolation warning.  Reads only (priority calls); opens no connection.
+spawn_epoch_check(Elector, MemberName, Connector) ->
+    _ = spawn(fun() ->
+        nudge_durable_epoch(Elector, MemberName),
+        Leader =
+            try dgen_server:priority_call(Elector, get_leader) of
+                L -> L
+            catch
+                %% Treat an unreachable/erroring elector as "no leader observed" — it
+                %% counts toward the isolation window rather than being swallowed.
+                _:_ -> undefined
+            end,
+        Connector ! {connectivity_leader, Leader}
+    end),
+    ok.
+
+%% Read the committed election epoch (a priority read) and nudge the member with it: if
+%% it is ahead of what the member has heard, a leadership handoff never reached this node
+%% and the member re-joins to trigger a fresh assume/fan-out.  Shared by the mesh fetch
+%% (self_managed) and the epoch check (provided_externally).
+nudge_durable_epoch(Elector, MemberName) ->
+    try dgen_server:priority_call(Elector, get_epoch) of
+        DurableEpoch when is_integer(DurableEpoch) ->
+            MemberName ! {durable_epoch, DurableEpoch};
+        _ ->
+            ok
+    catch
+        _:_ -> ok
+    end,
+    ok.
+
+%% Log the delegated-connectivity isolation warning (provided_externally, §4.6).  A
+%% latched one-shot: fired once when no leader has been seen for ?ISOLATION_WARN_TICKS
+%% consecutive ticks, re-armed when a leader reappears.
+warn_possible_isolation(Name, Ticks) ->
+    logger:warning(
+        "dgen_registry ~p: connectivity=provided_externally but no leader has been "
+        "observed for ~b checks (~b ms). Distribution connectivity for this registry is "
+        "delegated (§4.6) — verify a self_managed provider registry spans this node, or "
+        "this node may be isolated and refusing writes (CP, §5.3).",
+        [Name, Ticks, Ticks * ?EPOCH_CHECK_INTERVAL]
+    ),
     ok.
 
 %% Connect Erlang distribution to each target member node, off the loop (the handshake

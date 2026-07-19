@@ -61,7 +61,10 @@ defmodule DGen.Registry do
   Starts the registry `name` with per-registry options `opts`.
 
   See `docs/dgen_registry_design.md` (§8 Configuration) for the available
-  tuning knobs (`register_replicas`, `strict_replication`, etc.).
+  tuning knobs (`register_replicas`, `strict_replication`,
+  `connectivity`, etc.). Set `connectivity: :provided_externally` to turn
+  off this registry's proactive distribution mesh so it free-rides on the
+  connections another registry maintains (§4.6).
   """
   defdelegate start_link(name, tenant, opts), to: :dgen_registry
 

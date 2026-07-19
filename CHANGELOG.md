@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.4.1 (TBD)
+
+### Enhancements
+
+- **`dgen_registry` — delegable distribution connectivity (`connectivity` option).**
+  Each registry runs a `connector` process that keeps the Erlang-distribution mesh in
+  step with membership. Meshing is a *node-level* concern (distribution is one shared set
+  of TCP links), but a node hosting many registries — an explicitly supported pattern,
+  e.g. one registry per tenant (§4.8) — runs one connector per registry, each doing its
+  own periodic durable `get_members` read and `connect_node` sweep. That work scales with
+  the number of registries on the node, not the cluster size.
+
+  The new per-registry `connectivity` option lets you collapse the duplication by hand:
+
+  - `self_managed` (default) — unchanged: the registry runs its own proactive mesh and is
+    self-sufficient.
+  - `provided_externally` — the proactive mesh is **off** (no `connect_node`, no periodic
+    member-set read). The registry free-rides on the distribution links another registry
+    on the node maintains. The intended shape is one `self_managed` "system" registry
+    spanning every node, with many `provided_externally` "tenant" registries free-riding
+    on it.
+
+  Only the mesh is delegated; the registry-scoped backstops (leader-liveness probe,
+  stranded-member reap, durable-epoch nudge) stay active in both modes — they cannot be
+  offloaded to another registry. Delegation carries a contract: the provider registry must
+  span a node-superset of the consumer's nodes, or the consumer's node is silently
+  isolated (CP write refusals, §5.3). As a backstop, a `provided_externally` connector that
+  sees no elected leader for a sustained window logs a warning naming the contract. Any
+  value other than `provided_externally` resolves to `self_managed`, so a typo fails safe.
+
+  See `docs/dgen_registry_design.md` §4.6 (rationale and contract) and §8 (configuration).
+
 ## v0.4.0 (2026-07-12)
 
 ### Enhancements

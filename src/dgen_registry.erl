@@ -186,9 +186,12 @@ Starts the registry `Name` with per-registry options `Opts`.
 
 `Opts` is a map of tuning knobs scoped to *this* registry — `register_replicas`,
 `replicate_timeout`, `strict_replication`, `terminate_on_conflict`,
-`conflict_kill_budget`, `reject_when_degraded`. Each unset key falls back to the
-`dgen` application environment, then to a built-in default, so different registries
-can be tuned independently. See `docs/dgen_registry_design.md` (§8 Configuration).
+`conflict_kill_budget`, `reject_when_degraded`, `connectivity`. Each unset key falls
+back to the `dgen` application environment, then to a built-in default, so different
+registries can be tuned independently. `connectivity => provided_externally` turns off
+this registry's proactive distribution mesh so it free-rides on connections another
+registry maintains (§4.6) — the rest default to a self-sufficient, single-fault-tolerant
+registry. See `docs/dgen_registry_design.md` (§8 Configuration).
 
 The supervisor itself is **not** registered under a name — hold onto the `pid()`
 this returns (e.g. `Supervisor.stop/2` to tear it down) rather than looking it up
@@ -849,13 +852,15 @@ init({Name, Tenant, Opts}) ->
     %% node-level connectivity plumbing, split out of the member so each has one job.
     %% It is unnamed and holds only the elector pid; it is started **after** the member
     %% so it can discover the elector by walking from the (already-registered) member,
-    %% exactly as the member does. See dgen_registry_connector.
+    %% exactly as the member does. `Opts` is threaded through so the connector can
+    %% resolve its `connectivity` mode (§8) — `provided_externally` turns off the
+    %% proactive mesh. See dgen_registry_connector.
     ConnectorSpec = #{
         id => connector,
         start =>
             {dgen_registry_connector, start_link, [
                 Name,
-                #{name => Name}
+                #{name => Name, config => Opts}
             ]},
         restart => permanent,
         shutdown => 5000,

@@ -10,7 +10,8 @@
     replicate_timeout/1,
     strict_replication/1,
     reject_when_degraded/1,
-    commit_batch_size/1
+    commit_batch_size/1,
+    connectivity/1
 ]).
 
 -type config() :: #{atom() => term()}.
@@ -138,3 +139,32 @@ conflict_kill_budget(Config) ->
 -spec conflict_release_ttl(config()) -> pos_integer().
 conflict_release_ttl(Config) ->
     get(Config, conflict_release_ttl, 600000).
+
+%% Who is responsible for keeping the Erlang-distribution mesh in step with this
+%% registry's membership (§4.6, §8).
+%%
+%%   `self_managed` (default) — the registry's connector runs the proactive mesh: it
+%%     periodically reads the authoritative member set and opens a distribution
+%%     connection to every member node, so `nodes()` converges without any external
+%%     discovery.  Every registry is self-sufficient.
+%%
+%%   `provided_externally` — the connector does **not** mesh: it opens no distribution
+%%     connections and does not read the member set on a timer.  The registry assumes
+%%     the connections it needs are established by *something else on the node* —
+%%     typically another `self_managed` "system" registry whose member set spans a
+%%     superset of this registry's nodes (distribution links are node-global, so a
+%%     tenant registry free-rides on them).  The per-registry liveness backstops (the
+%%     leader-liveness probe, the stranded-member reap, the durable-epoch nudge) stay
+%%     active — they are registry-scoped and cannot be delegated.
+%%
+%% Only `provided_externally` disables meshing; any other value (including an
+%% unrecognised one) resolves to `self_managed`, so a typo fails *safe* — toward doing
+%% the connectivity work rather than silently isolating the node.  See §4.6 for the
+%% contract this mode places on the deployer and the isolation it risks if that
+%% contract is broken.
+-spec connectivity(config()) -> self_managed | provided_externally.
+connectivity(Config) ->
+    case get(Config, connectivity, self_managed) of
+        provided_externally -> provided_externally;
+        _ -> self_managed
+    end.

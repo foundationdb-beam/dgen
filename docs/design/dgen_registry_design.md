@@ -164,7 +164,7 @@ Starting a registry on a node creates three processes under a local supervisor:
 |---|---|
 | **member** | Holds the local `name → pid` replica in a `protected` ETS table that it alone writes and any process reads lock-free. Serves reads. When it is the leader, it is the sole writer for the name table. |
 | **elector** | Tracks which nodes are members and decides which member is the leader, coordinating through the database. |
-| **connector** | Keeps Erlang distribution in step with that membership: proactively connects to every member node, reaps stranded ones, and runs the leader-liveness probe. Pure node-level connectivity plumbing, with no names/leadership state of its own. |
+| **connector** | Keeps Erlang distribution in step with that membership: proactively connects to every member node, reaps stranded ones, and runs the leader-liveness probe. Pure node-level connectivity plumbing, with no names/leadership state of its own. Its proactive-mesh half can be turned off per registry (`connectivity => provided_externally`, §4.6, §8) so a registry free-rides on connections another registry maintains. |
 
 Application code only ever talks to the member (directly or through the
 via-tuple). The elector and connector work behind the scenes.
@@ -274,6 +274,69 @@ The one thing the registry cannot do for you is make two nodes *capable* of conn
 they must share an Erlang cookie and be able to resolve and reach each other on the
 network. Given that, the registry guarantees the connections themselves — see
 [Guarantees](#6-guarantees).
+
+#### Delegating connectivity (`connectivity => provided_externally`)
+
+The proactive mesh just described is a **node-level** concern — Erlang distribution is a
+single mesh of TCP links shared by everything on the node — but each registry runs its
+own copy of it. That is exactly what you want for one registry. It becomes wasteful when
+a single node hosts **many** registries at once, which is a first-class use case here:
+§4.8 goes to some length so that an application can start many independent registries
+dynamically (one per tenant, say) without leaking atoms. On such a node, every registry's
+connector independently subscribes to node events, keeps its own (identical) node-state,
+runs its own mesh timer, and — most expensively — performs its own periodic **durable
+`get_members` read** and its own `connect_node` sweep. Those reads and sweeps scale with
+the *number of registries on the node*, not with the size of the cluster, even though the
+connections they produce are one shared mesh.
+
+`connectivity => provided_externally` lets you collapse that duplication by hand. A
+registry started in this mode runs its connector with the **proactive mesh switched
+off**: it opens no distribution connections and does no periodic member-set read. It
+relies on the fact that distribution links are node-global — once *any* registry on the
+node has connected node A to node B, every process on A can reach B, including a member of
+a registry that never dialled the connection itself.
+
+The intended shape is a **provider/consumer split**:
+
+- One **system registry** runs in the default `self_managed` mode and is started on
+  **every** node in the cluster. Its mesh converges the full distribution graph.
+- Many **tenant registries** run in `provided_externally` mode and free-ride on the
+  links the system registry maintains. They pay none of the mesh cost.
+
+This is, in effect, a manually-designated node-level connectivity singleton: rather than
+introduce a dedicated per-node process (which would have to hold a set of elector pids and
+track their liveness — reintroducing the stale-pid problem §4.8's `one_for_all` design
+eliminates), you elect an existing, always-present registry to play that role.
+
+**The contract, and its footgun.** Delegation is only safe if the provider's member set
+spans a **node-superset** of every consumer's member set — i.e. the system registry is
+running on every node any tenant registry runs on. If that is violated — a tenant member
+lands on a node the system registry does not cover — nothing connects that node, and it is
+**silently isolated**: it cannot reach a leader, so it answers the CP write refusals of
+§5.3 with no obvious cause. This is the price of the flexibility, and it is the deployer's
+responsibility, not the registry's. As a cheap backstop, a `provided_externally` connector
+that observes **no elected leader for a sustained window** (~60 s) logs a warning naming
+this contract, so a misconfiguration surfaces in the logs rather than as a mute refusal.
+
+**What is *not* delegated.** Only the mesh is node-level and therefore shareable. The
+connector's other duties are **registry-scoped** — they read *this* registry's elector and
+act on *this* registry's leader and members — and stay active in both modes:
+
+- the **stranded-member reap** (a `nodedown` backstop that reaps a member the elector
+  still lists on a departed node),
+- the **leader-liveness probe** (reaps a leader recovered from durable state onto a node
+  this node has never connected — the cold-restart failover, §5.3), and
+- the **durable-epoch nudge** (prompts the member to re-join on a missed handoff).
+
+These cannot be offloaded to the provider registry, which holds no handle on a tenant
+registry's elector. Disabling *them* would not save shared work; it would just delete a
+registry's own liveness backstops — so `connectivity` deliberately governs the mesh only.
+(Because the epoch nudge normally piggybacks on the mesh's member-set read, a
+`provided_externally` connector re-homes it onto a small dedicated timer.)
+
+Any value other than `provided_externally` — including an unrecognised one — resolves to
+`self_managed`, so a typo fails *safe*, toward a self-sufficient registry rather than a
+silently isolated one.
 
 ### 4.7 Metadata and queries
 
@@ -822,7 +885,11 @@ These are normative. Behaviour that violates one of these is a defect.
    node's join is committed, the cluster converges so that `nodes()` on each member
    returns every other reachable member — without an external discovery mechanism. (It
    cannot connect nodes that are misconfigured or unreachable, and an unreachable
-   member is, by definition, not in `nodes()` until it becomes reachable.)
+   member is, by definition, not in `nodes()` until it becomes reachable.) This is the
+   default (`self_managed`) behaviour; a registry configured
+   `connectivity => provided_externally` (§4.6, §8) deliberately delegates the
+   connecting to another registry on the node and does not establish connections
+   itself — the convergence guarantee then rests on that provider.
 10. **Metadata lifetime is tied to the registration.** A registration's metadata (both
     `index` and `data`) and its index entries are present exactly while the
     registration is, and are removed automatically on unregister or process exit —
@@ -927,6 +994,7 @@ default for every registry), and then to the built-in default below.
 | `conflict_kill_budget` | `{3, 60000}` | At most *N* terminations per name per window (ms) before escalating to an operator instead of looping. Tracked by the current leader only and not merged across a handoff, so the bound is per name *per leader term* (§5.6). |
 | `conflict_release_ttl` | `600000` ms | How long an explicitly-released live name/pid pair stays in the conflict-detector trail (§5.6) — the discriminator that keeps a lagging replica from being mistaken for a conflict. Expiry is suspended while any member is disconnected *and* for one TTL after any member departs, so neither a partition nor a dropped member's rejoin within the window can outlive the trail. Entries are tiny; a generous window is cheap. |
 | `reject_when_degraded` | `false` | Optional prevention (§5.6). When `true`, a leader whose last handoff could not reach every member that *could be holding bindings* refuses to register a name it does not already hold — preventing a reissue rather than repairing it. A brand-new joiner that has not yet connected (it exists only as a row in the database, §4.6) holds nothing and does not count, so a healthy scale-up does not trip this. Deliberately blunt otherwise: it cannot distinguish a partition from a deliberate scale-down, so it is off by default. |
+| `connectivity` | `self_managed` | Who maintains the Erlang-distribution mesh for this registry (§4.6). `self_managed` (default): the registry runs its own proactive mesh — self-sufficient. `provided_externally`: the mesh is **off** (no `connect_node`, no periodic member-set read); the registry free-rides on links another registry maintains, for a node hosting many registries. Requires that a `self_managed` provider registry span a node-superset of this registry's nodes, or the node is silently isolated (§4.6) — a sustained no-leader window logs a warning. Governs the mesh only; the registry-scoped backstops (leader-liveness probe, stranded-member reap, durable-epoch nudge) stay active. Any value other than `provided_externally` resolves to `self_managed` (typos fail safe). |
 
 Observability: when a direct registration degrades open, the registry emits an event
 through the optional `telemetry` library (if present) and logs a warning, so the
