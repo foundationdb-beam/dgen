@@ -135,10 +135,11 @@ stakeholders are database entities. See §4.9 of the design doc.
     get_leader/1,
     get_members/1,
     get_epoch/1,
-    %% Readiness
+    %% Readiness and introspection
     ready/1,
     await_ready/1,
     await_ready/2,
+    status/1,
     %% Process identity helpers (exported for tests / introspection)
     member_name/1,
     names_table/1,
@@ -197,6 +198,37 @@ The supervisor itself is **not** registered under a name — hold onto the `pid(
 this returns (e.g. `Supervisor.stop/2` to tear it down) rather than looking it up
 later by `Name`, which now names the member, not the supervisor. See the
 "Process identity" note above.
+
+## `keyspace` — separating identity from the coordination keyspace
+
+`Name` normally plays three roles at once: this member's **identity** (the registered
+process name, the ETS table name, and the second element of its `member_id/0`), and
+the registry's **keyspace** (the tuid prefixing every durable key — the elector queue,
+the leader key, the version key).
+
+The optional `keyspace` option splits the second role out:
+
+```erlang
+dgen_registry:start_link(member_a, Tenant, #{keyspace => shared_registry}),
+dgen_registry:start_link(member_b, Tenant, #{keyspace => shared_registry}).
+```
+
+Both members now coordinate through *one* registry's durable state — one elector
+queue, one leader key, one version key — while keeping distinct identities, so they
+elect a leader between themselves and replicate to each other exactly as members on
+separate nodes do. It defaults to `Name`, which is the ordinary one-member-per-node
+deployment.
+
+This exists for **simulation**: `member_id/0` is `{node(), Name}`, so without it a
+single VM can host at most one member of a given registry and any multi-member test
+needs real distribution and real nodes. With it, an N-member cluster runs inside one
+BEAM — which is what makes deterministic, seeded, replayable simulation of the
+replication protocol possible (see `test/support/sim/`). It is **not** intended for
+production deployment: two members of one registry sharing a VM share a fate, so they
+are not two holders in the sense of Guarantee 4, and the connector's node-level
+backstops (§4.6) cannot distinguish them.
+
+Note that `delete/2` takes the **keyspace** name, not a member's `Name`.
 """.
 -endif.
 -spec start_link(Name :: atom(), Tenant :: dgen_backend:tenant(), Opts :: registry_opts()) ->
@@ -244,7 +276,13 @@ consistent (replication is asynchronous).
 -spec unregister_name({atom(), term()}) -> ok.
 unregister_name({RegistryName, LogicalName}) ->
     try
-        gen_server:call(member_name(RegistryName), {unregister, LogicalName})
+        gen_server:call(
+            member_name(RegistryName),
+            {unregister, LogicalName},
+            %% Same caller-side bound as the other leader-routed writes — see
+            %% set_metadata/2.
+            dgen_config:register_timeout(#{})
+        )
     catch
         %% noproc: the registry is stopped/absent — nothing to unregister, `ok` is
         %% truthful.  timeout: the removal is already stashed on the member and will
@@ -344,7 +382,15 @@ mid-flight — retry).
 set_metadata({RegistryName, LogicalName}, MetaSpec) ->
     {Index, Data} = meta_of(MetaSpec),
     try
-        gen_server:call(member_name(RegistryName), {set_metadata, LogicalName, Index, Data})
+        gen_server:call(
+            member_name(RegistryName),
+            {set_metadata, LogicalName, Index, Data},
+            %% Bounded by the same caller-side knob as register_name/2,3 rather than
+            %% `gen_server:call/2`'s hidden 5s default: this is a leader-routed write
+            %% on the same pipeline, so an operator who tunes how long a write may
+            %% block should not find one of them ignoring the setting.
+            dgen_config:register_timeout(#{})
+        )
     catch
         exit:_ -> {error, no_leader}
     end.
@@ -660,6 +706,37 @@ ready(Name) ->
     end.
 
 -if(?DOCATTRS).
+-doc """
+Reports this node's member's own view of the registry, as a map:
+
+- `member_id` — this member's `member_id/0`.
+- `leader` — the member id it currently believes leads, or `undefined`.
+- `is_leader` — whether that belief names itself.
+- `epoch` — the leadership epoch it has heard (§4.2).
+- `synced` — whether it has applied a snapshot or assumed leadership.
+- `applied_version` — the commit version its replica has applied up to (§4.5).
+
+This is a member's **belief**, which is deliberately not the same thing as
+`get_leader/1`'s committed answer from the elector: a deposed leader that has not
+yet heard about the handoff still reports `is_leader => true` here while
+`get_leader/1` already names its successor. That gap is the fenced window of §5.1,
+and seeing it is the point of this call.
+
+Side-effect free — a plain state read, useful for operational introspection and for
+asserting replication invariants across members. Returns `undefined` if the member
+is not running.
+""".
+-endif.
+-spec status(Name :: atom()) -> map() | undefined.
+status(Name) ->
+    try gen_server:call(member_name(Name), status, ?READY_CALL_TIMEOUT) of
+        Status when is_map(Status) -> Status;
+        _ -> undefined
+    catch
+        exit:_ -> undefined
+    end.
+
+-if(?DOCATTRS).
 -doc "Blocks until `ready/1` holds, or 5s elapses. See `await_ready/2`.".
 -endif.
 -spec await_ready(Name :: atom()) -> ok | {error, timeout}.
@@ -811,12 +888,17 @@ init({Name, Tenant, Opts}) ->
     %% The elector is deliberately unnamed (`dgen_server:start_link/3`, no `Reg`):
     %% it has no registered name at all, local or otherwise. The member finds it by
     %% pid via this supervisor instead — see the "Process identity" moduledoc note.
+    %% `Name` is this member's identity; `Keyspace` is the durable prefix every
+    %% member of the registry coordinates through.  They are the same atom in the
+    %% ordinary one-member-per-node case; `keyspace` splits them so several members
+    %% of one registry can share a VM (see start_link/3's docs).
+    Keyspace = maps:get(keyspace, Opts, Name),
     ElectorSpec = #{
         id => elector,
         start =>
             {dgen_server, start_link, [
                 dgen_registry_elector,
-                #{name => Name},
+                #{name => Name, keyspace => Keyspace},
                 [{tenant, Tenant}, {consume_k, 50}]
             ]},
         restart => permanent,
@@ -827,8 +909,10 @@ init({Name, Tenant, Opts}) ->
 
     %% Tuid matches the elector's (both derive it from dgen_registry_elector:tuid/1)
     %% so the member can compute the leader key and the per-registry version key
-    %% directly, against the same keyspace the elector's fence writes.
-    Tuid = dgen_registry_elector:tuid(Name),
+    %% directly, against the same keyspace the elector's fence writes.  Derived from
+    %% `Keyspace`, not `Name`: every member of a registry must fence against the same
+    %% leader key even when their identities differ.
+    Tuid = dgen_registry_elector:tuid(Keyspace),
     MemberSpec = #{
         id => member,
         start =>

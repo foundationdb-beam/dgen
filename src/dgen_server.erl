@@ -3,6 +3,8 @@
 
 -define(DOCATTRS, ?OTP_RELEASE >= 27).
 
+-include("../include/dgen_eta.hrl").
+
 -if(?DOCATTRS).
 -moduledoc """
 A durable, distributed gen_server backed by a pluggable storage backend.
@@ -543,7 +545,7 @@ handle_cast(consume, State = #state{tenant = Tenant, tuid = Tuid, consume_k = K}
     case Ret of
         {noreply, #state{watch = undefined, cache_misses = Misses}} when Misses > 0 ->
             Delay = min(1 bsl (Misses - 1), 50),
-            erlang:send_after(Delay, self(), consume_after_penalty);
+            arm(Delay, consume_after_penalty);
         {noreply, #state{watch = undefined}} ->
             gen_server:cast(self(), consume);
         _ ->
@@ -852,7 +854,7 @@ handle_consume(Tenant, K, Tuid, State = #state{dead_letter_threshold = Threshold
                 Action = fun(_) ->
                     case Remaining of
                         infinity -> ok;
-                        Ms -> erlang:send_after(Ms, self(), recheck_lock)
+                        Ms -> arm(Ms, recheck_lock)
                     end
                 end,
                 {{noreply, [Action]}, undefined, State#state{watch = Watch}}
@@ -1205,3 +1207,8 @@ is_locked(Td, State) ->
 
 get_quid(Tuple) ->
     dgen_key:extend(Tuple, <<"q">>).
+
+%% Arm a timer, and say so. See `dgen_registry_member:arm/2`.
+arm(Delay, Msg) ->
+    _ = ?ETA_LOG({arm, Msg, Delay}),
+    erlang:send_after(Delay, self(), Msg).

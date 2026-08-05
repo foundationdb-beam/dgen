@@ -15,11 +15,6 @@ underneath: a strongly-consistent database (FoundationDB) instead of process
 memory, so state and coordination survive process, node, and even cluster
 restarts.
 
-**The replication protocol behind `dgen_registry` is exhaustively
-model-checked with TLA+/TLC** — not just tested — as part of CI. See
-[`formal/README.md`](formal/README.md) for the model, what it proves, and how
-to run it yourself.
-
 ## What's here
 
 - **`dgen_server`** — the `gen_server` programming model (same callbacks, same
@@ -48,9 +43,11 @@ DGen can be installed by adding `dgen` to your list of dependencies in
 
 ```erlang
 {deps, [
-    {dgen, "~> 0.4"}
+    {dgen, "0.4.x"}
 ]}.
 ```
+
+Find the most recent version number on [Hex](hex.pm/packages/dgen).
 
 ### Elixir
 
@@ -77,6 +74,11 @@ end
   configuration.
 - [formal/README.md](formal/README.md) — the TLA+ model of `dgen_registry`'s
   replication protocol.
+- [`eta`](https://github.com/foundationdb-beam/eta) — `dgen_registry` is partally
+  tested with Deterministic Simulation Testing, to assist in verification
+  of the actual implementation of the TLA+ model, including its invariants.
+  The framework for driving the simulation was extracted to a separate
+  library for general use.
 - API reference and getting-started guides: <https://hexdocs.pm/dgen>.
 - [CHANGELOG.md](CHANGELOG.md) — release notes.
 
@@ -84,14 +86,10 @@ end
 
 DGen's development makes deliberate, disclosed use of AI tooling:
 
-- **Implementation.** Substantial portions of the codebase — across both
-  Erlang and Elixir — were built in close collaboration with large language
-  models, from initial implementation through refactoring and documentation.
-- **Correctness.** LLM-assisted code touching safety-critical logic doesn't
-  get a pass on rigor — the opposite: `dgen_registry`'s replication protocol
-  is checked against a TLA+ model with TLC, exhaustively exploring every
-  reachable interleaving of a bounded cluster rather than relying on test
-  coverage alone. See [formal/README.md](formal/README.md).
+- **Implementation.** Substantial portions of the codebase were built with LLMs
+  from initial implementation through refactoring and documentation.
+- **Correctness.** LLM output is verified by various testing efforts, including
+  unit and integration testing, simulation testing, and formal methods.
 - **Design.** The architecture, API surface, and consistency trade-offs are
   human-opinionated, shaped by hands-on experience operating comparable
   distributed systems — leader election, durable queues, CP-oriented

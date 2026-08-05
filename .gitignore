@@ -28,3 +28,7 @@ dgen-*.tar
 # TLA+ model checker jar and TLC scratch directory (formal/PLAN.md §4).
 formal/tla2tools.jar
 formal/states/
+# Counterexample traces TLC writes beside the spec on a violation, which the
+# expected-fail configs produce on every run.
+formal/*_TTrace_*.tla
+formal/*_TTrace_*.bin

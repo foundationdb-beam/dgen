@@ -2,6 +2,8 @@
 
 -define(DOCATTRS, ?OTP_RELEASE >= 27).
 
+-include("../include/dgen_eta.hrl").
+
 -if(?DOCATTRS).
 -moduledoc """
 Durable FIFO queue backed by the configured dgen backend.

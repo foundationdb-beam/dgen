@@ -11,7 +11,7 @@ on:
 
 env:
   TLA_VERSION: v1.8.0
-  TLA_SHA256: "33de7da9ce1b7fffb9d1c184021178dbb051747be48504e65c584c423721a32e"
+  TLA_SHA256: "e22f8ffb4bacdea0a871f444dd94fe5fb0d8013b3388ae39e82e26f852c735d5"
 
 jobs:
   tlc:
@@ -40,7 +40,7 @@ jobs:
         uses: actions/cache@v3
         with:
           path: formal/tla2tools.jar
-          key: tla2tools-${{ env.TLA_VERSION }}
+          key: tla2tools-${{ env.TLA_VERSION }}-${{ env.TLA_SHA256 }}
       - name: Download tla2tools.jar
         if: steps.cache-tla.outputs.cache-hit != 'true'
         run: |
@@ -50,3 +50,90 @@ jobs:
         run: echo "${TLA_SHA256}  formal/tla2tools.jar" | sha256sum -c -
       - name: Model-check
         run: formal/check.sh ${{ matrix.cfg }} ${{ matrix.expect }}
+
+  dst:
+    runs-on: ubuntu-latest
+    name: Deterministic simulation
+    env:
+      FDB_VERSION: "7.3.69"
+    steps:
+      - uses: actions/checkout@v3
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27"
+          elixir-version: "1.17"
+      - name: Cache deps
+        uses: actions/cache@v3
+        with:
+          path: |
+            deps
+            _build
+          key: dst-${{ runner.os }}-${{ hashFiles('mix.lock') }}
+      - name: Cache FoundationDB packages
+        id: cache-fdb-dst
+        uses: actions/cache@v3
+        with:
+          path: /tmp/fdb-debs
+          key: fdb-clients-${{ env.FDB_VERSION }}
+      - name: Download FoundationDB client
+        if: steps.cache-fdb-dst.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /tmp/fdb-debs
+          wget --quiet -O /tmp/fdb-debs/foundationdb-clients_${FDB_VERSION}-1_amd64.deb \
+            https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/foundationdb-clients_${FDB_VERSION}-1_amd64.deb
+      - name: Install FoundationDB client
+        run: sudo dpkg -i /tmp/fdb-debs/foundationdb-clients_${FDB_VERSION}-1_amd64.deb
+      - run: mix deps.get
+      - run: mix dst
+
+  mutation:
+    runs-on: ubuntu-latest
+    name: Mutation (framework non-vacuity)
+    env:
+      FDB_VERSION: "7.3.69"
+      # Both steps below need this: `erlc_options/1` reads it when Mix loads
+      # mix.exs, so it has to be in the environment of the compile as well as the
+      # run. See mix.exs.
+      DGEN_MUTATION: partial_batch
+      DGEN_BACKEND: dgen_mem
+    steps:
+      - uses: actions/checkout@v3
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27"
+          elixir-version: "1.17"
+      # Deliberately NOT the `dst-` key. This job's `_build` holds a registry with
+      # a defect compiled into it, and a cache shared with the `dst` job would let
+      # those beams be restored into the clean sweep — which does not use
+      # `--force`, so it would run green against mutated code and prove nothing.
+      - name: Cache deps
+        uses: actions/cache@v3
+        with:
+          path: |
+            deps
+            _build
+          key: mutation-${{ runner.os }}-${{ hashFiles('mix.lock') }}
+      - name: Cache FoundationDB packages
+        id: cache-fdb-mutation
+        uses: actions/cache@v3
+        with:
+          path: /tmp/fdb-debs
+          key: fdb-clients-${{ env.FDB_VERSION }}
+      - name: Download FoundationDB client
+        if: steps.cache-fdb-mutation.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /tmp/fdb-debs
+          wget --quiet -O /tmp/fdb-debs/foundationdb-clients_${FDB_VERSION}-1_amd64.deb \
+            https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/foundationdb-clients_${FDB_VERSION}-1_amd64.deb
+      - name: Install FoundationDB client
+        run: sudo dpkg -i /tmp/fdb-debs/foundationdb-clients_${FDB_VERSION}-1_amd64.deb
+      - run: mix deps.get
+      # `--force` is not optional: Mix does not reliably rebuild an Erlang module
+      # when only its compiler options change, and the failure looks like success.
+      # The suite's own setup block re-checks the compiled defines and flunks if
+      # the mutation is missing, so a build that silently skipped it fails here
+      # rather than passing vacuously.
+      - name: Compile with the planted defect
+        run: MIX_ENV=test mix compile --force
+      - name: Rediscover, shrink and replay it
+        run: mix test --only mutation

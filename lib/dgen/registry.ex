@@ -243,6 +243,17 @@ defmodule DGen.Registry do
   defdelegate await_ready(registry_name, timeout), to: :dgen_registry
 
   @doc """
+  This node's member's own view of the registry, as a map with `:member_id`,
+  `:leader`, `:is_leader`, `:epoch`, `:synced`, and `:applied_version`.
+
+  This is the member's *belief*, deliberately distinct from `get_leader/1`'s
+  committed answer from the elector — a deposed leader that has not yet heard about
+  the handoff still reports `is_leader: true` here. Side-effect free; returns
+  `:undefined` if the member is not running.
+  """
+  defdelegate status(registry_name), to: :dgen_registry
+
+  @doc """
   Returns the registered name of the member process for the given registry name.
 
   Identity today (`member_name(name) == name`) — the member is registered

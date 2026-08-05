@@ -244,9 +244,9 @@ After the leader applies a batch of changes it broadcasts them to the other memb
 which update their local maps. Combined with the forwarding path, this is what keeps
 every node's phone book current.
 
-Each broadcast carries its batch's version *and the version of the batch before it*,
-so a member applies broadcasts only when they are **contiguous** with what it already
-holds. A member that missed a batch — a message dropped while it was briefly
+A batch is broadcast as **one message**, carrying its version *and the version of the
+batch before it*, so a member applies a batch only when it is **contiguous** with what
+it already holds. A member that missed a batch — a message dropped while it was briefly
 disconnected — detects the gap, stops applying, and asks the leader for a fresh
 snapshot instead of silently continuing with a hole in its replica. Every member's
 replica is therefore always a *prefix* of the leader's ordered stream, which is what
@@ -985,7 +985,7 @@ default for every registry), and then to the built-in default below.
 
 | Setting | Default | Effect |
 |---|---|---|
-| `register_timeout` | `5000` ms | Caller-side bound on how long `register_name/2,3` waits for its verdict before **exiting** with a call timeout (see §3 — a timeout is deliberately not converted to `no`). Unlike the other knobs this is resolved in the *calling* process, which has no handle on the per-registry options map, so it is set through the `dgen` application environment only (no per-registry override). |
+| `register_timeout` | `5000` ms | Caller-side bound on how long a **leader-routed write** waits before giving up — `register_name/2,3`, `unregister_name/1`, and `set_metadata/2` alike. |
 | `register_replicas` | `1` | How many follower copies a *direct* registration waits for before `yes`. Bounded by the number of followers. Higher values widen durability at the cost of registration latency. |
 | `commit_batch_size` | `5000` | Max write ops the leader coalesces into one group commit; the rest ride the next commit. Bounds the *inline* per-commit work (plan, replica apply, broadcast fan-out are all O(batch)), so a burst — e.g. a departing node's flood of `DOWN`s — is split across bounded commits and the leader loop stays responsive between them. Latency/throughput only, never correctness. Lower to cap the burst; raise to coalesce more aggressively. |
 | `replicate_timeout` | `1000` ms | How long the leader waits for those confirmations before applying the timeout policy. |

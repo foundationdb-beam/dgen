@@ -28,8 +28,10 @@ One module, `DgenRegistryReplication.tla`, at the abstraction level of the
 
 - **Fenced commit** — the leader is sole writer; a commit succeeds only if
   the durable leader key + epoch still match.
-- **Version-stamped broadcasts** — each carries `{Epoch, PrevVersion,
-  Version}`; followers apply only *contiguous* broadcasts.
+- **Version-stamped broadcasts** — one per commit version, carrying `{Epoch,
+  PrevVersion, Version}`; followers apply only *contiguous* broadcasts.  The code
+  matches this: a group commit ships as a single `{names_batch, Ops, …}` message
+  (see "A closed abstraction gap" below).
 - **Resync** — a gapped follower requests a snapshot from its stream's
   sender.
 - **Forwarded registrations, version-guarded acks** — a follower answers its
@@ -102,6 +104,33 @@ what a guard is meant to prevent — all expected to fail:
   version-monotonic snapshot apply, TLC finds a counterexample where a single
   node crash silently loses an already-acked registration.
 
+## A closed abstraction gap: one broadcast per commit version
+
+`RegisterForward`/`RegisterDirect` each commit **exactly one** name at a version, so
+in this model a version is always a single broadcast — and `RecvBcastApply`'s
+`m.ver = appliedVer[f]` disjunct is reachable only for a duplicate.
+
+The code did not match that. The leader group-commits up to `commit_batch_size`
+(default 5000) ops into one version and used to broadcast **one message per changed
+name**, all sharing it. There, `m.ver = appliedVer[f]` was the clause applying the
+2nd..Nth message of a batch — so `applied_version` advanced on a batch's *first*
+message, and a member receiving a strict subset reported the full version while
+holding only part of it. `PrefixConsistency`, and the "version tie ⇒ identical
+content" property `AssumeGather`'s freshest-wins relies on, were being verified here
+under an assumption the implementation did not satisfy.
+
+The simulation harness in [`test/support/sim/`](../test/support/sim/README.md) found
+this against the real code (finding 1 there). It was closed **on the code side**: a
+batch now ships as a single `{names_batch, Ops, …}` message, so one commit version is
+one broadcast, exactly as modelled, and the surviving `V =< Applied` clause is purely
+the duplicate guard this spec always assumed it was.
+
+Worth recording as the general lesson: the gap was not in either artefact taken
+alone. TLC verified the spec exhaustively and the tests passed; what neither could
+see was that they were describing different protocols. That seam is what the
+`Spec ↔ code map` below exists to hold shut, and it is worth re-deriving rather than
+trusting whenever either side changes.
+
 ## Spec ↔ code map
 
 | Spec | Code |
@@ -109,10 +138,10 @@ what a guard is meant to prevent — all expected to fail:
 | `Elect` | `dgen_registry_elector` committing a membership/leadership change (abstracted to one durable write) |
 | `AssumeGather` (incl. the `SafeAssume` version-key fence) | `{elector_assume_and_distribute}` genuine-change clause → `spawn_assume_gather` → `gather_caught_up/6` → `{assume_gathered}` continuation |
 | `CanCommit`'s `dbLeader/dbEpoch` conjuncts | the fenced version-key bump in `dgen_registry_names:start_commit/4` (§5.1) |
-| `RegisterForward` | follower `route_register` forward → leader `{register_req}` → group commit → broadcast + `{register_reply, Ref, yes, Version}` |
+| `RegisterForward` | follower `route_register` forward → leader `{register_req}` → group commit → `broadcast_batch/5` + `{register_reply, Ref, yes, Version}` |
 | `RegisterDirect` + `RecvSync`/`RecvAck` | leader-local `route_register` → `pending_acks` / `{replicate_sync}` / `{replicate_ack}` |
 | `DegradeTimeout` | `handle_info({replicate_timeout, _})` with `strict_replication = false` |
-| `RecvBcastApply/Drop/Gap` | `apply_bcast/6` (the four-way case split) |
+| `RecvBcastApply/Drop/Gap` | `apply_bcast/6` (the three-way case split; one `{names_batch, …}` per commit version) |
 | `RecvReply` | `handle_register_reply/4` incl. `deferred_yes`; flushes are `bump_applied/2` → `flush_deferred/1` |
 | `RecvSnap` (incl. the `SafeAssume` version-monotonic guard) | `handle_cast({apply_names_snapshot, ...})` |
 | `ServeResync` / `resyncReq` | `{resync_req}` handler / `request_resync/2` |

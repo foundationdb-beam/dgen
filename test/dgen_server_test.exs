@@ -84,7 +84,9 @@ defmodule DGen.Server.Test do
 
       cast = DGen.Server.outbox_cast(pid)
 
-      :erlfdb.transactional(db, fn tx ->
+      backend = :dgen_config.backend()
+
+      backend.transactional(db, fn tx ->
         cast.(tx, {:incr, 5})
       end)
 

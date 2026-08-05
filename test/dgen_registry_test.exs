@@ -1049,6 +1049,14 @@ defmodule DGen.RegistryTest do
     version
   end
 
+  # A replication broadcast in the shape the leader actually sends: one
+  # `{:names_batch, Ops, Epoch, PrevV, Version, LeaderId}` message per committed
+  # batch, with the batch's ops carried inside it. A batch is delivered whole or
+  # not at all — see `broadcast_batch/5` in dgen_registry_member.
+  defp names_batch(ops, epoch, prev_v, version, leader) do
+    {:names_batch, ops, epoch, prev_v, version, leader}
+  end
+
   describe "epoch fencing" do
     test "name_registered with stale epoch is discarded", %{reg: reg} do
       member = :dgen_registry.member_name(reg)
@@ -1062,7 +1070,13 @@ defmodule DGen.RegistryTest do
       # version stamps are contiguous, so only the epoch causes the discard.
       GenServer.cast(
         member,
-        {:name_registered, :stale_name, pid, %{}, :undefined, epoch - 1, v, v + 1, leader}
+        names_batch(
+          [{:name_registered, :stale_name, pid, %{}, :undefined}],
+          epoch - 1,
+          v,
+          v + 1,
+          leader
+        )
       )
 
       # whereis_name now reads ETS in the caller (no member round-trip), so it can no
@@ -1083,7 +1097,13 @@ defmodule DGen.RegistryTest do
 
       GenServer.cast(
         member,
-        {:name_registered, :current_name, pid, %{}, :undefined, epoch, v, v + 1, leader}
+        names_batch(
+          [{:name_registered, :current_name, pid, %{}, :undefined}],
+          epoch,
+          v,
+          v + 1,
+          leader
+        )
       )
 
       # Barrier: ensure the member has processed the cast before the caller-side read.
@@ -1106,7 +1126,13 @@ defmodule DGen.RegistryTest do
       # snapshot instead of advancing with a hole in its replica).
       GenServer.cast(
         member,
-        {:name_registered, :gapped_name, pid, %{}, :undefined, epoch, v + 10, v + 11, leader}
+        names_batch(
+          [{:name_registered, :gapped_name, pid, %{}, :undefined}],
+          epoch,
+          v + 10,
+          v + 11,
+          leader
+        )
       )
 
       :sys.get_state(member)
@@ -1126,7 +1152,13 @@ defmodule DGen.RegistryTest do
 
       GenServer.cast(
         member,
-        {:name_unregistered, :persisted_name, :undefined, epoch - 1, v, v + 1, leader}
+        names_batch(
+          [{:name_unregistered, :persisted_name, :undefined}],
+          epoch - 1,
+          v,
+          v + 1,
+          leader
+        )
       )
 
       # Barrier: ensure the member has processed (and discarded) the stale cast.
@@ -1147,7 +1179,7 @@ defmodule DGen.RegistryTest do
 
       GenServer.cast(
         member,
-        {:name_unregistered, :to_remove, :undefined, epoch, v, v + 1, leader}
+        names_batch([{:name_unregistered, :to_remove, :undefined}], epoch, v, v + 1, leader)
       )
 
       # Barrier: ensure the member has processed the cast before the caller-side read.

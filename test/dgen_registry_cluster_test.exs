@@ -3,6 +3,11 @@ defmodule DGen.RegistryClusterTest do
   # transactions from multiple nodes — run sequentially.
   use DGen.Case, async: false
 
+  # Starts real peer BEAM nodes that open the backend themselves, so this suite
+  # needs a genuinely shared database. Excluded when running on `dgen_mem`, which
+  # is per-VM ETS.
+  @moduletag :cluster
+
   require Logger
 
   import DGen.ClusterHelper, only: [await_leader!: 1, eventually: 1, eventually: 2]
@@ -110,6 +115,14 @@ defmodule DGen.RegistryClusterTest do
       :erpc.call(peer_node, GenServer, :call, [peer_member, :get_names_snapshot])
 
     version
+  end
+
+  # A replication broadcast in the shape the leader actually sends: one
+  # `{:names_batch, Ops, Epoch, PrevV, Version, LeaderId}` message per committed
+  # batch, carrying the batch's ops. A batch is delivered whole or not at all —
+  # see `broadcast_batch/5` in dgen_registry_member.
+  defp names_batch(ops, epoch, prev_v, version, leader) do
+    {:names_batch, ops, epoch, prev_v, version, leader}
   end
 
   # Spawn a long-lived process on a remote node without Elixir dependency.
@@ -768,11 +781,24 @@ defmodule DGen.RegistryClusterTest do
 
       # The primary must detect the peer's departure and remove it from the
       # elector's member set.
+      #
+      # The most generous budget in this file, and the slowest step in it: the
+      # disconnect has to produce two `:noconnection` DOWNs, each member has to
+      # enqueue `{member_down, Other, Token}` into the elector's **FDB-backed**
+      # queue, and the elector has to consume it and rewrite the member set. That
+      # is several FoundationDB round trips on a machine that is also hosting the
+      # database it is talking to, which is exactly what a CI runner is.
+      #
+      # It failed there at 5s having never failed locally -- not in isolation, not
+      # in the full suite, and not under 3x CPU oversubscription. The property is
+      # *eventual* reconstitution rather than a latency bound, so the number is
+      # arbitrary and a larger one costs a passing run nothing: `eventually/2`
+      # polls every 20ms and returns the moment the condition holds.
       assert eventually(
                fn ->
                  not Enum.any?(:dgen_registry.get_members(reg), fn {n, _} -> n == peer_node end)
                end,
-               5_000
+               15_000
              ),
              "primary did not remove peer from member set after disconnect"
 
@@ -1127,7 +1153,13 @@ defmodule DGen.RegistryClusterTest do
 
       GenServer.cast(
         member,
-        {:name_registered, :conflicted, p2, %{}, :undefined, epoch, v, v + 1, leader}
+        names_batch(
+          [{:name_registered, :conflicted, p2, %{}, :undefined}],
+          epoch,
+          v,
+          v + 1,
+          leader
+        )
       )
 
       :sys.get_state(member)
@@ -1198,7 +1230,13 @@ defmodule DGen.RegistryClusterTest do
 
       :erpc.call(peer_node, :gen_server, :cast, [
         peer_member,
-        {:name_registered, :fp_conflicted, p2, %{}, :undefined, epoch, v, v + 1, leader}
+        names_batch(
+          [{:name_registered, :fp_conflicted, p2, %{}, :undefined}],
+          epoch,
+          v,
+          v + 1,
+          leader
+        )
       ])
 
       :erpc.call(peer_node, :sys, :get_state, [peer_member])
@@ -1256,7 +1294,13 @@ defmodule DGen.RegistryClusterTest do
       # are contiguous, so only the stale epoch causes the discard.
       :erpc.call(peer_node, :gen_server, :cast, [
         peer_member,
-        {:name_registered, :ghost_name, pid, %{}, :undefined, epoch - 1, v, v + 1, leader}
+        names_batch(
+          [{:name_registered, :ghost_name, pid, %{}, :undefined}],
+          epoch - 1,
+          v,
+          v + 1,
+          leader
+        )
       ])
 
       # whereis_name now reads the member's ETS table in the caller, so it no longer
@@ -1288,7 +1332,13 @@ defmodule DGen.RegistryClusterTest do
 
                :erpc.call(peer_node, :gen_server, :cast, [
                  peer_member,
-                 {:name_registered, :valid_name, pid, %{}, :undefined, epoch, v, v + 1, leader}
+                 names_batch(
+                   [{:name_registered, :valid_name, pid, %{}, :undefined}],
+                   epoch,
+                   v,
+                   v + 1,
+                   leader
+                 )
                ])
 
                # Barrier: ensure the peer member processed the cast before the read.
@@ -1345,7 +1395,13 @@ defmodule DGen.RegistryClusterTest do
       # leader for a resync snapshot instead.
       :erpc.call(peer_node, :gen_server, :cast, [
         peer_member,
-        {:name_registered, :gap_ghost, pid, %{}, :undefined, epoch, v + 10, v + 11, leader}
+        names_batch(
+          [{:name_registered, :gap_ghost, pid, %{}, :undefined}],
+          epoch,
+          v + 10,
+          v + 11,
+          leader
+        )
       ])
 
       :erpc.call(peer_node, :sys, :get_state, [peer_member])

@@ -80,6 +80,8 @@ Optional:
 """.
 -endif.
 
+-include("../include/dgen_eta.hrl").
+
 -export([start_link/3, start_monitor/3, start/3, run/3]).
 -export([
     init/1,

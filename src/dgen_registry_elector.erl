@@ -2,6 +2,8 @@
 -behaviour(dgen_server).
 
 -define(DOCATTRS, ?OTP_RELEASE >= 27).
+
+-include("../include/dgen_eta.hrl").
 -define(SnapshotTimeout, 2000).
 
 -if(?DOCATTRS).
@@ -116,14 +118,24 @@
 %% ---------------------------------------------------------------------------
 
 -if(?DOCATTRS).
--doc "Initialises the elector state with an empty member map and undefined leader.".
+-doc """
+Initialises the elector state with an empty member map and undefined leader.
+
+`name` is the co-located member's **identity** — it is what `elect_leader/5` turns
+into the local `member_id/0` when preferring the local member for leadership.
+`keyspace` is the registry's durable **prefix**, and is what the tuid is derived
+from; it defaults to `name`. The two differ only when a registry is started with
+`dgen_registry:start_link/3`'s `keyspace` option, which lets several members of one
+registry share a VM (see that function's docs).
+""".
 -endif.
--spec init(#{name := atom()}) -> {ok, dgen_server:tuid(), registry_state()}.
-init(#{name := Name}) ->
+-spec init(#{name := atom(), keyspace => atom()}) ->
+    {ok, dgen_server:tuid(), registry_state()}.
+init(Args = #{name := Name}) ->
     State = #{
         name => Name, members => #{}, leader => undefined, epoch => 0, subscriptions => #{}
     },
-    {ok, tuid(Name), State}.
+    {ok, tuid(maps:get(keyspace, Args, Name)), State}.
 
 -if(?DOCATTRS).
 -doc """

@@ -3,6 +3,8 @@
 
 -define(DOCATTRS, ?OTP_RELEASE >= 27).
 
+-include("../include/dgen_eta.hrl").
+
 -if(?DOCATTRS).
 -moduledoc false.
 -endif.
@@ -222,12 +224,12 @@ handle_continue(discover_elector, State = #state{name = Name, mode = Mode}) ->
             %% No mesh: connectivity is provided elsewhere (§4.6).  Drive only the
             %% epoch nudge (normally piggybacked on the mesh fetch) and the isolation
             %% warning on the epoch tick.
-            erlang:send_after(?EPOCH_CHECK_INTERVAL, self(), epoch_check)
+            arm(?EPOCH_CHECK_INTERVAL, epoch_check)
     end,
     %% Backstop the nodedown-driven failover for a leader we never connected to (see
     %% probe_leader).  Delayed so a genuinely-reachable leader is meshed first.  Active
     %% in both modes — it is a registry-scoped duty, not part of the mesh.
-    erlang:send_after(?LEADER_PROBE_GRACE, self(), probe_leader),
+    arm(?LEADER_PROBE_GRACE, probe_leader),
     {noreply, State#state{elector = Elector}}.
 
 handle_call(_Request, _From, State) ->
@@ -265,7 +267,7 @@ handle_info({nodedown, Node}, State = #state{recently_down = RD}) ->
 %% the isolation warning), both off the loop; the leader observation is reported back as
 %% `{connectivity_leader, _}`.  Re-arm the tick.
 handle_info(epoch_check, State = #state{elector = Elector, name = Name}) ->
-    erlang:send_after(?EPOCH_CHECK_INTERVAL, self(), epoch_check),
+    arm(?EPOCH_CHECK_INTERVAL, epoch_check),
     spawn_epoch_check(Elector, Name, self()),
     {noreply, State};
 %% Isolation warning (provided_externally): a leader observation from spawn_epoch_check.
@@ -306,7 +308,7 @@ handle_info({reap_down, Node, N}, State = #state{elector = Elector}) ->
 %% reachable member re-elects.  Off the loop — spawn_probe_leader reads the elector and
 %% casts only, opening no connection.
 handle_info(probe_leader, State = #state{elector = Elector, ever_connected = Ever}) ->
-    erlang:send_after(?LEADER_PROBE_INTERVAL, self(), probe_leader),
+    arm(?LEADER_PROBE_INTERVAL, probe_leader),
     spawn_probe_leader(Elector, node(), Ever),
     {noreply, State};
 %% Converge Erlang distribution to a full mesh: read the authoritative member set from
@@ -318,7 +320,7 @@ handle_info(probe_leader, State = #state{elector = Elector, ever_connected = Eve
 %% `{nodedown, _}` — so an in-flight fetch cannot reconnect a node that dropped while it
 %% was running.  A successful connect fires `nodeup`, driving the member's rejoin.
 handle_info(mesh_connect, State = #state{elector = Elector, name = Name}) ->
-    erlang:send_after(?MESH_INTERVAL, self(), mesh_connect),
+    arm(?MESH_INTERVAL, mesh_connect),
     Now = erlang:system_time(millisecond),
     RD = maps:filter(
         fun(_Node, Ts) -> Ts >= Now - ?MESH_DOWN_COOLDOWN end, State#state.recently_down
@@ -360,7 +362,7 @@ code_change(_OldVsn, State, _Extra) ->
 %% ---------------------------------------------------------------------------
 
 schedule_reap(Node, N) ->
-    erlang:send_after(?REAP_INTERVAL, self(), {reap_down, Node, N}),
+    arm(?REAP_INTERVAL, {reap_down, Node, N}),
     ok.
 
 %% Report `member_down` for every member the elector currently lists on `Node`, fenced
@@ -496,3 +498,9 @@ warn_possible_isolation(Name, Ticks) ->
 spawn_mesh_connect(Targets) ->
     _ = spawn(fun() -> lists:foreach(fun net_kernel:connect_node/1, Targets) end),
     ok.
+
+%% Arm a timer, and say so. See `dgen_registry_member:arm/2` — the same reasoning
+%% applies here, and this module arms most of the periodic work in a run.
+arm(Delay, Msg) ->
+    _ = ?ETA_LOG({arm, Msg, Delay}),
+    erlang:send_after(Delay, self(), Msg).
