@@ -731,7 +731,7 @@ init(#{name := Name, tenant := Tenant, tuid := Tuid} = Args) ->
     %% called from here directly. Queuing the internal event (gen_statem's replacement
     %% for `{continue, …}`) lets the supervisor consider this child started,
     %% unblocking it, before the lookup runs.
-    {ok, member,
+    {ok, searching,
         #state{
             member_id = MemberId,
             elector = undefined,
@@ -766,29 +766,141 @@ init(#{name := Name, tenant := Tenant, tuid := Tuid} = Args) ->
         [{next_event, internal, discover_elector}]}.
 
 %% ---------------------------------------------------------------------------
-%% handle_event/4 — the phase-1 dispatch shim
+%% handle_event/4 — dispatch, and the derived state
 %% ---------------------------------------------------------------------------
 
-%% One placeholder state (`member`) and a pure translation onto the former
-%% gen_server handlers, whose bodies are unchanged.  This isolates the behaviour
-%% swap — statem start gating, observe parity, wire-compatible call/cast — from
-%% any state redesign; the real states (searching / assuming / leader /
-%% {follower, _}) arrive in phase 2 of the plan.  No handler ever returned
-%% `{stop, …}` or a timeout tuple (verified), so the translation is total.
-handle_event({call, From}, Msg, member, State) ->
-    case handle_call(Msg, From, State) of
-        {reply, Reply, State1} -> {keep_state, State1, [{reply, From, Reply}]};
-        {noreply, State1} -> {keep_state, State1}
+%% Phase 2 of the statem port: the statem state is a DERIVED projection of the
+%% role fields in Data — `state_of/1` over leader / member_id / assume_ref —
+%% recomputed after every event by `next/2`.  Data stays the single source of
+%% truth (dozens of body reads want the leader's identity, not just the role),
+%% the projection cannot drift from it, and every role change is a genuine
+%% gen_statem transition — the seam phase 3's enter calls hang off.
+%%
+%% The state-matched clauses below are the hoisted dispatch: events whose old
+%% gen_server heads matched leadership now match the state itself, with the
+%% original Data guards kept where they say something the role alone does not
+%% (an epoch, a ref).  Everything else falls through to the generic shim at the
+%% bottom, whose handlers' own leadership branches remain authoritative — the
+%% hoist changes where dispatch is visible, never what it decides.
+
+%% -- the assume lifecycle ---------------------------------------------------
+
+%% A continuing leader absorbs a join on the fast path; every other
+%% configuration runs the genuine leadership change.  The old heads' epoch and
+%% synced guards stay on Data — the `leader` state says who we are, not which
+%% term we are in.
+handle_event(
+    {call, From},
+    {elector_assume_and_distribute, MemberId, AllIds, Tokens, FreshIds, Epoch},
+    leader,
+    Data = #state{epoch = Epoch, synced = true}
+) when MemberId =/= undefined ->
+    {reply, Reply, Data1} =
+        assume_fast_path(MemberId, AllIds, Tokens, FreshIds, Epoch, Data),
+    next(Data1, [{reply, From, Reply}]);
+handle_event(
+    {call, From},
+    {elector_assume_and_distribute, MemberId, AllIds, Tokens, FreshIds, Epoch},
+    _AnyState,
+    Data
+) ->
+    {reply, Reply, Data1} =
+        assume_genuine(MemberId, AllIds, Tokens, FreshIds, Epoch, Data),
+    next(Data1, [{reply, From, Reply}]);
+%% The handoff gather's continuation lands only in `assuming`, and only for the
+%% assume that armed it (the ref) — anywhere else it was superseded by a newer
+%% assume or by a snapshot that made us a follower, and is dropped where the
+%% mismatch is visible.
+handle_event(
+    info,
+    {assume_gathered, {_, _, _, _, _, Ref}, _, _, _, _, _} = Msg,
+    assuming,
+    Data = #state{assume_ref = Ref}
+) ->
+    {noreply, Data1} = handle_info(Msg, Data),
+    next(Data1, []);
+handle_event(info, {assume_gathered, _Ctx, _Self, _Freshest, _MaxV, _Peers, _Subs}, _AnyState, Data) ->
+    {keep_state, Data};
+%% The joiner-gather continuation is leader work in the current term; the
+%% member-still-known guard stays on Data.
+handle_event(
+    info,
+    {joiner_gathered, MemberId, _AllIds, _Tokens, Epoch, _Result} = Msg,
+    leader,
+    Data = #state{epoch = Epoch, members = Members}
+) when is_map_key(MemberId, Members) ->
+    {noreply, Data1} = handle_info(Msg, Data),
+    next(Data1, []);
+handle_event(info, {joiner_gathered, _M, _A, _T, _E, _R}, _AnyState, Data) ->
+    {keep_state, Data};
+
+%% -- leader-only periodic work ---------------------------------------------
+
+%% Only the leader advertises; everyone keeps the timer running so a later
+%% election heartbeats immediately.
+handle_event(info, replica_heartbeat, leader, Data) ->
+    broadcast_heartbeat(Data),
+    arm(?REPLICA_HEARTBEAT_INTERVAL, replica_heartbeat),
+    {keep_state, Data};
+handle_event(info, replica_heartbeat, _AnyState, Data) ->
+    arm(?REPLICA_HEARTBEAT_INTERVAL, replica_heartbeat),
+    {keep_state, Data};
+%% The deferred monitor-establishment sweep is leader work in the term that
+%% armed it; a stale step (deposed, or a newer assume) strands here.
+handle_event(info, {monitor_sweep, Epoch, _Cont} = Msg, leader, Data = #state{epoch = Epoch}) ->
+    {noreply, Data1} = handle_info(Msg, Data),
+    next(Data1, []);
+handle_event(info, {monitor_sweep, _Epoch, _Cont}, _AnyState, Data) ->
+    {keep_state, Data};
+
+%% -- leader-only protocol serves -------------------------------------------
+
+%% A follower's resync request: only a member that believes it leads answers
+%% (the requester's own state makes a stale serve harmless — see the handler).
+handle_event(cast, {resync_req, _FollowerId} = Msg, leader, Data) ->
+    {noreply, Data1} = handle_cast(Msg, Data),
+    next(Data1, []);
+handle_event(cast, {resync_req, _FollowerId}, _AnyState, Data) ->
+    {keep_state, Data};
+%% A forwarded unregister: the leader commits it; a non-leader stays silent (the
+%% follower keeps the removal stashed and re-drives it at the next leader).
+handle_event(cast, {unregister_req, _Ref, _FollowerId, _Name} = Msg, leader, Data) ->
+    {noreply, Data1} = handle_cast(Msg, Data),
+    next(Data1, []);
+handle_event(cast, {unregister_req, _Ref, _FollowerId, _Name}, _AnyState, Data) ->
+    {keep_state, Data};
+
+%% -- the generic shim -------------------------------------------------------
+
+handle_event({call, From}, Msg, _State, Data) ->
+    case handle_call(Msg, From, Data) of
+        {reply, Reply, Data1} -> next(Data1, [{reply, From, Reply}]);
+        {noreply, Data1} -> next(Data1, [])
     end;
-handle_event(cast, Msg, member, State) ->
-    {noreply, State1} = handle_cast(Msg, State),
-    {keep_state, State1};
-handle_event(info, Msg, member, State) ->
-    {noreply, State1} = handle_info(Msg, State),
-    {keep_state, State1};
-handle_event(internal, Continue, member, State) ->
-    {noreply, State1} = handle_continue(Continue, State),
-    {keep_state, State1}.
+handle_event(cast, Msg, _State, Data) ->
+    {noreply, Data1} = handle_cast(Msg, Data),
+    next(Data1, []);
+handle_event(info, Msg, _State, Data) ->
+    {noreply, Data1} = handle_info(Msg, Data),
+    next(Data1, []);
+handle_event(internal, Continue, _State, Data) ->
+    {noreply, Data1} = handle_continue(Continue, Data),
+    next(Data1, []).
+
+%% The statem state, derived.  `assuming` wins over the leader/follower read
+%% because a mid-assume member has cleared its leader view on purpose; a member
+%% with no leader and no assume in flight is searching.  The follower/gapped
+%% split arrives in phase 3 with the resync-ownership move.
+state_of(#state{assume_ref = Ref}) when Ref =/= undefined -> assuming;
+state_of(#state{leader = undefined}) -> searching;
+state_of(#state{leader = Self, member_id = Self}) -> leader;
+state_of(#state{}) -> follower.
+
+%% `{next_state, SameState, …}` is not a state change to gen_statem (same-state
+%% transitions keep timeouts and never fire enter calls), so deriving on every
+%% event is free of behavioral effect until a role actually moves.
+next(Data, Actions) ->
+    {next_state, state_of(Data), Data, Actions}.
 
 %% ---------------------------------------------------------------------------
 %% handle_continue/2
@@ -998,10 +1110,15 @@ handle_call(
     %% Ship the (potentially huge) replica as an off-heap binary, folded straight
     %% off the table — see encode_table/1.  The gathering leader decodes it.
     {reply, {encode_table(Tab), Version, Released}, State};
-%% ---- Elector calls (during lock period) ------------------------------------
+handle_call(_Request, _From, State) ->
+    {reply, {error, unknown_call}, State}.
+
+%% ---- Elector calls (dispatched from handle_event; during lock period) ------
 
 %% Called by the elector to atomically assume leadership and fan out the
-%% names snapshot to all followers.
+%% names snapshot to all followers.  Dispatch — fast path in the `leader` state
+%% for the same epoch, genuine change everywhere else — lives on the
+%% handle_event clauses; these are their bodies.
 %%
 %% The bindings are reconstructed entirely from the freshest of every reachable
 %% member's names map (`gather_maps/3`) — there is no durable name state to read
@@ -1029,11 +1146,7 @@ handle_call(
 %% and tell the existing followers to monitor the joiner too via a small token-only
 %% message.  The full gather+distribute below is reserved for a genuine leadership
 %% change, where a new leader must reconstruct from the freshest surviving member.
-handle_call(
-    {elector_assume_and_distribute, MemberId, AllIds, Tokens, FreshIds, Epoch},
-    _From,
-    State = #state{member_id = Self, leader = Self, epoch = Epoch, synced = true}
-) when MemberId =/= undefined ->
+assume_fast_path(MemberId, AllIds, Tokens, FreshIds, Epoch, State = #state{member_id = Self}) ->
     State1 = merge_peer_tokens(
         Tokens, add_member_monitors(extra_member_ids(MemberId, AllIds, Self), State)
     ),
@@ -1055,12 +1168,9 @@ handle_call(
         false ->
             spawn_joiner_gather(MemberId, AllIds, Tokens, Epoch, self()),
             {reply, ok, State1}
-    end;
-handle_call(
-    {elector_assume_and_distribute, MemberId, AllIds, Tokens, FreshIds, Epoch},
-    _From,
-    State = #state{member_id = Self}
-) ->
+    end.
+
+assume_genuine(MemberId, AllIds, Tokens, FreshIds, Epoch, State = #state{member_id = Self}) ->
     %% Genuine leadership change (a fresh leader, or a member_down that moved
     %% leadership).  The reconstruction gathers the freshest of every reachable member's
     %% replica — a **network** fan-out bounded by ?GATHER_TIMEOUT — so it runs **off this
@@ -1092,9 +1202,7 @@ handle_call(
     %% writes block (no reachable leader) and are re-driven by the continuation — rather
     %% than forwarding to the old, possibly-dead leader.  The continuation sets
     %% leader=Self.  `synced` is left as-is; the continuation's mark_synced handles it.
-    {reply, ok, State#state{assume_ref = Ref, leader = undefined}};
-handle_call(_Request, _From, State) ->
-    {reply, {error, unknown_call}, State}.
+    {reply, ok, State#state{assume_ref = Ref, leader = undefined}}.
 
 %% ---------------------------------------------------------------------------
 %% handle_cast/2
@@ -1131,11 +1239,6 @@ handle_cast(
             {remove, LogicalName, ReleasedPid, {forward_unreg, FollowerId, Ref}},
             row_delete(State, LogicalName)
         )};
-handle_cast({unregister_req, _Ref, _FollowerId, _LogicalName}, State) ->
-    %% Not the leader (the follower's leader belief was stale).  Deliberately no
-    %% reply: the follower keeps the removal stashed, and redrive_unregs/1 hands it
-    %% (pid-guarded) to the leader it learns from the snapshot/leadership change.
-    {noreply, State};
 %% Follower: the leader committed a forwarded unregister — answer the caller `ok`.
 %% FIFO puts this behind the batch's {names_batch} broadcast, so this member's
 %% row state reflects the removal by the time the caller sees the reply.
@@ -1299,10 +1402,6 @@ handle_cast(
     cast_to_member(
         FollowerId, {apply_names_snapshot, RecordsBin, Leader, [], #{}, Epoch, Version}
     ),
-    {noreply, State};
-handle_cast({resync_req, _FollowerId}, State) ->
-    %% Not the leader (the requester's stream came from someone else, or leadership
-    %% has since moved) — ignore; the requester's retry/rejoin will find the leader.
     {noreply, State};
 %% A pid-guarded remote retract (strict_replication fail-closed, §8): a member that
 %% failed to durably retract a binding — it lost leadership with the retract still
@@ -1630,10 +1729,6 @@ handle_info(
                 State
         end,
     {noreply, onboard_joiner(MemberId, AllIds, Tokens, State1)};
-handle_info({joiner_gathered, _MemberId, _AllIds, _Tokens, _Epoch, _Result}, State) ->
-    %% Superseded (leadership/epoch moved, or the joiner left the set) while the
-    %% gather was in flight — whatever superseded it re-snapshots the member.
-    {noreply, State};
 %% The asynchronous handoff gather (spawn_assume_gather) has returned: finish assuming
 %% leadership with the freshest reconstruction, off the critical path the elector's call
 %% was on.  Applied only if `assume_ref` still matches — a newer assume, or a snapshot
@@ -1728,10 +1823,6 @@ handle_info(
                 redrive_unregs(reject_forwards(mark_synced(cancel_resync(State4))))
             )
         )};
-handle_info({assume_gathered, _Ctx, _SelfRecords, _Freshest, _MaxV, _PeerResults, _Subs}, State) ->
-    %% Superseded (a newer assume, or a snapshot made us a follower) while the gather
-    %% was in flight — the current assume, or the leader, owns reconstruction now.
-    {noreply, State};
 %% Periodic maintenance: expire stale entries from the conflict-detection trail
 %% (§5.6) and the per-name kill-budget timestamps, then re-arm.  Trail pruning is
 %% suspended while any current member is disconnected: a disconnected member misses
@@ -1782,17 +1873,9 @@ handle_info(resync_timeout, State) ->
 %% and asks for a resync.  This is what makes replication converge without new
 %% writes; every other gap-detection trigger needs traffic that a quiescent cluster
 %% does not have.
-handle_info(replica_heartbeat, State = #state{member_id = Self, leader = Self}) ->
-    broadcast_heartbeat(State),
-    arm(?REPLICA_HEARTBEAT_INTERVAL, replica_heartbeat),
-    {noreply, State};
-handle_info(replica_heartbeat, State) ->
-    %% Not the leader — nothing to advertise, but keep the timer running so this
-    %% member heartbeats immediately if it is later elected.
-    arm(?REPLICA_HEARTBEAT_INTERVAL, replica_heartbeat),
-    {noreply, State};
-%% (broadcast_heartbeat/1, the leader clause's advertisement above, is defined
-%% beside broadcast_batch/5's MUTATION ifdef — it is itself mutation-planted.)
+%% (replica_heartbeat is dispatched entirely from handle_event — the leader
+%% advertises via broadcast_heartbeat/1, defined beside broadcast_batch/5's
+%% MUTATION ifdef since it is itself mutation-planted; everyone re-arms.)
 %%
 %% The deferred monitor-establishment sweep (see assume_leadership/1): one chunk of
 %% the names table per message, so live traffic interleaves.  Three guards make it
@@ -1836,11 +1919,6 @@ handle_info(
             self() ! {monitor_sweep, Epoch, Cont1},
             {noreply, State#state{name_to_ref = NTR1}}
     end;
-handle_info({monitor_sweep, _Epoch, _Cont}, State) ->
-    %% Superseded — deposed, or a newer assume (higher epoch) owns monitoring now.
-    %% Whatever monitors this sweep did create were demonitored by
-    %% relinquish_leadership on the way out.
-    {noreply, State};
 %% Re-drive the destructive ops of a batch that failed to commit (see
 %% salvage_failed_plan): re-enqueue them if we are (still) the leader, or forward
 %% the pid-guarded clears to the current leader if we were deposed — so an
