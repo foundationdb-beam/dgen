@@ -702,12 +702,22 @@ defmodule DGen.RegistryTest do
   # ---------------------------------------------------------------------------
 
   describe "detect_conflicts/3" do
+    # The detector takes RECORDS maps (`%{name => {pid, index, data}}`) and
+    # compares entries against the authority in place — the shape change that made
+    # the all-agree handoff allocation-free. `rec/1` builds the record wrapper;
+    # the semantics pinned below are unchanged from the pid-map era.
+    defp rec(pid), do: {pid, %{}, nil}
+
     test "two different live pids for one name is a conflict" do
       p1 = spawn_live()
       p2 = spawn_live()
 
       assert [{:n, ^p1, [^p2]}] =
-               :dgen_registry_member.detect_conflicts(%{n: p1}, [%{n: p1}, %{n: p2}], %{})
+               :dgen_registry_member.detect_conflicts(
+                 %{n: rec(p1)},
+                 [%{n: rec(p1)}, %{n: rec(p2)}],
+                 %{}
+               )
     end
 
     test "a recently-released name/pid pair is suppressed (lag, not conflict)" do
@@ -717,7 +727,11 @@ defmodule DGen.RegistryTest do
       released = %{{:n, p2} => System.system_time(:millisecond)}
 
       assert [] =
-               :dgen_registry_member.detect_conflicts(%{n: p1}, [%{n: p1}, %{n: p2}], released)
+               :dgen_registry_member.detect_conflicts(
+                 %{n: rec(p1)},
+                 [%{n: rec(p1)}, %{n: rec(p2)}],
+                 released
+               )
     end
 
     test "a release under one name does not mask a conflict on another name" do
@@ -728,7 +742,11 @@ defmodule DGen.RegistryTest do
       released = %{{:other, p2} => System.system_time(:millisecond)}
 
       assert [{:n, ^p1, [^p2]}] =
-               :dgen_registry_member.detect_conflicts(%{n: p1}, [%{n: p1}, %{n: p2}], released)
+               :dgen_registry_member.detect_conflicts(
+                 %{n: rec(p1)},
+                 [%{n: rec(p1)}, %{n: rec(p2)}],
+                 released
+               )
     end
 
     test "a legacy bare-pid trail entry (rolling upgrade) still suppresses" do
@@ -739,7 +757,11 @@ defmodule DGen.RegistryTest do
       released = %{p2 => System.system_time(:millisecond)}
 
       assert [] =
-               :dgen_registry_member.detect_conflicts(%{n: p1}, [%{n: p1}, %{n: p2}], released)
+               :dgen_registry_member.detect_conflicts(
+                 %{n: rec(p1)},
+                 [%{n: rec(p1)}, %{n: rec(p2)}],
+                 released
+               )
     end
 
     test "a dead divergent pid is not a conflict" do
@@ -748,19 +770,54 @@ defmodule DGen.RegistryTest do
       Process.exit(p2, :kill)
       eventually(fn -> not Process.alive?(p2) end)
 
-      assert [] = :dgen_registry_member.detect_conflicts(%{n: p1}, [%{n: p1}, %{n: p2}], %{})
+      assert [] =
+               :dgen_registry_member.detect_conflicts(
+                 %{n: rec(p1)},
+                 [%{n: rec(p1)}, %{n: rec(p2)}],
+                 %{}
+               )
+    end
+
+    test "a dead authority is not a conflict (nothing to defend)" do
+      p1 = spawn(fn -> :ok end)
+      Process.exit(p1, :kill)
+      eventually(fn -> not Process.alive?(p1) end)
+      p2 = spawn_live()
+
+      assert [] =
+               :dgen_registry_member.detect_conflicts(
+                 %{n: rec(p1)},
+                 [%{n: rec(p1)}, %{n: rec(p2)}],
+                 %{}
+               )
     end
 
     test "agreement across all maps is not a conflict" do
       p1 = spawn_live()
 
-      assert [] = :dgen_registry_member.detect_conflicts(%{n: p1}, [%{n: p1}, %{n: p1}], %{})
+      assert [] =
+               :dgen_registry_member.detect_conflicts(
+                 %{n: rec(p1)},
+                 [%{n: rec(p1)}, %{n: rec(p1)}],
+                 %{}
+               )
+    end
+
+    test "agreement with different metadata is still agreement (pids decide)" do
+      p1 = spawn_live()
+
+      assert [] =
+               :dgen_registry_member.detect_conflicts(
+                 %{n: {p1, %{v: 1}, nil}},
+                 [%{n: {p1, %{v: 2}, :other}}],
+                 %{}
+               )
     end
 
     test "a name with no authority (absent from the freshest map) is not a conflict" do
       p1 = spawn_live()
 
-      assert [] = :dgen_registry_member.detect_conflicts(%{}, [%{n: p1}], %{})
+      assert [] = :dgen_registry_member.detect_conflicts(%{}, [%{n: rec(p1)}], %{})
     end
   end
 

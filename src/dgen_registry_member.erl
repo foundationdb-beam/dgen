@@ -1565,10 +1565,15 @@ handle_info(
                     State#state.recently_released,
                     Released
                 ),
-                OwnPids = record_pids(current_records(State#state.names_tab)),
-                Conflicts = detect_conflicts(OwnPids, [record_pids(Records)], MergedReleased),
-                {_Names, S1} = resolve_conflicts(
-                    Conflicts, OwnPids, State#state{recently_released = MergedReleased}
+                %% One materialization of our own replica (the authority) instead of
+                %% one plus two pid projections — detect_conflicts compares records
+                %% maps in place now.  The resolved map is discarded either way: the
+                %% leader's table is authoritative here, and a conflict resolution
+                %% only kills/alarms (the joiner is re-baselined by the snapshot).
+                OwnRecords = current_records(State#state.names_tab),
+                Conflicts = detect_conflicts(OwnRecords, [Records], MergedReleased),
+                {_Records, S1} = resolve_conflicts(
+                    Conflicts, OwnRecords, State#state{recently_released = MergedReleased}
                 ),
                 S1;
             error ->
@@ -1616,19 +1621,22 @@ handle_info(
     ),
     %% Resolve genuine uniqueness conflicts the gather exposes (§5.6) — kill-both +
     %% alarm + bounded budget; conflicted names are dropped (the fan-out propagates the
-    %% drop).  A no-op in the common conflict-free handoff.
-    FreshestNames = record_pids(FreshestRecords),
-    {CleanNames, State0} = resolve_conflicts(
+    %% drop).  A no-op in the common conflict-free handoff — and an ALLOCATION-FREE
+    %% one: detect_conflicts compares the records maps in place, and with no
+    %% conflicts `Records` below IS `FreshestRecords`, untouched.  Metadata rides the
+    %% surviving bindings automatically (resolve_conflicts only ever *removes* names
+    %% from the records map).  This path used to project three pid maps, build a
+    %% union map, and re-project the survivors with maps:keys + maps:with — five
+    %% n-entry allocations discarded on every healthy handoff.
+    {Records, State0} = resolve_conflicts(
         detect_conflicts(
-            FreshestNames,
-            [record_pids(SelfRecords) | [record_pids(M) || M <- PeerRecordMaps]],
+            FreshestRecords,
+            [SelfRecords | PeerRecordMaps],
             MergedReleased
         ),
-        FreshestNames,
+        FreshestRecords,
         State#state{recently_released = MergedReleased}
     ),
-    %% Metadata rides the surviving bindings (resolve_conflicts only ever *drops* names).
-    Records = maps:with(maps:keys(CleanNames), FreshestRecords),
     %% Reconstruct the local replica (pid + metadata) + inverted index wholesale, then
     %% become leader, monitoring the reconstructed names.  Clearing assume_ref marks the
     %% assume complete.
@@ -1831,14 +1839,20 @@ do_leader_changed(NewLeader, OldLeader, Self, State0) ->
 %% work in the same call chain (the handoff gather, records_replace, index_rebuild) — so
 %% it is not the hot path the commit-plan seed is (see plan_batch/maybe_start_commit).
 assume_leadership(State = #state{names_tab = Tab}) ->
-    Names = record_pids(current_records(Tab)),
-    {NTR, RTN} = maps:fold(
-        fun(LogicalName, Pid, {NTRAcc, RTNAcc}) ->
+    %% One pass over the table, straight into the two ref maps — no intermediate
+    %% records map and no pid projection.  This used to be
+    %% `record_pids(current_records(Tab))`, i.e. materialize the whole replica as
+    %% a map and then project it to pids, both thrown away immediately; measured
+    %% at 200k names those two allocations were ~115ms of the client-visible
+    %% handoff window (map materialization is ~0.4us/name, the projection
+    %% ~0.16us/name — see bench/registry_election_latency.exs).
+    {NTR, RTN} = ets:foldl(
+        fun({LogicalName, Pid, _Index, _Data}, {NTRAcc, RTNAcc}) ->
             Ref = erlang:monitor(process, Pid),
             {NTRAcc#{LogicalName => Ref}, RTNAcc#{Ref => LogicalName}}
         end,
         {#{}, #{}},
-        Names
+        Tab
     ),
     %% Seed each subscription's watch-set membership from the reconstructed replica, so
     %% the first commit under this leadership computes its deltas against the true
@@ -2066,28 +2080,49 @@ collect_gather(Ref, Waiting, Deadline, Acc) ->
 %% no second live claimant — so it is left to the freshest-wins reconstruction.
 %% Aliveness is probed only when a candidate divergence exists, so the common
 %% all-agree handoff costs no probes.  Returns `[{Name, AuthorityPid, [DivergentPid]}]`.
-detect_conflicts(FreshestNames, AllMaps, Released) ->
-    ByName = lists:foldl(
+%%
+%% Takes RECORDS maps (`#{Name => {Pid, Index, Data}}`) directly and compares each
+%% entry against the authority inline, accumulating only for *divergent* names — so
+%% the common all-agree handoff allocates nothing but the fold's loop frame.  This
+%% used to project every map to pids (`record_pids`) and build a name→pid-set map
+%% over the union first: at 200k names that was three full n-entry maps plus the
+%% union map (~0.9us/name) allocated and discarded on a path where a divergence is
+%% the rare case.  An entry from the freshest map itself always agrees with its own
+%% authority, so including it in `RecordMaps` is harmless.
+detect_conflicts(FreshestRecords, RecordMaps, Released) ->
+    Candidates = lists:foldl(
         fun(Map, Acc0) ->
             maps:fold(
-                fun(Name, Pid, Acc) ->
-                    Pids = maps:get(Name, Acc, #{}),
-                    Acc#{Name => Pids#{Pid => true}}
+                fun(Name, {Pid, _Index, _Data}, Acc) ->
+                    case maps:get(Name, FreshestRecords, undefined) of
+                        {Pid, _, _} ->
+                            %% Agrees with the authority — the common case, free.
+                            Acc;
+                        _AbsentOrDifferent ->
+                            case released_entry(Name, Pid, Released) of
+                                true ->
+                                    Acc;
+                                false ->
+                                    Pids = maps:get(Name, Acc, #{}),
+                                    Acc#{Name => Pids#{Pid => true}}
+                            end
+                    end
                 end,
                 Acc0,
                 Map
             )
         end,
         #{},
-        AllMaps
+        RecordMaps
     ),
     maps:fold(
         fun(Name, PidSet, Acc) ->
-            Authority = maps:get(Name, FreshestNames, undefined),
-            Others = [
-                P
-             || P <- maps:keys(PidSet), P =/= Authority, not released_entry(Name, P, Released)
-            ],
+            Authority =
+                case maps:get(Name, FreshestRecords, undefined) of
+                    {APid, _Index, _Data} -> APid;
+                    undefined -> undefined
+                end,
+            Others = [P || P <- maps:keys(PidSet), P =/= Authority],
             case Others =:= [] orelse not (is_pid(Authority) andalso is_pid_alive(Authority)) of
                 true ->
                     Acc;
@@ -2099,7 +2134,7 @@ detect_conflicts(FreshestNames, AllMaps, Released) ->
             end
         end,
         [],
-        ByName
+        Candidates
     ).
 
 %% Was this pid explicitly released *from this name* recently?  Trail keys are
@@ -2115,7 +2150,9 @@ released_entry(Name, Pid, Released) ->
 %% every divergent pid), drop the name from the reconstructed map (the snapshot
 %% fan-out propagates the drop, so supervised processes restart and re-register
 %% cleanly under the single fenced leader), and alarm — subject to a per-name kill
-%% budget and the `terminate_on_conflict` config.  Returns `{CleanNames, State}`.
+%% budget and the `terminate_on_conflict` config.  Operates on the freshest RECORDS
+%% map (values `{Pid, Index, Data}`) and only ever `maps:remove`s from it, so with
+%% no conflicts the map passes through by reference.  Returns `{CleanRecords, State}`.
 resolve_conflicts([], Names, State) ->
     {Names, State};
 resolve_conflicts(Conflicts, Names, State = #state{config = Config}) ->
@@ -3591,10 +3628,6 @@ decode_records(Bin) when is_binary(Bin) -> binary_to_term(Bin);
 %% the map every caller wants.
 decode_records(List) when is_list(List) -> maps:from_list(List);
 decode_records(Map) when is_map(Map) -> Map.
-
-%% Project a records map down to its pids for the pid-uniqueness conflict detector.
-record_pids(Records) ->
-    maps:map(fun(_Name, {Pid, _Index, _Data}) -> Pid end, Records).
 
 %% Wholesale replace the replica with a records map `#{Name => {Pid, Index, Data}}` (a
 %% leadership-snapshot apply / handoff reconstruction): clear the table, insert the new

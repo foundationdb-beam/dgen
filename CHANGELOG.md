@@ -21,6 +21,20 @@
 
 ### Enhancements
 
+- **`dgen_registry` — leadership-handoff map allocations cut (~22% faster
+  client-visible election window).** The assume path materialized the replica
+  as fresh n-entry Erlang maps at least eight times; profiling
+  (`bench/registry_election_latency.exs`) attributed ~52% of the O(names)
+  handoff cost to that churn, with ETS writes under 5%. Now:
+  `detect_conflicts/3` compares records maps in place and allocates only for
+  divergent names (the all-agree handoff allocates nothing);
+  `resolve_conflicts` operates on the freshest records map directly, so the
+  no-conflict reconstruction passes it through by reference (the
+  `maps:keys` + `maps:with` identity projection is gone); and
+  `assume_leadership` folds the ETS table straight into its monitor-ref maps.
+  Measured kill→first-`yes` at 200k names: ~940ms → ~740ms (~3.1µs/name,
+  from ~4.2).
+
 - **Formal layers hardened and aligned.** The TLA+ model now covers the
   replication heartbeat (bounded to one in flight per leader) and splits the
   §5.7 fix into its two guards, each proven independently necessary by its own
