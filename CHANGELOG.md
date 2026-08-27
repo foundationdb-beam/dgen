@@ -14,7 +14,29 @@
   the current holder. Found by the simulation harness's new end-of-run
   ack-history invariant (`test/support/sim/README.md`, finding 7).
 
+- **DST harness — `dgen_registry:await_ready/2` wedged the deterministic
+  suite.** Its poll loop's transformed `timer:sleep` ran in the eta driver
+  process, arming a virtual deadline nothing could reach; the readiness poll
+  now runs on the real clock via transform-free `dgen_utils` helpers.
+
 ### Enhancements
+
+- **Formal layers hardened and aligned.** The TLA+ model now covers the
+  replication heartbeat (bounded to one in flight per leader) and splits the
+  §5.7 fix into its two guards, each proven independently necessary by its own
+  expected-fail config; new configs demonstrate the handoff race's
+  UniqueBinding half, machine-check ack reachability (the vacuity canary), and
+  characterize the *default* degrade-open mode (keeps everything but
+  two-holder durability). The DST harness gains end-of-run ack-history
+  invariants under `eta_run` (UniqueBinding in the spec's cumulative form,
+  acked-presence), a strict-replication leader-crash durability test, a
+  join-mid-workload-under-loss scenario (`Cluster.join/2`) pinning the
+  continuing-leader fast path, and a second planted mutation
+  (`DGEN_MUTATION=quiet_resync`) with its own targeted suite. Guard rails:
+  a plain test run now refuses a build cache still holding a planted
+  mutation, `formal/check.sh` is concurrency-safe (per-run metadir), and CI
+  runs every TLC config, both mutations, and the previously-uncovered
+  deterministic-suite ratchets.
 
 - **`dgen_registry` — per-registry `connectivity` option.** `provided_externally`
   disables a registry's proactive distribution mesh so it can free-ride on the links

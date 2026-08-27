@@ -23,11 +23,33 @@ jobs:
         include:
           - cfg: DgenRegistryReplication
             expect: pass
+          # The heartbeat with every invariant, at the reduced bounds its
+          # mechanism needs (full bounds exceed 60M states) — see its .cfg.
+          - cfg: DgenRegistryReplicationHeartbeat
+            expect: pass
+          # The shipped DEFAULT (degrade-open) keeps everything except two-holder
+          # durability — the characterization config, see its .cfg comment.
+          - cfg: DgenRegistryReplicationDegradeOpenSafety
+            expect: pass
           - cfg: DgenRegistryReplicationHandoffRace
+            expect: fail
+          # The UniqueBinding half of the handoff race, which the config above
+          # never demonstrates (TLC stops at DurableAcked first).
+          - cfg: DgenRegistryReplicationHandoffRaceUnique
+            expect: fail
+          # Each half of the §5.7 fix flipped alone — both independently necessary.
+          - cfg: DgenRegistryReplicationHandoffGatherOnly
+            expect: fail
+          - cfg: DgenRegistryReplicationSnapMonotonicOnly
             expect: fail
           - cfg: DgenRegistryReplicationNoGuard
             expect: fail
           - cfg: DgenRegistryReplicationDegradeOpen
+            expect: fail
+          # Not a mutation: the reachability canary. `acked = {}` asserted as an
+          # invariant MUST fail, or every safety invariant above is vacuously
+          # satisfiable by a protocol that never acks anyone.
+          - cfg: DgenRegistryReplicationAckReachable
             expect: fail
     steps:
       - uses: actions/checkout@v3
@@ -85,6 +107,16 @@ jobs:
         run: sudo dpkg -i /tmp/fdb-debs/foundationdb-clients_${FDB_VERSION}-1_amd64.deb
       - run: mix deps.get
       - run: mix dst
+      # The untagged mem_only tests — the determinism ratchets (25-seed schedule
+      # distinctness, per-seed reproduction, instrumentation invariance), strict
+      # replay, virtual time, and the single-run check_final assertion — are not
+      # `:simulation`-tagged (they are the fast edit-loop tier), and the plain
+      # `mix test` in ci.yml runs the FDB backend, which excludes `:mem_only`. So
+      # without this step they run in NO CI job at all.
+      - name: Deterministic-suite ratchets
+        run: mix test test/dgen_registry_eta_test.exs
+        env:
+          DGEN_BACKEND: dgen_mem
 
   mutation:
     runs-on: ubuntu-latest
@@ -137,3 +169,14 @@ jobs:
         run: MIX_ENV=test mix compile --force
       - name: Rediscover, shrink and replay it
         run: mix test --only mutation
+      # The second planted defect, in the same job (its own compile --force
+      # replaces the beams wholesale, and the shared cache never leaks into the
+      # clean jobs — their keys differ).
+      - name: Compile with the quiet-resync defect
+        run: MIX_ENV=test mix compile --force
+        env:
+          DGEN_MUTATION: quiet_resync
+      - name: Catch the quiet-resync gap
+        run: mix test --only mutation_quiet
+        env:
+          DGEN_MUTATION: quiet_resync

@@ -10,13 +10,20 @@ CFG="${1:?usage: check.sh <config-basename> [pass|fail]}"
 EXPECT="${2:-pass}"
 JAR="${TLA2TOOLS_JAR:-tla2tools.jar}"
 OUT="$(mktemp)"
-trap 'rm -f "$OUT"' EXIT
+# A private scratch metadir per run. TLC's default (states/ shared by every
+# invocation) plus -cleanup lets one concurrent run delete another's live state
+# pool mid-write — observed as "Error: when writing the disk (StatePoolWriter)"
+# killing the main-config run whenever two check.sh ran at once. mktemp -d makes
+# concurrent invocations (a make -j, two terminals, parallel CI steps) safe;
+# the trap replaces -cleanup.
+META="$(mktemp -d)"
+trap 'rm -rf "$OUT" "$META"' EXIT
 
 set +e
 # -deadlock DISABLES deadlock checking: bounded models legitimately run out
 # of enabled actions when MaxVersion/MaxEpoch/MaxCrashes are exhausted.
 java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC \
-  -workers auto -deadlock -cleanup \
+  -workers auto -deadlock -metadir "$META" \
   -config "${CFG}.cfg" DgenRegistryReplication.tla 2>&1 | tee "$OUT"
 STATUS=${PIPESTATUS[0]}
 set -e
