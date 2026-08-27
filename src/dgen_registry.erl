@@ -803,17 +803,27 @@ not-yet-known leader. Safe to call from many nodes; it only reads local member s
 -endif.
 -spec await_ready(Name :: atom(), Timeout :: non_neg_integer()) -> ok | {error, timeout}.
 await_ready(Name, Timeout) ->
-    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    Deadline = dgen_utils:real_monotonic_ms() + Timeout,
     await_ready_loop(Name, Deadline).
 
+%% The poll sleeps and reads the clock through `dgen_utils`, which the eta
+%% transform does not touch, and that is load-bearing: this module carries the
+%% transform (see the include at the top), so a bare `timer:sleep/1` here becomes
+%% `eta_time:sleep/1` — and under `eta_run` this loop runs in the *driver* while
+%% the cluster starts, the one process whose transformed sleep arms a virtual
+%% deadline nothing will ever reach (`eta_time:sleep/1`'s own boundary rule).
+%% Observed as the whole run wedging in `await_ready_loop` whenever a member was
+%% not ready on the very first poll.  Readiness polling is a wall-clock concern:
+%% it runs before the schedule owns the system (or on a real node, where there is
+%% no schedule at all), exactly like the harness's own `await_quiescent/2`.
 await_ready_loop(Name, Deadline) ->
     case ready(Name) of
         true ->
             ok;
         false ->
-            case erlang:monotonic_time(millisecond) < Deadline of
+            case dgen_utils:real_monotonic_ms() < Deadline of
                 true ->
-                    timer:sleep(?READY_POLL_INTERVAL),
+                    dgen_utils:real_sleep(?READY_POLL_INTERVAL),
                     await_ready_loop(Name, Deadline);
                 false ->
                     {error, timeout}
