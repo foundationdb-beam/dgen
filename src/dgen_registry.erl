@@ -3,6 +3,50 @@
 
 -define(DOCATTRS, ?OTP_RELEASE >= 27).
 
+%% The transform, for a module that is mostly a supervisor and an API surface.
+%%
+%% What matters is *where this code runs*.  `register_name/2`, `unregister_name/1`,
+%% `whereis_name/1`, `query/2` and the rest execute in the **caller's** process, and
+%% under simulation the caller is a process the scheduler owns.  So every
+%% `gen_server:call/2,3` here has to be the one `eta_net` provides rather than
+%% OTP's -- not for the fault injection, but for the clock and the schedule.
+%%
+%% Left untransformed, such a call goes into `gen:do_call/4`, which is OTP code no
+%% transform reaches, and takes two real-time dependencies with it: a
+%% `receive ... after Timeout` on the wall clock, and a real `erlang:monitor` whose
+%% `DOWN` the VM delivers when it likes rather than when the schedule says.  Both
+%% put a scheduled process's progress outside the schedule, and neither shows up in
+%% `eta_run:audit/1` -- the run simply stops being a function of its seed.  Found
+%% exactly that way: clients parked in `gen:do_call/4` at the step where two runs
+%% of one seed first disagreed.
+-include("../include/dgen_eta.hrl").
+
+%% Supervisor flags that exist only to keep this tree schedulable under simulation.
+%%
+%% The simulation declares these supervisors to `eta_sched` — it has to, because
+%% `elector_pid/1` below asks a supervisor for its children, so every
+%% `get_leader/1`, `get_epoch/1` and `get_members/1` is a call into one. A process
+%% the scheduler owns must have no real timers, and on OTP 28 a supervisor does:
+%% `hibernate_after` arrived with a 1000ms default, implemented as a `gen_server`
+%% timeout, and `supervisor` is OTP code no parse transform reaches. So every
+%% supervisor armed a wall-clock timer that dropped a message into a scheduled
+%% process's mailbox whenever real time said so. It moved with machine load — six
+%% simulation suites running at once made it fail about one run in three, while
+%% one at a time looked clean — and it was the last thing keeping `mix dst` from
+%% being a function of its seed.
+%%
+%% Guarded twice over, so a release build is byte-for-byte what it was: `DST` is
+%% set only by the test profile, and the key does not exist before OTP 28.
+-ifdef(DST).
+-if(?OTP_RELEASE >= 28).
+-define(SUP_SIM_FLAGS, #{hibernate_after => infinity}).
+-else.
+-define(SUP_SIM_FLAGS, #{}).
+-endif.
+-else.
+-define(SUP_SIM_FLAGS, #{}).
+-endif.
+
 -if(?DOCATTRS).
 -moduledoc """
 OTP-compatible process registry implementing the `{via, dgen_registry, {RegistryName, LogicalName}}` contract.
@@ -102,6 +146,8 @@ watched query changes — `{dgen_presence, SubId, [{joined | left, Name, Pid}]}`
 Subscriptions are **durable** (stored in the elector's backend state, keyed by an
 application id), so they outlive the cluster — built for process-presence systems whose
 stakeholders are database entities. See §4.9 of the design doc.
+
+*This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
 -endif.
 
@@ -960,6 +1006,6 @@ init({Name, Tenant, Opts}) ->
     %% matters: elector first (both others discover it), then member (registers its
     %% name), then connector (walks from the member to the elector).
     {ok,
-        {#{strategy => one_for_all, intensity => 5, period => 10}, [
+        {maps:merge(#{strategy => one_for_all, intensity => 5, period => 10}, ?SUP_SIM_FLAGS), [
             ElectorSpec, MemberSpec, ConnectorSpec
         ]}}.

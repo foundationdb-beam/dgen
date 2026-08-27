@@ -47,6 +47,8 @@ defmodule DGen.Registry do
   (lock-free / leader-routed, mirroring `whereis_name/1` /
   `whereis_name_consistent/1`). `query/2` / `query_consistent/2` find every
   registration whose `index` satisfies a conjunction of exact equalities.
+
+  *This documentation is LLM-generated. See the AI disclosure in `README.md`.*
   """
 
   @doc """

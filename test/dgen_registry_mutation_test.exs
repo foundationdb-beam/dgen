@@ -120,8 +120,15 @@ defmodule DGen.RegistryMutationTest do
       # positional ids, which is why the *operations* themselves never shrink.
       small = %{max_ops: 3}
 
+      # 1..200 rather than 1..40. The three-operation workload is a narrow window —
+      # the defect needs a batch to be partially delivered inside three ops — so the
+      # density of reproducing seeds is low, and *which* seeds reproduce is a
+      # function of `generate/2`. Adding the node-fault draws to the generator
+      # reshuffled that mapping, and the first reproducing seed moved from inside
+      # the old range to 119. Nothing about the defect or the framework changed;
+      # the range was simply cut too fine to survive a generator change.
       found =
-        Enum.find_value(1..40, fn seed ->
+        Enum.find_value(1..200, fn seed ->
           case @run.run(@harness, opts(seed, tenant, small)) do
             %{outcome: {:violation, _}, trace: trace} -> {seed, trace}
             _ -> nil
@@ -160,6 +167,12 @@ defmodule DGen.RegistryMutationTest do
     #
     # `save_fixture/4` replays strictly before writing anything, so what is on
     # disk has been demonstrated to reproduce rather than believed to.
+    #
+    # It has been regenerated once, and for exactly the reason above: declaring the
+    # supervisors to the scheduler changed the order `processes/1` registers in, so
+    # every process id in the recorded trace shifted and the replay diverged at the
+    # first step. That is the contract changing, which this fixture is supposed to
+    # notice.
     @fixture "test/fixtures/partial_batch.eta"
 
     test "the recorded divergence still reproduces", %{tenant: tenant} do
@@ -185,7 +198,10 @@ defmodule DGen.RegistryMutationTest do
       assert harness == @harness
       assert opts.config.drop_p == 0.2
       assert opts.config.members == 3
-      assert opts.preload == [:dgen]
+
+      # Everything a scheduled process might reach has to be preloaded, or an
+      # on-demand code load blocks it on `code_server` — see `RegistryHarness`.
+      assert opts.preload == [:dgen, :elixir, :logger]
     end
   end
 

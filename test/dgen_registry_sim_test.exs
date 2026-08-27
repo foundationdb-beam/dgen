@@ -356,6 +356,167 @@ defmodule DGen.RegistrySimTest do
   end
 
   # ---------------------------------------------------------------------------
+  # Node faults — a lost *link*, not a lost message.
+  #
+  # `cut/2` above is the narrow fault of a channel that swallows traffic while both
+  # ends still believe the link is up. `partition/4` is the one real distribution
+  # actually produces: the connection goes down, both ends are told, and every
+  # monitor across it fires. The registry hangs recovery off exactly those events,
+  # so these are the tests of that recovery.
+  #
+  # One thing is *not* exercised here and is in `dgen_registry_eta_test.exs`
+  # instead: this suite runs `eta_net` with no scheduler, and a simulated peer
+  # monitor learns of an ordinary exit from `eta_sched`. Placing before the cluster
+  # forms — which is what makes a peer monitor severable — would therefore break
+  # `crash/2` detection above. So a partition here delivers the node signals and
+  # the message loss, and the `noconnection` DOWNs belong to the deterministic
+  # suite. See `Cluster.start/3`'s `:simulate_peer_monitors`.
+  # ---------------------------------------------------------------------------
+
+  describe "node faults" do
+    test "a partitioned member rejoins and reconverges when the link heals", %{tenant: tenant} do
+      seed = 81
+      c = Cluster.start(tenant, 3, seed: seed)
+      on_exit(fn -> Cluster.stop(c) end)
+
+      {_node, leader} = Cluster.leader(c)
+      victim = Enum.find(Cluster.alive(c), &(&1 != leader))
+
+      acked = run_workload(c, 20, seed)
+
+      before = :eta_net.stats().signalled
+      Cluster.partition(c, leader, victim)
+
+      assert :eta_net.stats().signalled > before,
+             "the partition told nobody a node had gone — every process on both " <>
+               "sides is unplaced, so the topology is not what this test thinks"
+
+      # The victim is cut off in both directions, so the writes below cannot reach
+      # it and it must fall behind.
+      acked = Map.merge(acked, run_workload(c, 30, seed + 1))
+
+      assert eventually(fn ->
+               Cluster.applied_version(victim) < Cluster.applied_version(leader)
+             end),
+             "the victim did not fall behind — the partition had no effect"
+
+      Cluster.heal_partition(c, leader, victim)
+      assert_converged!(c, acked, seed, crashed?: true)
+
+      {_node, converged_leader} = Cluster.leader(c)
+      assert Cluster.bindings(victim) == Cluster.bindings(converged_leader)
+    end
+
+    test "a fully isolated member rejoins from the minority side", %{tenant: tenant} do
+      # The classic shape: one member cut off from every peer at once, while the
+      # remaining two carry on. Its elector is `attach`ed rather than `place`d, so
+      # it still reaches the durable queue — which is what a real partition looks
+      # like when the store is reachable from both sides, and what keeps the run
+      # scoped to the protocol rather than wedging on an election that can never
+      # complete.
+      seed = 85
+      c = Cluster.start(tenant, 3, seed: seed)
+      on_exit(fn -> Cluster.stop(c) end)
+
+      acked = run_workload(c, 20, seed)
+      victim = Cluster.a_follower(c)
+
+      Cluster.isolate(c, victim)
+      acked = Map.merge(acked, run_workload(c, 30, seed + 1))
+
+      assert_always!(c, seed)
+      assert_converged!(c, acked, seed, crashed?: true)
+    end
+
+    test "only one side notices, and the cluster still converges", %{tenant: tenant} do
+      # `learns: :a` is the asymmetry real distribution produces constantly: the
+      # two ends time out independently, so one can find out well before the
+      # other. The cut itself stays symmetric — a lost link loses both directions
+      # whether or not anyone has realised — which is exactly the state that used
+      # to need hand-rolling from two `cut/2` calls.
+      seed = 86
+      c = Cluster.start(tenant, 3, seed: seed)
+      on_exit(fn -> Cluster.stop(c) end)
+
+      {_node, leader} = Cluster.leader(c)
+      victim = Enum.find(Cluster.alive(c), &(&1 != leader))
+
+      acked = run_workload(c, 20, seed)
+      Cluster.partition(c, leader, victim, %{learns: :a})
+
+      acked = Map.merge(acked, run_workload(c, 30, seed + 1))
+      assert_always!(c, seed)
+      assert_converged!(c, acked, seed, crashed?: true)
+    end
+
+    test "the cluster survives losing a whole node", %{tenant: tenant} do
+      # `crash/2`'s node-level counterpart. The tree dies atomically, the survivors
+      # are told `{nodedown, member_i}`, and the node's name stays behind so it can
+      # be restarted onto.
+      seed = 82
+      c = Cluster.start(tenant, 3, seed: seed)
+      on_exit(fn -> Cluster.stop(c) end)
+
+      acked = run_workload(c, 30, seed)
+      victim = Cluster.a_follower(c)
+
+      before = :eta_net.stats().signalled
+      c = Cluster.kill_node(c, victim)
+
+      assert Process.whereis(victim) == nil, "the member survived its node"
+      assert :eta_net.stats().signalled > before, "no survivor was told the node had gone"
+      assert length(Cluster.alive(c)) == 2
+
+      acked = Map.merge(acked, run_workload(c, 30, seed + 1))
+      assert_always!(c, seed)
+      # crashed?: true — a node kill is a fault, and Guarantee 4 is degrade-open at
+      # one, exactly as for `crash/2`.
+      assert_converged!(c, acked, seed, crashed?: true)
+    end
+
+    test "a killed node restarts onto the same name and re-syncs", %{tenant: tenant} do
+      seed = 83
+      c = Cluster.start(tenant, 3, seed: seed)
+      on_exit(fn -> Cluster.stop(c) end)
+
+      acked = run_workload(c, 30, seed)
+      victim = Cluster.a_follower(c)
+
+      c = Cluster.kill_node(c, victim)
+      acked = Map.merge(acked, run_workload(c, 20, seed + 1))
+      c = Cluster.restart(c, victim)
+
+      assert_converged!(c, acked, seed, crashed?: true)
+
+      {_node, converged_leader} = Cluster.leader(c)
+      assert Cluster.bindings(victim) == Cluster.bindings(converged_leader)
+      assert length(Cluster.alive(c)) == 3
+    end
+
+    test "losing the leader's node elects a new leader", %{tenant: tenant} do
+      seed = 84
+      c = Cluster.start(tenant, 3, seed: seed)
+      on_exit(fn -> Cluster.stop(c) end)
+
+      acked = run_workload(c, 30, seed)
+      {_node, leader} = Cluster.leader(c)
+      c = Cluster.kill_node(c, leader)
+
+      assert eventually(fn ->
+               case Cluster.leader(c) do
+                 nil -> false
+                 {_n, name} -> name != leader and name in Cluster.alive(c)
+               end
+             end),
+             "no new leader was elected after the leader's node was lost"
+
+      acked = Map.merge(acked, run_workload(c, 30, seed + 1))
+      assert_always!(c, seed)
+      assert_converged!(c, acked, seed, crashed?: true)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Regression: a batch is atomic on the wire.
   #
   # A batch ships as one `{names_batch, Ops, …}` message, so losing it always leaves

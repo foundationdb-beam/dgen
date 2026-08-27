@@ -44,6 +44,8 @@ that will appear in a `{Ref, ready}` message sent to the watching process.
 Backends define opaque types for database handles, transaction handles,
 directory handles, and futures. The dgen core treats these as opaque terms
 and only passes them back into backend callbacks.
+
+*This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
 -endif.
 

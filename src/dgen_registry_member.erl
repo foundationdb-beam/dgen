@@ -686,6 +686,17 @@ init(#{name := Name, tenant := Tenant, tuid := Tuid} = Args) ->
     %% reap / probe machinery lives in the sibling `dgen_registry_connector`, which
     %% subscribes independently — this member no longer meshes or reaps.
     net_kernel:monitor_nodes(true),
+    %% Resolve the telemetry lookup here rather than lazily on the first event.  It
+    %% is cached per VM either way (see `telemetry_available/0`), so this only moves
+    %% *when* the one uncached call happens -- and where it happens is the point.
+    %% Uncached, it is a synchronous call into `code_server`; lazily, it lands inside
+    %% whichever member emits the first event, which under simulation is a scheduled
+    %% process blocking on a process the scheduler does not own.  Everything after
+    %% that is ordered by wall clock, and nothing reports it: `code:ensure_loaded/1`
+    %% on a *missing* module loads nothing, so the "no module loaded mid-run" audit
+    %% stays clean while the leak is wide open.  Here it runs while the tree is
+    %% starting, which under `eta_run` is before a scheduler exists at all.
+    _ = telemetry_available(),
     %% Periodic maintenance: expire the conflict-detection trail (§5.6) and the
     %% per-name kill-budget timestamps.
     arm(?PRUNE_INTERVAL, prune_released),

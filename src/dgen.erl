@@ -2,6 +2,11 @@
 
 -define(DOCATTRS, ?OTP_RELEASE >= 27).
 
+%% Runs *inside the caller's process*, which under simulation is a scheduled one,
+%% so it needs the transform for exactly the reason the servers do -- see the note
+%% above the include in `dgen_registry`.
+-include("../include/dgen_eta.hrl").
+
 -if(?DOCATTRS).
 -moduledoc false.
 -endif.

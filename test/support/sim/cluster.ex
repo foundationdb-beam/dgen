@@ -16,13 +16,29 @@ defmodule DGen.Sim.Cluster do
   ~5s for a `:peer` node) and lets `eta_net` interpose on every message between
   them.
 
-  ## What it does not simulate
+  ## Node faults
 
-  All members share a VM, so they also share a fate and a scheduler. A member
-  "crash" here kills its supervision tree, which is a faithful model of losing a
-  *member*, but not of losing a *node* — the surviving members never see a
-  `nodedown`, and the connector's node-level backstops (§4.6) never fire. Tests
-  that need those belong in `dgen_registry_cluster_test.exs` with real peers.
+  Each member's whole supervision tree sits on a simulated node of its own, so
+  `eta_net` can express node-level failure and not only message loss:
+
+  - `partition/3,4` cuts a pair of nodes *and* delivers the `{nodedown, Peer}`
+    both ends would see, plus a `noconnection` DOWN at every peer monitor across
+    the cut. `isolate/2,3` is the same fault against every peer at once.
+  - `kill_node/2,3` is node death — the tree dies atomically and every survivor
+    gets the events that death produces.
+  - `crash/2` remains member-level loss: the tree dies with no node event, which
+    is what a member exiting on its own looks like.
+
+  What is still not simulated is `net_kernel`. A simulated node is a name in a
+  table: `nodes()` does not list it and `dgen_utils:node_reachable/1` therefore
+  answers `true` for every member id, since every member id's node component is
+  the one real `node()`. So the *member*-level reactions to a node event are
+  exercised here (`handle_info({nodeup, _})`'s rejoin and unregister re-drive,
+  the peer-monitor DOWN that drives `{member_down}`), and the connector's
+  reachability-keyed backstops — the `{nodedown, Node}` reap and the leader
+  probe — are not: they filter member ids by node and no member id names a
+  simulated node. Those belong in `dgen_registry_cluster_test.exs` with real
+  peers.
   """
 
   defstruct [:keyspace, :tenant, :net, :opts, members: %{}]
@@ -45,6 +61,8 @@ defmodule DGen.Sim.Cluster do
   - `:registry_opts` — per-registry options (`strict_replication`,
     `register_replicas`, …) applied to every member.
   - `:ready_timeout` — how long to wait for each member to sync (default 10s).
+  - `:simulate_peer_monitors` — hold each member and place its tree as it starts,
+    rather than placing once the cluster is up. **Requires a scheduler**; see below.
 
   The policy is applied only once every member is ready, or a member can be
   partitioned away before it has ever synced and the run measures startup rather
@@ -52,6 +70,31 @@ defmodule DGen.Sim.Cluster do
 
   Under `eta_run` a network already exists, seeded from the run's seed; this call
   leaves its lifetime, seed and policy alone and only declares the topology.
+
+  ## `:simulate_peer_monitors`, and why it is not the default
+
+  `dgen_registry_member`'s failure detection is an `erlang:monitor` on each peer
+  (`add_member_monitors/2`), which `eta_transform` points at `eta_net:monitor/2`.
+  That monitor is *simulated* — the only kind a partition can fire `noconnection`
+  at — when both ends are already on different simulated nodes at the moment it
+  is created. Peers are monitored while the cluster forms, so placing after
+  `await_ready/2` leaves every one of them a plain `erlang:monitor` and makes
+  `partition/3,4` message loss with a signal attached and nothing more.
+
+  Placing each tree as `start_link/3` returns is necessary and **not sufficient**,
+  and the gap is the interesting part: a member learns of its peers when the
+  elector distributes the member set back, which is an ordinary message arriving
+  some unbounded time later. So which peer monitors ended up simulated came down
+  to real-time luck, and the run stopped being a function of its seed — about one
+  seed in five. This option therefore *holds* each member from the moment its tree
+  starts until every tree is placed, so no monitor anywhere can be created before
+  the topology is complete. Ordering the two beats hoping one wins.
+
+  It is opt-in because a simulated monitor learns of an ordinary exit from
+  `eta_sched`'s exit trace — so under `eta_run` it fires on a crash exactly as a
+  real one would, and with no scheduler it never fires at all. Turning it on for
+  the real-clock suite would silently disable `crash/2` detection, which is the
+  failure mode `eta_net`'s own docs warn about.
   """
   def start(tenant, n, opts \\ []) do
     keyspace = :"sim_#{:erlang.unique_integer([:positive])}"
@@ -67,13 +110,27 @@ defmodule DGen.Sim.Cluster do
       |> Map.put(:keyspace, keyspace)
 
     ready_timeout = Keyword.get(opts, :ready_timeout, 10_000)
+    eager? = Keyword.get(opts, :simulate_peer_monitors, false)
 
     members =
       for i <- 1..n, into: %{} do
         name = :"#{keyspace}_m#{i}"
         {:ok, sup} = :dgen_registry.start_link(name, tenant, registry_opts)
-        {name, %{name: name, sup: sup, index: i}}
+
+        # Hold the member before it can act on anything the elector sends back, so
+        # no peer monitor can be created until every tree is placed.
+        if eager? do
+          :ok = hold_member(name)
+          :ok = place_tree(%{name: name, sup: sup, index: i})
+        end
+
+        # Captured here, while the supervisor is still answerable — see `tree_pids/1`.
+        {name, %{name: name, sup: sup, index: i, children: capture_children(sup)}}
       end
+
+    # Every tree is placed, so every peer monitor created from here on crosses a
+    # declared link. Released in start order, the order they were placed in.
+    if eager?, do: for(i <- 1..n, do: :ok = release_member(:"#{keyspace}_m#{i}"))
 
     cluster = %__MODULE__{
       keyspace: keyspace,
@@ -107,29 +164,141 @@ defmodule DGen.Sim.Cluster do
   end
 
   @doc """
-  Puts each member on a simulated node of its own.
+  Puts each member's whole supervision tree on a simulated node of its own.
 
   **The placement is the fault model.** `eta_net` faults a send only when both ends
-  are on nodes and the nodes differ, so which traffic can be lost follows from the
-  topology rather than from a predicate this module has to keep correct.
+  are faultable and their nodes differ, so which traffic can be lost follows from
+  the topology rather than from a predicate this module has to keep correct.
 
-  **Only the member process is placed**, deliberately. A member's elector and
-  connector are on no node, so nothing they send or receive is ever faulted: their
-  messages stand in for operations against the durable store, and dropping them
-  injects a failure the real system cannot have. Faulting them produces
-  `acked_bindings_present` violations that look exactly like the replication defect
-  this suite hunts and are artefacts of the harness.
+  A node's processes are on it in two different senses, which is the distinction
+  `eta_net:place/2` and `eta_net:attach/2` draw:
+
+  - The **member** is `place`d: *located* and *faultable*. It is the only one
+    whose messages are on the wire.
+  - The **elector** and the **connector** are `attach`ed: located but never
+    faultable. They are on the node — they take its link events and die with it
+    — and their traffic is never dropped, because it is not network traffic. The
+    elector coordinates through the durable store and the connector talks to
+    nothing; dropping their sends models a failure the real system cannot have,
+    and produces `acked_bindings_present` violations that look exactly like the
+    replication defect this suite hunts.
+
+  Attaching rather than leaving them unplaced is what makes a node fault mean
+  anything: an unplaced process is on no node at all, so it learns nothing when
+  one fails and survives a `kill_node/2,3` that killed its own member.
+
+  **The supervisor is deliberately on no node**, even though it does have to die
+  with one. Locating it would hand it every link event, and a supervisor answers
+  an unrecognised message by logging one — which under a run is a `logger` call
+  from a process the scheduler does not own, loading `Logger.Translator` and
+  `Inspect.Tuple` on demand and putting a `code_server` round trip inside the
+  schedule. It fails `eta_run:audit/1`, which is how this was found. `kill_node/2`
+  takes the supervisor down by hand instead.
 
   Everything a member spawns — transaction workers, snapshot collectors — inherits
-  its node as `eta_sched` adopts it, so the topology does not go stale the first
-  time the system creates a worker.
+  its node *and its faultability* as `eta_sched` adopts it, so the topology does
+  not go stale the first time the system creates a worker.
   """
   def place_members(%__MODULE__{} = c) do
-    for m <- Map.values(c.members), pid = Process.whereis(m.name), is_pid(pid) do
-      :ok = :eta_net.place(:"member_#{m.index}", [pid])
+    for m <- Enum.sort_by(Map.values(c.members), & &1.index), do: :ok = place_tree(m)
+    :ok
+  end
+
+  @doc "The simulated node a member sits on. Stable across a crash and restart."
+  def node_of(%__MODULE__{} = c, name), do: node_name(Map.fetch!(c.members, name).index)
+
+  defp node_name(index), do: :"member_#{index}"
+
+  # Tolerant of a tree that is gone or going: `kill_node/2` leaves a dead
+  # supervisor behind, and `place_members/1` is called again after every restart.
+  defp place_tree(m) do
+    node = node_name(m.index)
+
+    case children(m.sup) do
+      %{} = kids ->
+        for pid <- [kids[:member]], is_pid(pid), do: :ok = :eta_net.place(node, [pid])
+
+        case for id <- [:elector, :connector], is_pid(kids[id]), do: kids[id] do
+          [] -> :ok
+          pids -> :ok = :eta_net.attach(node, pids)
+        end
+
+      :gone ->
+        :ok
     end
 
     :ok
+  end
+
+  defp children(sup) do
+    Map.new(Supervisor.which_children(sup), fn {id, pid, _type, _mods} -> {id, pid} end)
+  catch
+    :exit, _ -> :gone
+  end
+
+  @doc """
+  Every process of every member's tree, **supervisor included**, in a stable
+  order — what a harness hands to `eta_harness:processes/1`.
+
+  ## The supervisor belongs in the schedule
+
+  It reads as infrastructure rather than as part of the system, and it is not.
+  `dgen_registry:elector_pid/1` finds the elector by reading the member's
+  `$ancestors` and asking that supervisor for its children, so every
+  `get_leader/1`, `get_epoch/1` and `get_members/1` — from a client, and from the
+  connector's reap, mesh-fetch and epoch-check helpers — is a `gen_server:call`
+  into the supervisor. Left undeclared, those are scheduled processes blocking on
+  one the scheduler does not own, which answers whenever the *real* scheduler
+  runs it. It was the largest single source of wall-clock ordering in a node-fault
+  run: 561k of the parked-process samples in one sweep were sitting in
+  `gen:do_call/4` waiting on a supervisor.
+
+  ## Read from a snapshot, never from the supervisor
+
+  These pids are captured while the tree is starting, and cached. The caller is
+  the driver, the driver must not call into a scheduled process, and once the
+  supervisor is scheduled `Supervisor.which_children/1` is exactly that call — it
+  would block until the run gave up. The cache stays correct because the tree is
+  `one_for_all` and nothing restarts it inside a run: `kill_node/2,3` is terminal
+  by construction, and `restart/3` recaptures.
+  """
+  def tree_pids(%__MODULE__{} = c) do
+    for m <- Enum.sort_by(Map.values(c.members), & &1.index),
+        pid <- [m.sup | m.children],
+        is_pid(pid),
+        Process.alive?(pid),
+        do: pid
+  end
+
+  # Hold a member across the placement of the whole cluster, so that placement is
+  # ordered *before* peer monitoring rather than racing it. See `start/3`.
+  #
+  # Suspending the member is enough. Its `discover_elector` continuation runs
+  # before any system message and only casts a join to its own elector, which
+  # creates no monitors; `add_member_monitors/2` runs when the elector distributes
+  # the member set back, and that is an ordinary message a held member cannot
+  # touch. So no monitor exists anywhere until `release_member/1`, by which point
+  # every tree is on a node.
+  defp hold_member(name) do
+    :sys.suspend(name)
+  catch
+    # It has to exist — `start_link/3` has returned — so this is only a guard
+    # against a tree that died on the way up, which `await_ready/2` reports better.
+    :exit, _ -> :ok
+  end
+
+  defp release_member(name) do
+    :sys.resume(name)
+  catch
+    :exit, _ -> :ok
+  end
+
+  # Child pids in a fixed role order, captured once while the tree is starting.
+  defp capture_children(sup) do
+    case children(sup) do
+      %{} = kids -> for id <- [:elector, :member, :connector], is_pid(kids[id]), do: kids[id]
+      :gone -> []
+    end
   end
 
   @doc """
@@ -268,9 +437,119 @@ defmodule DGen.Sim.Cluster do
   # ---------------------------------------------------------------------------
 
   @doc """
+  Severs the link between two members' nodes, with the events a lost link
+  produces.
+
+  Both directions are cut, every simulated peer monitor across the cut fires one
+  `{'DOWN', _, process, _, noconnection}`, and each side is told the *other* node
+  is gone — `{nodedown, member_2}` on side A, `{nodedown, member_1}` on side B.
+  That asymmetry is the point: a partition is two ends each learning about the
+  other, and one undifferentiated term would tell both sides the same thing,
+  which is never what happened.
+
+  `opts` is `eta_net`'s `event_opts`, so `%{learns: :a}` gives the one-sided form
+  — A notices, B does not — which is what two independently timing-out ends
+  actually do. The cut stays symmetric either way.
+
+  **Delivering the signal is not optional here.** `dgen_registry` hangs recovery
+  off it (`handle_info({nodeup, _})` re-announces the join and re-drives stashed
+  and forwarded unregisters, Non-goal 5), so cutting without it injects loss no
+  real network produces — messages vanishing while both ends still believe the
+  link is up — and the unrecovered state that follows is an artefact rather than
+  a defect. `eta_net:cut/2` is still the right tool for the narrower fault of a
+  channel that swallows traffic while both ends believe the link is up; that is
+  what the resync tests use.
+  """
+  def partition(%__MODULE__{} = c, a, b, opts \\ %{}) do
+    :ok = :eta_net.partition(node_of(c, a), node_of(c, b), Map.put_new(opts, :signal, :nodedown))
+    c
+  end
+
+  @doc """
+  Heals a partition, delivering the `{nodeup, Peer}` a reconnect produces.
+
+  **Resurrects nothing.** A peer monitor that fired `noconnection` is gone, as it
+  would be in real Erlang; the member re-establishes it when the peer rejoins.
+  """
+  def heal_partition(%__MODULE__{} = c, a, b, opts \\ %{}) do
+    :ok =
+      :eta_net.heal_partition(node_of(c, a), node_of(c, b), Map.put_new(opts, :signal, :nodeup))
+
+    c
+  end
+
+  @doc "Partitions one member's node away from every other live member's node."
+  def isolate(%__MODULE__{} = c, name, opts \\ %{}) do
+    for peer <- alive(c), peer != name, do: partition(c, name, peer, opts)
+    c
+  end
+
+  @doc """
+  Node death: the member, its elector, its connector and its supervisor all die
+  at once, and every survivor gets the events that death produces.
+
+  This is the fault `crash/2` cannot express. `crash/2` kills a tree and leaves
+  the network none the wiser — peers find out only because the processes are
+  gone. Here the peers' monitors are retired *before* anything dies and fire
+  `noconnection` rather than `killed`, which is the asymmetry real distribution
+  has (a remote watcher sees `noconnection`; something on the same machine sees
+  the true reason), and the survivors are then told `{nodedown, member_i}`.
+
+  `eta_net`'s part of the sequence is atomic with respect to the schedule, so no
+  survivor can observe a half-dead node.
+
+  The node *name* survives, so `restart/3` on the same member is a restart of the
+  node. Cuts involving it do not reset — a node that was partitioned and then
+  died comes back partitioned, which is `eta_net`'s rule everywhere: an event
+  says what just happened, it does not undo what happened before.
+
+  ## The supervisor
+
+  Three things happen to it, in this order, and each is load-bearing:
+
+  1. **Unlinked** — it is linked to whoever called `start/3`, which under
+     `eta_run` is the driver.
+  2. **Frozen** — this tree is `one_for_all`, so the child deaths below would
+     otherwise restart the very node that just died, as new pids on no node. A
+     frozen supervisor cannot act on an exit; the signals queue in a mailbox that
+     is never read again. This is what makes the kill *terminal*, and it has to
+     happen before `eta_net` kills anything rather than after, because "after" is
+     a race the supervisor sometimes wins.
+  3. **Killed**, once its children are gone.
+
+  Under `eta_run` step 2 is already done: the supervisor is one of the processes
+  `tree_pids/1` declares, so the scheduler is holding it suspended for the whole
+  of `execute/2`. Asking `sys:suspend/1` for it there would block forever — a
+  suspended process cannot answer a system message — so the call is made only when
+  no scheduler is running, which is the real-clock suite.
+
+  Killing the supervisor *first* and letting its links do the work would be
+  simpler and would model the wrong thing: a link exit is trappable, so a member
+  that traps exits would run `terminate/2` and shut down gracefully. A node that
+  died did not shut anything down gracefully.
+  """
+  def kill_node(%__MODULE__{} = c, name, opts \\ %{}) do
+    m = Map.fetch!(c.members, name)
+    Process.unlink(m.sup)
+    freeze(m.sup)
+    :ok = :eta_net.kill_node(node_of(c, name), Map.put_new(opts, :signal, :nodedown))
+    Process.exit(m.sup, :kill)
+    c
+  end
+
+  # See `kill_node/3`. A supervisor that is already gone needs no freezing either.
+  defp freeze(sup) do
+    if :eta_sched.current() == :undefined, do: :sys.suspend(sup), else: :ok
+  catch
+    :exit, _ -> :ok
+  end
+
+  @doc """
   Kills a member's whole supervision tree — elector, member, and connector — which
   is how a member is lost in reality (`one_for_all`, §4.8). Its ETS replica dies
   with it, exactly as the formal model's `Crash` does.
+
+  Member-level loss, with no node event: see `kill_node/2,3` for the other one.
   """
   def crash(%__MODULE__{} = c, name) do
     m = Map.fetch!(c.members, name)
@@ -284,6 +563,10 @@ defmodule DGen.Sim.Cluster do
   Restarts a crashed member under the same name and keyspace. It comes back
   `fresh` — an empty replica, holding nothing — which is what a restarted member
   is (§5.6: a fresh member provably holds no bindings).
+
+  Also how a node killed by `kill_node/2,3` comes back: the node name survived,
+  so re-placing on it is the restart. Its new processes take a fresh position in
+  the link-event fan-out, and any cut it died under is still in force.
   """
   def restart(%__MODULE__{} = c, name, ready_timeout \\ 10_000) do
     m = Map.fetch!(c.members, name)
@@ -295,12 +578,16 @@ defmodule DGen.Sim.Cluster do
 
     {:ok, sup} = :dgen_registry.start_link(name, c.tenant, registry_opts)
 
+    # Before the tree can be monitored by a peer, for the reason in `start/3`.
+    if Keyword.get(c.opts, :simulate_peer_monitors, false),
+      do: :ok = place_tree(%{m | sup: sup})
+
     case :dgen_registry.await_ready(name, ready_timeout) do
       :ok -> :ok
       other -> raise "restarted member #{name} never became ready: #{inspect(other)}"
     end
 
-    c = %{c | members: Map.put(c.members, name, %{m | sup: sup})}
+    c = %{c | members: Map.put(c.members, name, %{m | sup: sup, children: capture_children(sup)})}
     # The restarted member has a new pid, which has to be placed before it can be
     # faulted — a node cut against the old one still holds, because a partition
     # names a place rather than a process. See `apply_policy/1`.
@@ -361,7 +648,25 @@ defmodule DGen.Sim.Cluster do
     do_converge(c, deadline, 0)
   end
 
-  # Deliver the `{nodeup, _}` a real reconnect would.
+  # There is nothing to drain: `eta_net` holds no queues, so a message it delayed
+  # is already a deadline in the timer wheel and arrives when the clock reaches it.
+  #
+  # `heal_all/0` removes every cut and pending targeted drop but deliberately emits
+  # nothing — it restores a network, it does not announce one. The signal is
+  # `signal_heal/1`'s job.
+  defp heal_everything(_net) do
+    :ok = :eta_net.heal_all()
+    :ok = :eta_net.set_policy(%{drop_p: 0.0, delay_p: 0.0})
+  end
+
+  @doc """
+  Every live member's pid, which is what the fault scope is expressed in terms of.
+  """
+  def member_pids(%__MODULE__{} = c) do
+    for name <- alive(c), pid = Process.whereis(name), is_pid(pid), do: pid
+  end
+
+  # Deliver the `{nodeup, _}` a real reconnect would, to every live node pair.
   #
   # This is the harness paying a debt it owes. Dropping a message models an Erlang
   # link failure, but in reality a link failure is never *just* lost messages — it
@@ -378,26 +683,21 @@ defmodule DGen.Sim.Cluster do
   # had optimistically deleted a row whose `unregister_req` was dropped, diverging
   # from its peers at the same applied_version, forever.
   #
-  # All simulated members share `node()`, so there is no real distribution event to
-  # wait for; sending the message directly is what the cluster tests do to drive the
-  # same path.
-  # There is nothing to drain: `eta_net` holds no queues, so a message it delayed
-  # is already a deadline in the timer wheel and arrives when the clock reaches it.
-  defp heal_everything(_net) do
-    :ok = :eta_net.heal_all()
-    :ok = :eta_net.set_policy(%{drop_p: 0.0, delay_p: 0.0})
-  end
-
-  @doc """
-  Every live member's pid, which is what the fault scope is expressed in terms of.
-  """
-  def member_pids(%__MODULE__{} = c) do
-    for name <- alive(c), pid = Process.whereis(name), is_pid(pid), do: pid
-  end
-
+  # Every pair rather than only the cut ones, because random per-message loss has
+  # no pair to name and owes the same debt. `heal_partition/3` on an uncut pair
+  # heals nothing and still signals, which is exactly what is wanted.
+  #
+  # This used to be a hand-written `send(pid, {:nodeup, node()})` to each member.
+  # Routing it through `eta_net` buys two things a send cannot: each side is told
+  # about *the other* node rather than both being handed one undifferentiated
+  # term, and the connector — which is on the node but not on the wire — gets it
+  # too, because the event goes to everything located rather than to a list this
+  # module maintains by hand.
   defp signal_heal(%__MODULE__{} = c) do
-    for name <- alive(c), pid = Process.whereis(name), is_pid(pid) do
-      send(pid, {:nodeup, node()})
+    nodes = for name <- alive(c), do: node_of(c, name)
+
+    for {a, i} <- Enum.with_index(nodes), b <- Enum.drop(nodes, i + 1) do
+      :ok = :eta_net.heal_partition(a, b, %{signal: :nodeup})
     end
 
     :ok

@@ -63,8 +63,8 @@ because a *link* failed, and a failed link delivers `nodedown`/`nodeup` to both
 ends. The registry deliberately hangs recovery off those signals —
 `handle_info({nodeup, _})` re-announces the member's join and re-drives unregisters
 that were stashed or forwarded into the dying link (Non-goal 5). So
-`DGen.Sim.Cluster.converge/2` sends `{nodeup, node()}` to every member as part of
-healing.
+`DGen.Sim.Cluster.converge/2` heals through `eta_net:heal_partition/3` with a
+`nodeup` signal rather than merely removing the cuts.
 
 This was learned the hard way: without it the harness reported a follower that had
 optimistically deleted a row whose `unregister_req` was dropped, diverging from its
@@ -77,19 +77,102 @@ Only inter-member traffic is faulted. The elector's durable membership/election
 queue is untouched, so elections still make progress and a run cannot wedge on a
 fault the design never claims to survive.
 
-That scoping is stated as a **topology**, not as a predicate. `Cluster.apply_policy/1`
-places each member process on a simulated node of its own, and `eta_net` faults a
-send only when both ends are on nodes and the nodes differ — so member-to-member
-traffic is faultable and nothing else is. Anything a member spawns inherits its
-node, so a transaction worker's traffic to a peer is faulted too.
+That scoping is stated as a **topology**, not as a predicate.
+`Cluster.place_members/1` puts each member's tree on a simulated node of its own,
+and `eta_net` faults a send only when both ends are faultable and their nodes
+differ — so member-to-member traffic is faultable and nothing else is. Anything a
+member spawns inherits its node *and its faultability*, so a transaction worker's
+traffic to a peer is faulted too.
 
-The elector and the connector are deliberately left **unplaced**. Their messages
-are not network traffic: they stand in for operations against the durable store,
-and dropping them injects a failure the real system cannot have. Faulting them
-produces `acked_bindings_present` violations that look exactly like the
-replication defect this suite hunts and are artefacts of the harness — the tell
-being that widening the fault model, rather than any change to the system,
-produced the failure.
+The elector and the connector are `attach`ed rather than `place`d: on the node,
+never on the wire. Their messages are not network traffic — they stand in for
+operations against the durable store — and dropping them injects a failure the
+real system cannot have. Faulting them produces `acked_bindings_present`
+violations that look exactly like the replication defect this suite hunts and are
+artefacts of the harness; the tell is that widening the fault model, rather than
+any change to the system, produced the failure. But leaving them *unplaced* is
+wrong too, and for a reason that only shows up once node faults exist: an
+unplaced process is on no node at all, so it learns nothing when one fails and
+survives a node kill that took its own member. `attach/2` is the distinction.
+
+## Node faults
+
+A cut channel is not a lost node. `partition/4`, `heal_partition/4`, `isolate/3`
+and `kill_node/3` on `DGen.Sim.Cluster` inject the link-level failure instead of
+the message-level one, and each carries the events the failure produces:
+
+| | messages | `{nodedown, Peer}` | `noconnection` DOWNs | processes die |
+|---|---|---|---|---|
+| `set_policy` loss | dropped at random | — | — | — |
+| `cut/2` | dropped on one channel | — | — | — |
+| `partition/4` | both directions cut | both sides | across the cut | — |
+| `kill_node/3` | in flight cancelled | survivors | across the node | the whole tree |
+| `crash/2` | — | — | — | the whole tree |
+
+The signal is **derived per side**: A is told `{nodedown, member_2}` and B is told
+`{nodedown, member_1}`, because that is what a partition actually says. One
+undifferentiated term would tell both sides the same thing, which is never what
+happened. `%{learns: :a}` gives the one-sided form, which is what two
+independently timing-out ends produce.
+
+`kill_node/3` and `crash/2` are both "the tree dies", and the difference is the
+whole reason node faults exist. Under `crash/2` the peers find out because the
+processes are gone, and their monitors report `killed`. Under `kill_node/3` the
+peers' monitors are retired *before* anything dies and report `noconnection` —
+the asymmetry real distribution has, where a remote watcher and a local one see
+different reasons for the same death — and the survivors are then told the node
+went. The supervisor is frozen before the kill and killed after it, so
+`one_for_all` cannot restart the node that just died — under `eta_run` it is
+already frozen, being one of the processes the scheduler owns.
+
+### What is still not simulated: `net_kernel`
+
+`eta_net` delivers the *events* a node failure produces and nothing else. A
+simulated node is a name in a table: `nodes()` does not list it, and every member
+id's node component is the one real `node()`, so `dgen_utils:node_reachable/1`
+answers `true` for all of them.
+
+The consequence is worth stating precisely, because it decides which reactions
+these tests cover:
+
+- **Covered.** `dgen_registry_member`'s reactions, which do not read the node
+  name: `handle_info({nodeup, _})`'s rejoin and unregister re-drive, and the
+  peer-monitor `DOWN` that drives `{member_down}` into the elector.
+- **Not covered.** `dgen_registry_connector`'s reachability-keyed backstops — the
+  `{nodedown, Node}` reap and the leader-liveness probe. Both filter member ids
+  by node, and no member id names a simulated node, so both are no-ops here.
+  They belong in `dgen_registry_cluster_test.exs` with real peers.
+
+### Where the `noconnection` DOWNs come from, and the race that decides it
+
+`dgen_registry_member`'s failure detection is an `erlang:monitor` on each peer,
+which `eta_transform` points at `eta_net:monitor/2`. That monitor is *simulated*
+— the only kind a partition can sever — when both ends are already on different
+simulated nodes at the moment it is created. Peers are monitored while the cluster
+forms, so placement has to happen before that, which is `Cluster.start/3`'s
+`:simulate_peer_monitors`.
+
+Placing each tree as it starts is necessary and **not sufficient**, and the gap is
+instructive: a member learns of its peers when the elector distributes the member
+set back, which is an ordinary message arriving some unbounded time later. So which
+peer monitors ended up simulated came down to real-time luck, and a run stopped
+being a function of its seed — about a fifth of seeds. `Cluster.start/3` therefore
+*holds* each member (`sys:suspend/1`) from the moment its tree starts until every
+tree is placed, so no monitor anywhere can be created before the topology is
+complete. Ordering the two, rather than hoping one wins, is what made it
+deterministic.
+
+It stays off for the real-clock suite in this directory, deliberately. A simulated
+monitor learns of an ordinary exit from `eta_sched`'s exit trace: under `eta_run` it
+fires on a crash exactly as a real one would, and with no scheduler it never fires
+at all. Turning it on here would silently disable the `crash/2` detection the tests
+above rely on.
+
+`eta_net:stats/0` counts `signalled` and `noconnection` for exactly this reason.
+They are the non-vacuity guard for a node fault the way `dropped` is for a lossy
+policy: a run that partitioned a node nothing was on, or severed no monitor,
+exercised no recovery and reports the same `ok`. Both sweeps in
+`dgen_registry_eta_test.exs` assert on them.
 
 ## Determinism: what is and is not guaranteed
 
@@ -104,7 +187,37 @@ did; it is not a guarantee.
 `test/dgen_registry_eta_test.exs` drives the same cluster through `eta_run`, with
 the scheduler, the clock and the network all seeded from one value, against the
 in-memory `dgen_mem` backend. That is the suite to reach for when a failure has to
-replay exactly.
+replay exactly — under every fault model it offers, message and node alike. It
+asserts it, too: `"every seed reproduces its own schedule"` runs each seed three
+times and requires one trace, and `eta_run:audit/1` is fatal on every check.
+
+### What node faults cost to get there
+
+A cut is absolute where `drop_p` is scoped, so a partition drops every cross-node
+message and drives recovery paths — `peer_joined`, `replicate_sync`,
+`apply_names_snapshot`, the §5.7 handoff gather — that a scoped policy never
+reaches. Switching node faults on therefore found seven real-time dependencies
+that message loss alone never touched. About a fifth of seeds produced more than
+one schedule; all five are fixed and it is now nil.
+
+None showed up in `audit/1`, and the reason is worth internalising: the audit
+catches a process **running** outside the schedule, and every one of these was a
+process **blocking** on something outside it — `code_server`, an unscheduled
+supervisor, OTP's own `gen:do_call/4`. What found them was diffing two runs of one
+seed at the step where their runnable sets first disagreed, and reading the stack
+of the process that differed. `RegistryHarness`'s moduledoc lists all seven;
+findings 3, 4 and 5 below are the ones that are also bugs off the simulator.
+
+And measure under load. Six of the seven were visible on an idle machine; the last
+— an OTP 28 supervisor's `hibernate_after` timer, which is real — only appeared
+with several suites running at once, because what it turned on was how much real
+time a run took. `mix dst` looked clean serially and failed one run in three when
+six ran together.
+
+Two things are *not* leaks and are allowed. A node fault leaves stray timers — a
+killed node's periodic timers outlive it, and a call whose callee is behind a cut
+waits out an hour of virtual `register_timeout` the run never reaches. Both are
+the fault behaving correctly, and `stray_timers` is allowed on that sweep alone.
 
 This suite keeps its own value alongside it: it runs the same invariants against
 the same code without suspending anything, so it exercises the real BEAM scheduler
@@ -195,7 +308,71 @@ cast per follower per interval, independent of the name count.
 Regression: `"a follower that loses the tail of the stream still converges when
 quiescent"`.
 
-### 3. `set_metadata/2` did not honour a configurable timeout — FIXED
+### 3. A `try ... of` left the mesh nudge's send unprotected — FIXED
+
+Found by node-fault injection, and only by it. `spawn_mesh_fetch/3`'s helper calls
+`nudge_durable_epoch/2`, which read the committed epoch and sent it to the member:
+
+```erlang
+try dgen_server:priority_call(Elector, get_epoch) of
+    DurableEpoch when is_integer(DurableEpoch) ->
+        MemberName ! {durable_epoch, DurableEpoch};   %% not protected
+    _ -> ok
+catch
+    _:_ -> ok
+end,
+```
+
+An `of` body is **outside** the protected expression, so the `catch _:_ -> ok`
+that every other failure on this best-effort path routes through did not cover the
+send. The member is addressed by *registered name*, and sending to a name with no
+process raises `badarg` — so a nudge arriving in the window where the member is
+gone crashed the helper it ran in.
+
+Reachable in production wherever that window opens: the tree restarting under
+`one_for_all`, or the node lost. It was invisible to every existing test because
+nothing closed a member while a mesh fetch was in flight; a `kill_node/3` does it
+on roughly one sweep in ten.
+
+**Fix:** `try ... catch` around a `case`, so the send is inside the protected
+expression. Behaviour is otherwise unchanged — the epoch is re-read on the next
+`?MESH_INTERVAL` either way.
+
+### 4. Two client-facing modules were not built with the transform — FIXED
+
+`dgen` and `dgen_registry` had no `-include("dgen_eta.hrl")`. They read as API and
+supervisor code, so it looked like they had nothing to instrument — but *where they
+run* is the caller's process, which under simulation is a scheduled one. Every
+`gen_server:call/2,3` in them therefore went into OTP's `gen:do_call/4`, which no
+transform reaches, taking a wall-clock `receive ... after` and a real
+`erlang:monitor` with it. Both put a scheduled process's progress outside the
+schedule.
+
+Not a production bug — it costs nothing at run time — but a real hole in the
+simulation, and the rule it teaches generalises: **a module needs the transform if
+it runs inside a scheduled process, not if it owns one.**
+
+**Fix:** the include, in both. Neither uses anything on `eta_transform`'s
+`?NET_UNSUPPORTED` list, so the rewrite is total.
+
+### 5. `telemetry_available/0` called `code_server` from inside a member — FIXED
+
+Finding 4 of the previous round cached the telemetry lookup in `persistent_term`
+to stop `code:ensure_loaded/1` making a `code_server` round trip per event. The
+cache is per VM, so exactly one call still had to happen — and it happened lazily,
+inside whichever member emitted the first event. That is a scheduled process making
+a synchronous call into one the scheduler does not own.
+
+It is invisible to `eta_run:audit/1`, which is the part worth remembering:
+`code:ensure_loaded/1` on a *missing* module loads nothing, so the "no module
+loaded mid-run" check stays clean while the leak is wide open. It was found by
+reading the stack of a member that was parked in `code_server:call/1` at the step
+where two runs of one seed first disagreed.
+
+**Fix:** resolve it in `dgen_registry_member:init/1`, while the tree is starting —
+which under `eta_run` is before a scheduler exists at all.
+
+### 6. `set_metadata/2` did not honour a configurable timeout — FIXED
 
 `register_name/2,3` bounded its wait with `register_timeout` (§8), but `set_metadata/2`
 and `unregister_name/1` called `gen_server:call/2` with its hidden 5s default, so

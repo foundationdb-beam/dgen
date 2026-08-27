@@ -77,6 +77,8 @@ Optional:
   version) — both route through `handle_conflict/2` → `on_error/2` → replay, so a
   too-old pinned read falls back to a fresh GRV rather than failing the worker.
 - `terminate/2` — cleanup; receives the terminal `Reply`.
+
+*This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
 -endif.
 

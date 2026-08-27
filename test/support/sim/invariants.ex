@@ -32,6 +32,32 @@ defmodule DGen.Sim.Invariants do
   # ---------------------------------------------------------------------------
 
   @doc """
+  How many members `same_version_same_replica/2` would actually compare — those
+  within `:only` that have reached the newest leader's version.
+
+  Fewer than two cannot observe a divergence, so a run that never gets above one
+  is passing the property without asserting it. Under node faults that is a live
+  risk rather than a theoretical one: `:only` excludes every member cut off from
+  the leader, so a heavily partitioned run can leave the leader comparing against
+  nobody. A sweep injecting partitions should assert this got above one.
+  """
+  def compared(%Cluster{} = c, opts \\ []) do
+    only = Keyword.get(opts, :only)
+
+    case leader_version(c, only) do
+      nil ->
+        0
+
+      lv ->
+        c
+        |> Cluster.alive()
+        |> Enum.filter(&(is_nil(only) or &1 in only))
+        |> Enum.map(&Cluster.applied_version/1)
+        |> Enum.count(&(&1 == lv))
+    end
+  end
+
+  @doc """
   `PrefixConsistency`, in the form observable from outside.
 
   The spec states every live member's replica equals the committed history at its
@@ -89,17 +115,30 @@ defmodule DGen.Sim.Invariants do
 
   Measured: seeds 3 (at 25 operations) and 77 (at 40) reported divergences that were
   entirely this window, and the planted `partial_batch` mutation is still caught.
+
+  ## `:only`
+
+  Restricts the comparison to the named members. A member on the far side of a
+  live partition is one the rest of the cluster cannot reach, and it may sit at
+  the leader's version holding a speculative write that the batch reconciling it
+  cannot cross the cut to correct — the same window as above, opened by a node
+  fault rather than by a dropped batch. Requiring it to agree asserts something
+  the protocol does not claim while the partition is up. The default is every
+  live member, which is what a run with no node faults wants.
   """
-  def same_version_same_replica(%Cluster{} = c) do
+  def same_version_same_replica(%Cluster{} = c, opts \\ []) do
+    only = Keyword.get(opts, :only)
+
     members =
       c
       |> Cluster.alive()
+      |> Enum.filter(&(is_nil(only) or &1 in only))
       |> Enum.map(fn name -> {name, Cluster.applied_version(name), Cluster.bindings(name)} end)
       |> Enum.reject(fn {_, v, _} -> is_nil(v) end)
 
     # Only members that have caught up to the leader. See below for why this is
     # not the same test as "members at the same version as each other".
-    leader_version = leader_version(c)
+    leader_version = leader_version(c, only)
 
     by_version =
       members
@@ -128,16 +167,36 @@ defmodule DGen.Sim.Invariants do
     end
   end
 
-  # The applied_version of whichever member believes it is the leader, or `nil` if
+  # The applied_version of the member that believes it is the leader, or `nil` if
   # none does — in which case there is nothing to compare against and the property
   # is vacuously satisfied rather than asserted against an arbitrary member.
-  defp leader_version(%Cluster{} = c) do
-    Enum.find_value(Cluster.alive(c), fn name ->
+  #
+  # **The highest epoch wins**, which matters as soon as a node fault is in the
+  # picture. A partition can leave a deposed leader still believing it leads at a
+  # stale epoch (that is what `leader_epoch_unique/1` permits, and why the fence
+  # carries an epoch at all), and picking whichever believer came first in `alive`
+  # order would then compare every caught-up member against a member that has been
+  # fenced out of committing anything. The baseline is the newest leader; a
+  # predecessor is just another replica.
+  #
+  # With one believer — every run without node faults — this is what it always was.
+  defp leader_version(%Cluster{} = c, only) do
+    c
+    |> Cluster.alive()
+    |> Enum.filter(&(is_nil(only) or &1 in only))
+    |> Enum.flat_map(fn name ->
       case Cluster.status(name) do
-        %{leader: leader, member_id: id, applied_version: v} when leader == id -> v
-        _ -> nil
+        %{leader: leader, member_id: id, epoch: e, applied_version: v} when leader == id ->
+          [{e, v}]
+
+        _ ->
+          []
       end
     end)
+    |> case do
+      [] -> nil
+      believers -> believers |> Enum.max_by(fn {e, _v} -> e end) |> elem(1)
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -281,9 +340,13 @@ defmodule DGen.Sim.Invariants do
   `eta_sched` can say exactly when that is (nothing runnable, so only the clock can
   produce more work), which is why this set exists for the eta port and not for the
   harness it came from.
+
+  `opts` is passed through to `same_version_same_replica/2`; a run injecting node
+  faults uses `:only` to keep members it has partitioned away out of the
+  comparison.
   """
-  def check_quiescent(%Cluster{} = c) do
-    first_violation([fn -> same_version_same_replica(c) end])
+  def check_quiescent(%Cluster{} = c, opts \\ []) do
+    first_violation([fn -> same_version_same_replica(c, opts) end])
   end
 
   @doc "Runs the converged-only properties. Call after `Cluster.converge/2`."

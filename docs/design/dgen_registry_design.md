@@ -35,6 +35,8 @@ It is written to be read top to bottom. The early sections assume only that you
 know what an Erlang process and a `gen_server` are; the later sections get more
 precise about distributed-systems behaviour.
 
+**This document is LLM generated.**
+
 ---
 
 ## 1. The one-minute model

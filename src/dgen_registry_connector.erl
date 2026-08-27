@@ -467,16 +467,30 @@ spawn_epoch_check(Elector, MemberName, Connector) ->
 %% it is ahead of what the member has heard, a leadership handoff never reached this node
 %% and the member re-joins to trigger a fresh assume/fan-out.  Shared by the mesh fetch
 %% (self_managed) and the epoch check (provided_externally).
+%%
+%% `try ... catch` rather than `try ... of ... catch`, and the difference is the
+%% whole point: an `of` body sits *outside* the protected expression, so the send
+%% below was never covered by the handler that was plainly written to cover it.
+%% The member is addressed by registered name, and sending to a name with no
+%% process raises -- so a nudge landing while the member is gone (its tree
+%% restarting under `one_for_all`, or its node lost) crashed the mesh-fetch helper
+%% this runs in, instead of being ignored like every other failure on this path.
+%% Everything here is best-effort; the epoch is re-read on the next ?MESH_INTERVAL.
+%%
+%% Found by node-fault injection in the simulation suite, which widens the window
+%% enough to hit it -- see `test/support/sim/README.md`.
 nudge_durable_epoch(Elector, MemberName) ->
-    try dgen_server:priority_call(Elector, get_epoch) of
-        DurableEpoch when is_integer(DurableEpoch) ->
-            MemberName ! {durable_epoch, DurableEpoch};
-        _ ->
-            ok
+    try
+        case dgen_server:priority_call(Elector, get_epoch) of
+            DurableEpoch when is_integer(DurableEpoch) ->
+                MemberName ! {durable_epoch, DurableEpoch},
+                ok;
+            _ ->
+                ok
+        end
     catch
         _:_ -> ok
-    end,
-    ok.
+    end.
 
 %% Log the delegated-connectivity isolation warning (provided_externally, §4.6).  A
 %% latched one-shot: fired once when no leader has been seen for ?ISOLATION_WARN_TICKS

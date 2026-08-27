@@ -78,6 +78,8 @@ replays.
 State lives in ETS keyed by the database handle and nothing runs in a process of
 its own, so no call into this module can read as quiescence to `eta_sched`. Commit
 versions come from a counter, not a clock.
+
+*This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
 -endif.
 

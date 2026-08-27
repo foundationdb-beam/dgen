@@ -126,6 +126,7 @@ encoding scheme, which will yield performance benefits.
 The encoding is applied recursively. For example, an assigns map whose value
 is a component list will nest both encodings in the key path.
 
+*This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
 -endif.
 

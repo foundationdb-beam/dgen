@@ -11,6 +11,8 @@ Durable FIFO queue backed by the configured dgen backend.
 Each dgen_server has its own queue keyed under `Quid`. Items are
 ordered by versionstamps, guaranteeing strict FIFO across transactions.
 Push and pop counts are tracked with atomic `add` operations for O(1) length.
+
+*This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
 -endif.
 

@@ -45,26 +45,22 @@ defmodule DGen.RegistryEtaTest do
   # timeout, no stray timer. Each is a piece of the interleaving decided by wall
   # clock rather than by the seed.
   #
-  # **`stray_timers` is excluded, and only it.** This system produces strays: a
-  # leadership handoff collects peer snapshots in a bare-spawned process holding a
-  # `receive ... after`, and `Cluster.start/3` performs one while the cluster forms,
-  # before there is a scheduler to adopt anything. Whether a given startup does so
-  # is a real-scheduler race, so the count is nonzero on about half these runs.
+  # **Every check is fatal.** `stray_timers` used to be excluded, on the grounds
+  # that a leadership handoff spawns a snapshot collector before the scheduler
+  # exists and the count was therefore nonzero on about half of these runs. Two
+  # things about that turned out to be wrong. The collector's `receive ... after`
+  # is not a real-time wait — `eta_transform` rewrites it, like every other timer —
+  # and the strays were not inherent either: they came from the leaks listed in
+  # `RegistryHarness`'s moduledoc, and disappeared when those were fixed. Measured
+  # at zero across 25 seeds on a perfect network and 25 under `drop_p: 0.15`.
   #
-  # It is no longer a determinism problem — the driver steps over such a deadline
-  # rather than advancing to it, so a schedule is a function of its seed either way
-  # — but it is still a true statement about this system, and the exclusion should
-  # eventually go. Removing the strays needs `dgen_registry`'s startup handoff to
-  # stop spawning a collector before the scheduler exists. Three approaches were
-  # measured and none worked: serialising startup, draining the clock in `init/2`,
-  # and gating on in-flight gathers.
-  #
-  # Every other check stays fatal.
-  defp assert_deterministic(result, context) do
+  # `allow:` is for the node-fault sweep, which produces strays for a reason that
+  # is not a leak; see its own note.
+  defp assert_deterministic(result, context, opts \\ []) do
     suspect =
       case @run.audit(result) do
         :ok -> []
-        {:suspect, items} -> Keyword.delete(items, :stray_timers)
+        {:suspect, items} -> Keyword.drop(items, Keyword.get(opts, :allow, []))
       end
 
     assert suspect == [],
@@ -282,6 +278,163 @@ defmodule DGen.RegistryEtaTest do
       assert clean == [],
              "a perfect network logged #{inspect(clean)} — degrade-open should be " <>
                "unreachable without loss"
+    end
+  end
+
+  describe "node faults" do
+    # The message sweep above can lose a replication batch. It cannot lose a
+    # *node*, and until `eta_net` grew link events there was no honest way to: a
+    # cut channel with nothing announcing it is a state real distribution does not
+    # produce, and everything a system fails to recover from afterwards is an
+    # artefact that reads exactly like a defect.
+    #
+    # `fault_p` turns a fraction of the generated operations into node faults —
+    # partition, heal, and one kill — each carrying the events the failure
+    # produces: `{nodedown, Peer}` to both sides, one `noconnection` DOWN at every
+    # peer monitor across the cut, and for a kill the whole tree dying atomically
+    # with the survivors told about it.
+    #
+    # `stray_timers` is allowed here and nowhere else, and it is not a leak. Both
+    # node faults leave timers in the wheel that nothing will ever collect: a killed
+    # node's periodic timers outlive the processes that armed them, and a call whose
+    # callee is behind a cut sits on its (virtual) `register_timeout` — an hour of
+    # simulated time the run never reaches. Both are the fault behaving as it should.
+    # Every other audit check stays fatal, including here.
+    @nodes 1..60
+    @fault_p 0.3
+    @max_ops 30
+
+    defp run_node_faults(seed, tenant) do
+      run(
+        seed,
+        %{
+          max_ops: @max_ops,
+          config: %{tenant: tenant, members: 3, fault_p: @fault_p}
+        },
+        tenant
+      )
+    end
+
+    @tag :simulation
+    @tag timeout: 900_000
+    test "invariants hold across every seed", %{tenant: tenant} do
+      results =
+        for seed <- @nodes do
+          r = run_node_faults(seed, tenant)
+          assert_deterministic(r, "seed #{seed} under node faults", allow: [:stray_timers])
+          {seed, r, @harness.stats()}
+        end
+
+      failed = for {seed, %{outcome: o}, _} <- results, o != :ok, do: {seed, o}
+
+      assert failed == [],
+             "seeds failed under node faults: #{inspect(failed, pretty: true, limit: 3)}"
+
+      # --- non-vacuity ---------------------------------------------------------
+      #
+      # `dropped` says nothing here: this sweep's faults are cuts and kills, not a
+      # lossy policy, and a cut channel's traffic is counted as dropped only if
+      # something tried to use it. The guards that mean something for a node fault
+      # are the two counters `eta_net` keeps for link *events*.
+
+      # 1. Something was actually told a node had gone.
+      signalled = results |> Enum.map(&elem(&1, 2).signalled) |> Enum.sum()
+      seeds_signalled = Enum.count(results, &(elem(&1, 2).signalled > 0))
+
+      assert seeds_signalled > div(Enum.count(@nodes), 2),
+             "only #{seeds_signalled} of #{Enum.count(@nodes)} seeds delivered a node " <>
+               "signal — `fault_p` is not producing partitions"
+
+      # 2. A monitor was actually severed. This is the one that catches the whole
+      #    thing going quietly vacuous: the member's peer monitors are simulated
+      #    only if both ends were placed before the monitor was created, so if
+      #    `simulate_peer_monitors` ever stops taking effect, every partition here
+      #    becomes message loss with a signal attached and this drops to zero —
+      #    while every seed still passes.
+      noconn = results |> Enum.map(&elem(&1, 2).noconnection) |> Enum.sum()
+
+      assert noconn > 0,
+             "no partition severed a peer monitor across #{Enum.count(@nodes)} seeds, so " <>
+               "nothing here exercised monitor-driven failure detection"
+
+      # 3. The quiescent invariant was reached, and the workload completed.
+      quiescent = results |> Enum.map(&elem(&1, 2).quiescent_checks) |> Enum.sum()
+      assert quiescent > 0, "the quiescent invariant was never evaluated"
+
+      # 4. It had something to compare. `reaching_leader/1` drops every member cut
+      #    off from the leader, and the property can only see a divergence between
+      #    two members standing at the leader's version — so a run partitioned
+      #    hard enough satisfies it by having nobody left to disagree with.
+      #    Measured at 87% of quiescent checks on this config, so a collapse here
+      #    is a real change rather than a threshold set at the edge.
+      compared = results |> Enum.map(&elem(&1, 2).compared) |> Enum.sum()
+
+      assert compared > div(quiescent, 2),
+             "only #{compared} of #{quiescent} quiescent checks compared two or more " <>
+               "members at the leader's version — the property is passing without " <>
+               "asserting anything"
+
+      assert Enum.all?(results, fn {_, r, _} -> r.ops == @max_ops end),
+             "some seeds did not inject every operation"
+
+      IO.puts(
+        "\n[eta node faults] #{Enum.count(@nodes)} seeds @ fault_p #{@fault_p}: " <>
+          "#{signalled} signals across #{seeds_signalled} seeds, " <>
+          "#{noconn} noconnection DOWNs, #{compared}/#{quiescent} quiescent checks compared"
+      )
+    end
+
+    @tag :simulation
+    @tag timeout: 900_000
+    test "every seed reproduces its own schedule", %{tenant: tenant} do
+      # The sweep above is worth nothing if the runs producing it were not
+      # determined by their seeds, and this is the assertion that says they were.
+      #
+      # It did not hold when node faults were first switched on — about a fifth of
+      # seeds produced more than one schedule — and every cause was a scheduled
+      # process *blocking* on something the scheduler does not own, which is the
+      # one shape `audit/1` cannot see (it catches a process that ran outside the
+      # schedule, not one that waited outside it). `RegistryHarness`'s moduledoc
+      # lists all five.
+      #
+      # Node faults are the right place to assert this rather than the `drop_p`
+      # sweep: a cut is absolute where `drop_p` is scoped, so it reaches recovery
+      # paths — `peer_joined`, `replicate_sync`, the handoff gather — that a scoped
+      # policy never touches, and every one of the five leaks was on one of them.
+      not_exact =
+        for seed <- 1..20,
+            traces =
+              for(
+                _ <- 1..3,
+                do:
+                  run_node_faults(seed, tenant)
+                  |> assert_deterministic("seed #{seed} under node faults",
+                    allow: [:stray_timers]
+                  )
+                  |> Map.fetch!(:trace)
+              ),
+            length(Enum.uniq(traces)) != 1,
+            do: seed
+
+      assert not_exact == [],
+             "seeds #{inspect(not_exact)} produced more than one schedule across three runs " <>
+               "each — something in the system is waiting on a process the scheduler does " <>
+               "not own, or on the wall clock"
+    end
+
+    @tag :simulation
+    @tag timeout: 300_000
+    test "turning node faults on does not change a run that has none", %{tenant: tenant} do
+      # `generate/2` draws the fault entropy unconditionally, so `fault_p` at 0.0
+      # has to be the same run as the option not being there — otherwise every
+      # seed in the message sweep above silently became a different seed.
+      for seed <- [1, 4, 8] do
+        without = run(seed, tenant)
+        with_zero = run(seed, %{config: %{tenant: tenant, members: 3, fault_p: 0.0}}, tenant)
+
+        assert without.trace == with_zero.trace,
+               "seed #{seed}: `fault_p: 0.0` produced a different schedule from no fault_p"
+      end
     end
   end
 

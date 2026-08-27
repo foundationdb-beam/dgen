@@ -6,14 +6,14 @@
 [![Hex Docs](https://img.shields.io/badge/hex-docs-lightgrey.svg)](https://hexdocs.pm/dgen)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE.md)
 
-DGen implements useful OTP building blocks — `gen_server`, a process registry,
-and more to come — as durable, highly-available primitives for a distributed
-system, with a focus on **ease of use** and **minimal operator setup**. If you
-already know `gen_server` or a process registry like `:global` or `gproc`,
-using DGen's equivalents should feel familiar; the difference is what's
-underneath: a strongly-consistent database (FoundationDB) instead of process
-memory, so state and coordination survive process, node, and even cluster
-restarts.
+DGen provides software building blocks that marry the OTP ethos with a reliable
+distributed system, with a focus on **ease of use** and **minimal operator setup**.
+We implement a durable and fully distributed `gen_server`-like with `dgen_server`
+(Elixir: `DGen.Server`) and a distributed process registry with `dgen_registry`
+(Elixir: `DGen.Registry`).
+
+DGen is implemented against the FoundationDB API. Any conforming database could,
+in theory, be substituted, but for now FDB is the only implemented backend.
 
 ## What's here
 
@@ -74,7 +74,7 @@ end
   configuration.
 - [formal/README.md](formal/README.md) — the TLA+ model of `dgen_registry`'s
   replication protocol.
-- [`eta`](https://github.com/foundationdb-beam/eta) — `dgen_registry` is partally
+- [`eta`](https://hexdocs.pm/eta) — `dgen_registry` is partally
   tested with Deterministic Simulation Testing, to assist in verification
   of the actual implementation of the TLA+ model, including its invariants.
   The framework for driving the simulation was extracted to a separate
@@ -82,15 +82,12 @@ end
 - API reference and getting-started guides: <https://hexdocs.pm/dgen>.
 - [CHANGELOG.md](CHANGELOG.md) — release notes.
 
-## AI disclosure
+## AI full disclosure
 
-DGen's development makes deliberate, disclosed use of AI tooling:
-
-- **Implementation.** Substantial portions of the codebase were built with LLMs
-  from initial implementation through refactoring and documentation.
-- **Correctness.** LLM output is verified by various testing efforts, including
-  unit and integration testing, simulation testing, and formal methods.
-- **Design.** The architecture, API surface, and consistency trade-offs are
-  human-opinionated, shaped by hands-on experience operating comparable
-  distributed systems — leader election, durable queues, CP-oriented
-  registries — not left to a model's defaults.
+ - This software is developed with strong assistance from LLMs and with humans 
+   leading the ideas, testing, and debugging. We say this openly because it shaped
+   how the project was built. If you are not happy with AI-developed code, this
+   software is not for you. This disclosure was adopted from [antirez/ds4](https://github.com/antirez/ds4).
+ - We strive to write and edit the documentation for human consumption. LLM-speak
+   will eventually be rooted out in favor of imperfect human writing. Documentation
+   generated wholly by LLMs must be annotated as such.
