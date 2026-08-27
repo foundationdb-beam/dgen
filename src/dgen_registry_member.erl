@@ -154,6 +154,44 @@
 %% unreachable, the follower answers `undefined` immediately rather than hang the
 %% caller.
 %%
+%% ## The state machine
+%%
+%% This member is a `gen_statem` (handle_event_function + state_enter) with four
+%% states, each realizing one of the modes the TLA+ model
+%% (formal/DgenRegistryReplication.tla) treats implicitly through
+%% `leaderView[m]`/`epoch[m]`:
+%%
+%%   searching        no leader known (including before the first sync).
+%%   assuming         a handoff gather is in flight (`assume_ref` armed); the
+%%                    `{assume_gathered}` continuation is valid only here, so a
+%%                    superseded gather is a visible state mismatch, not a
+%%                    ref-compare.
+%%   leader           this member believes it leads and is synced.
+%%   follower         it follows a known leader.
+%%
+%% The state is a DERIVED projection (`state_of/1` over `leader` / `member_id` /
+%% `assume_ref`), recomputed after every event by `next/2`: Data stays the
+%% single source of truth, so the projection cannot drift.  The leadership
+%% lifecycle rides the role edges as state-enter calls — entering `leader` runs
+%% `assume_leadership/1`, leaving it runs `relinquish_leadership/1` — so no
+%% transition path can forget half of the pair.
+%%
+%% Three dimensions are DELIBERATELY data, not state, each because it proved
+%% orthogonal to role:
+%%
+%%   - gap/resync: `request_resync` can fire on a deposed-but-uninformed leader
+%%     (the spec's RecvBcastGap has no leaderView guard), so a gapped state
+%%     would lie about the role.
+%%   - leader reachability: `route_register`/`route_unregister` stash when the
+%%     KNOWN leader is unreachable, which is a property of the link, not of
+%%     this member's role — the reason the pending_registers/pending_unregs
+%%     stashes were kept over gen_statem's `postpone` (that, and the CP
+%%     contract: an unreachable-leader unregister answers `ok` NOW and keeps
+%%     the intent, where postpone would defer the reply; and stash entries also
+%%     originate internally from batch-salvage paths, which are not events).
+%%   - the commit pipeline (`committing`): ops must accumulate during an
+%%     in-flight commit, never be postponed.
+%%
 %% ## Leader role
 %%
 %% Assumed when the elector calls `{elector_assume_and_distribute, …}`.  On a genuine

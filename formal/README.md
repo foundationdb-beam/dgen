@@ -223,7 +223,7 @@ dead in every reachable state rather than someone's way of hoping it was.
 | Spec | Code |
 |---|---|
 | `Elect` | `dgen_registry_elector` committing a membership/leadership change (abstracted to one durable write) |
-| `AssumeGather` (incl. the `SafeAssumeGather` version-key fence) | `{elector_assume_and_distribute}` **genuine-change clause** → `spawn_assume_gather` → `gather_caught_up/6` → `{assume_gathered}` continuation. The continuing-leader join fast path (`onboard_joiner` / `{peer_joined}`) is a separate clause of the same handler and is OUT OF SCOPE here (see above) |
+| `AssumeGather` (incl. the `SafeAssumeGather` version-key fence) | the `assuming` statem state: `assume_genuine/6` → `spawn_assume_gather` → `gather_caught_up/6` → the `{assume_gathered}` continuation, valid only in `assuming` for its arming ref. The continuing-leader join fast path (`assume_fast_path/6` / `onboard_joiner` / `{peer_joined}`) dispatches in the `leader` state and is OUT OF SCOPE here (see above) |
 | `HeartbeatBcast` / `RecvHeartbeat` | `handle_info(replica_heartbeat, …)` leader clause → `broadcast_heartbeat/1` (`{names_batch, [], E, V, V, Self}`) / the empty batch through `apply_bcast/6`'s three-way split |
 | `CanCommit`'s `dbLeader/dbEpoch` conjuncts | the fenced version-key bump in `dgen_registry_names:start_commit/4` (§5.1) |
 | `RegisterForward` | follower `route_register` forward → leader `{register_req}` → group commit → `broadcast_batch/5` + `{register_reply, Ref, yes, Version}` |
@@ -237,6 +237,14 @@ dead in every reachable state rather than someone's way of hoping it was.
 | `DropMsg` | casts lost on an Erlang-distribution disconnect (signal-ordering semantics) |
 
 Keep this in sync when either side changes.
+
+Since the member became a `gen_statem`, its states realize this spec's implicit
+modes directly — `searching`/`assuming`/`leader`/`follower` are what
+`leaderView[m]`/`epoch[m]`/mid-assume encode here — so the map above can name
+states rather than ref-guarded continuations. The spec itself needed zero
+changes for that port; dimensions the member deliberately keeps as data rather
+than state (gap/resync, leader reachability, the commit pipeline) are exactly
+the ones this model treats as per-member variables rather than modes.
 
 ## Files
 

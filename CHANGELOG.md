@@ -21,6 +21,26 @@
 
 ### Enhancements
 
+- **`dgen_registry_member` is a `gen_statem`.** Four states — `searching`,
+  `assuming`, `leader`, `follower` — derived as a projection of the role
+  fields in Data (so the projection cannot drift), with the leadership
+  lifecycle on state-enter calls: entering `leader` seeds subscriptions and
+  arms the monitor sweep, leaving it demonitors — no transition path can
+  forget half the pair. The handoff-gather continuation is valid only in
+  `assuming`, so a superseded gather is a visible state mismatch. Ported in
+  three fully-gated phases (behaviour swap, derived states + hoisted
+  dispatch, enter-call lifecycle); every phase landed with the full suite,
+  both determinism ratchets, both planted mutations, and the election bench
+  unchanged — the pinned mutation fixture replays without regeneration.
+  Execution amended the plan twice, deliberately: gap/resync and leader
+  reachability stay data, not state (both proved orthogonal to role — a
+  deposed-but-uninformed leader can be gapped, and an unreachable leader is a
+  link property), and the register/unregister stashes stay over gen_statem
+  `postpone` (the CP contract answers `ok` immediately where postpone would
+  defer the reply, and stash intents also originate from batch salvage, which
+  is not an event). Behavior is intended to be observably identical; the one
+  external shape change is `sys:get_state/1` returning `{State, Data}`.
+
 - **`dgen_registry` — leadership-handoff map allocations cut (~22% faster
   client-visible election window).** The assume path materialized the replica
   as fresh n-entry Erlang maps at least eight times; profiling

@@ -174,6 +174,19 @@ policy: a run that partitioned a node nothing was on, or severed no monitor,
 exercised no recovery and reports the same `ok`. Both sweeps in
 `dgen_registry_eta_test.exs` assert on them.
 
+## The member is a gen_statem
+
+`dgen_registry_member` runs as a `gen_statem` (states: `searching`, `assuming`,
+`leader`, `follower` — see its moduledoc), which under simulation engages eta's
+statem support: starts gate through `eta_sched:statem_start_link/3`,
+`gen_statem:call/cast/reply` route through `eta_net`, `-eta_observe` publishes
+on statem callback returns, and any `state_timeout` would be virtualized by
+`eta_statem` (none is currently armed; event and generic timeouts raise under a
+running clock by design, so the member's periodic timers stay `arm/2`
+self-sends). The port was gated on this suite at every phase — the behaviour
+swap, the derived states, and the enter-call lifecycle each landed with the
+full battery green and the pinned mutation fixture replaying unchanged.
+
 ## Determinism: what is and is not guaranteed
 
 The **fault schedule** is seeded and reproducible — for a given seed, the same
