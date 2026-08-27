@@ -110,9 +110,11 @@ defmodule DGen.RegistryTest do
     do: assert(eventually(fn -> not leader_has_sub?(reg, sub_id) end))
 
   defp leader_has_sub?(reg, sub_id) do
-    reg
-    |> :dgen_registry.member_name()
-    |> :sys.get_state()
+    # The member is a gen_statem: sys.get_state returns {StatemState, Data}, and
+    # the subscription maps live in the Data record.
+    {_statem_state, data} = reg |> :dgen_registry.member_name() |> :sys.get_state()
+
+    data
     |> Tuple.to_list()
     |> Enum.any?(fn v -> is_map(v) and Map.has_key?(v, sub_id) end)
   end

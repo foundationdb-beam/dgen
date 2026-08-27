@@ -322,7 +322,7 @@ consistent (replication is asynchronous).
 -spec unregister_name({atom(), term()}) -> ok.
 unregister_name({RegistryName, LogicalName}) ->
     try
-        gen_server:call(
+        gen_statem:call(
             member_name(RegistryName),
             {unregister, LogicalName},
             %% Same caller-side bound as the other leader-routed writes — see
@@ -407,7 +407,7 @@ exits — a usage error.
 -endif.
 -spec register_name({atom(), term()}, pid(), map()) -> yes | no.
 register_name({RegistryName, LogicalName}, Pid, MetaSpec) ->
-    gen_server:call(
+    gen_statem:call(
         member_name(RegistryName),
         {register, LogicalName, Pid, meta_of(MetaSpec)},
         dgen_config:register_timeout(#{})
@@ -428,7 +428,7 @@ mid-flight — retry).
 set_metadata({RegistryName, LogicalName}, MetaSpec) ->
     {Index, Data} = meta_of(MetaSpec),
     try
-        gen_server:call(
+        gen_statem:call(
             member_name(RegistryName),
             {set_metadata, LogicalName, Index, Data},
             %% Bounded by the same caller-side knob as register_name/2,3 rather than
@@ -473,7 +473,7 @@ reflects the leader's committed view.
     {ok, #{pid := pid(), index := map(), data := term()}} | undefined.
 get_metadata_consistent({RegistryName, LogicalName}) ->
     try
-        gen_server:call(member_name(RegistryName), {get_metadata, LogicalName})
+        gen_statem:call(member_name(RegistryName), {get_metadata, LogicalName})
     catch
         exit:_ -> undefined
     end.
@@ -500,7 +500,7 @@ query(_RegistryName, Constraints) when map_size(Constraints) =:= 0 ->
     {error, empty_query};
 query(RegistryName, Constraints) ->
     try
-        gen_server:call(member_name(RegistryName), {query, Constraints})
+        gen_statem:call(member_name(RegistryName), {query, Constraints})
     catch
         exit:_ -> []
     end.
@@ -519,7 +519,7 @@ query_consistent(_RegistryName, Constraints) when map_size(Constraints) =:= 0 ->
     {error, empty_query};
 query_consistent(RegistryName, Constraints) ->
     try
-        gen_server:call(member_name(RegistryName), {query_consistent, Constraints})
+        gen_statem:call(member_name(RegistryName), {query_consistent, Constraints})
     catch
         exit:_ -> []
     end.
@@ -699,7 +699,7 @@ registered. More expensive than `whereis_name/1` but never stale.
 -spec whereis_name_consistent({atom(), term()}) -> pid() | undefined.
 whereis_name_consistent({RegistryName, LogicalName}) ->
     try
-        gen_server:call(member_name(RegistryName), {whereis, LogicalName})
+        gen_statem:call(member_name(RegistryName), {whereis, LogicalName})
     catch
         exit:_ -> undefined
     end.
@@ -742,7 +742,7 @@ registration will return `yes` (a name may already be taken, or leadership may m
 -endif.
 -spec ready(Name :: atom()) -> boolean().
 ready(Name) ->
-    try gen_server:call(member_name(Name), ready, ?READY_CALL_TIMEOUT) of
+    try gen_statem:call(member_name(Name), ready, ?READY_CALL_TIMEOUT) of
         Ready when is_boolean(Ready) -> Ready;
         _ -> false
     catch
@@ -775,7 +775,7 @@ is not running.
 -endif.
 -spec status(Name :: atom()) -> map() | undefined.
 status(Name) ->
-    try gen_server:call(member_name(Name), status, ?READY_CALL_TIMEOUT) of
+    try gen_statem:call(member_name(Name), status, ?READY_CALL_TIMEOUT) of
         Status when is_map(Status) -> Status;
         _ -> undefined
     catch

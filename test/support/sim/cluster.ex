@@ -560,15 +560,6 @@ defmodule DGen.Sim.Cluster do
   end
 
   @doc """
-  Restarts a crashed member under the same name and keyspace. It comes back
-  `fresh` — an empty replica, holding nothing — which is what a restarted member
-  is (§5.6: a fresh member provably holds no bindings).
-
-  Also how a node killed by `kill_node/2,3` comes back: the node name survived,
-  so re-placing on it is the restart. Its new processes take a fresh position in
-  the link-event fan-out, and any cut it died under is still in force.
-  """
-  @doc """
   Starts a NEW member into the running cluster — the membership-join path,
   which no other fault or lifecycle helper reaches. Returns `{cluster, name}`.
 
@@ -623,6 +614,15 @@ defmodule DGen.Sim.Cluster do
     {c, name}
   end
 
+  @doc """
+  Restarts a crashed member under the same name and keyspace. It comes back
+  `fresh` — an empty replica, holding nothing — which is what a restarted member
+  is (§5.6: a fresh member provably holds no bindings).
+
+  Also how a node killed by `kill_node/2,3` comes back: the node name survived,
+  so re-placing on it is the restart. Its new processes take a fresh position in
+  the link-event fan-out, and any cut it died under is still in force.
+  """
   def restart(%__MODULE__{} = c, name, ready_timeout \\ 10_000) do
     m = Map.fetch!(c.members, name)
 

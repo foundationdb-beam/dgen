@@ -362,7 +362,7 @@ presence_push_action(Update) ->
 %% disconnected node (the same hazard call_to_member/2 guards against — see §5.7).
 push_to_leader({Node, Name}, Msg) ->
     case dgen_utils:node_reachable(Node) of
-        true -> gen_server:cast({Name, Node}, Msg);
+        true -> gen_statem:cast({Name, Node}, Msg);
         false -> ok
     end.
 
@@ -464,6 +464,6 @@ call_to_member({Node, Name}, Msg) ->
     %% never detected.  (This guard is independent of the now-removed distributed
     %% lock; keep it regardless — §5.7.)
     case dgen_utils:node_reachable(Node) of
-        true -> gen_server:call({Name, Node}, Msg, ?SnapshotTimeout);
+        true -> gen_statem:call({Name, Node}, Msg, ?SnapshotTimeout);
         false -> exit({nodedown, Node})
     end.

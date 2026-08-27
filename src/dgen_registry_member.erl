@@ -1,5 +1,5 @@
 -module(dgen_registry_member).
--behaviour(gen_server).
+-behaviour(gen_statem).
 
 -define(DOCATTRS, ?OTP_RELEASE >= 27).
 
@@ -349,14 +349,17 @@
 -define(ALIVE_PROBE_TIMEOUT, 1000).
 
 -export([start_link/2]).
+%% gen_statem callbacks.  The former gen_server handlers (handle_call/3,
+%% handle_cast/2, handle_info/2, handle_continue/2) live on as internal
+%% functions dispatched by handle_event/4 — phase 1 of the statem port keeps
+%% their bodies verbatim so the behaviour swap is isolated from any state
+%% redesign; the real states arrive in phase 2.
 -export([
     init/1,
-    handle_continue/2,
-    handle_call/3,
-    handle_cast/2,
-    handle_info/2,
-    terminate/2,
-    code_change/3
+    callback_mode/0,
+    handle_event/4,
+    terminate/3,
+    code_change/4
 ]).
 %% Exported for unit testing the §5.6 conflict-detection predicate in isolation.
 -export([detect_conflicts/3]).
@@ -677,13 +680,16 @@
 -if(?DOCATTRS).
 -doc "Starts the member process registered as `Name`.".
 -endif.
--spec start_link(Name :: atom(), Args :: map()) -> gen_server:start_ret().
+-spec start_link(Name :: atom(), Args :: map()) -> gen_statem:start_ret().
 start_link(Name, Args) ->
-    gen_server:start_link({local, Name}, ?MODULE, Args, []).
+    gen_statem:start_link({local, Name}, ?MODULE, Args, []).
 
 %% ---------------------------------------------------------------------------
 %% gen_server callbacks
 %% ---------------------------------------------------------------------------
+
+callback_mode() ->
+    handle_event_function.
 
 init(#{name := Name, tenant := Tenant, tuid := Tuid} = Args) ->
     Config = maps:get(config, Args, #{}),
@@ -722,9 +728,10 @@ init(#{name := Name, tenant := Tenant, tuid := Tuid} = Args) ->
     %% Announcing presence needs the elector's pid, which is deferred to
     %% `discover_elector` below: the supervisor is still synchronously waiting on *this*
     %% init/1 to return when it runs, so `supervisor:which_children/1` would deadlock if
-    %% called from here directly. Returning via `{continue, ...}` lets the supervisor
-    %% consider this child started, unblocking it, before the lookup runs.
-    {ok,
+    %% called from here directly. Queuing the internal event (gen_statem's replacement
+    %% for `{continue, …}`) lets the supervisor consider this child started,
+    %% unblocking it, before the lookup runs.
+    {ok, member,
         #state{
             member_id = MemberId,
             elector = undefined,
@@ -754,7 +761,34 @@ init(#{name := Name, tenant := Tenant, tuid := Tuid} = Args) ->
             config = Config,
             last_departure = 0
         },
-        {continue, discover_elector}}.
+        %% gen_statem has no handle_continue; the same "run after the supervisor
+        %% unblocks" contract is an internal event queued from init's actions.
+        [{next_event, internal, discover_elector}]}.
+
+%% ---------------------------------------------------------------------------
+%% handle_event/4 — the phase-1 dispatch shim
+%% ---------------------------------------------------------------------------
+
+%% One placeholder state (`member`) and a pure translation onto the former
+%% gen_server handlers, whose bodies are unchanged.  This isolates the behaviour
+%% swap — statem start gating, observe parity, wire-compatible call/cast — from
+%% any state redesign; the real states (searching / assuming / leader /
+%% {follower, _}) arrive in phase 2 of the plan.  No handler ever returned
+%% `{stop, …}` or a timeout tuple (verified), so the translation is total.
+handle_event({call, From}, Msg, member, State) ->
+    case handle_call(Msg, From, State) of
+        {reply, Reply, State1} -> {keep_state, State1, [{reply, From, Reply}]};
+        {noreply, State1} -> {keep_state, State1}
+    end;
+handle_event(cast, Msg, member, State) ->
+    {noreply, State1} = handle_cast(Msg, State),
+    {keep_state, State1};
+handle_event(info, Msg, member, State) ->
+    {noreply, State1} = handle_info(Msg, State),
+    {keep_state, State1};
+handle_event(internal, Continue, member, State) ->
+    {noreply, State1} = handle_continue(Continue, State),
+    {keep_state, State1}.
 
 %% ---------------------------------------------------------------------------
 %% handle_continue/2
@@ -1862,12 +1896,12 @@ handle_info({durable_epoch, _DurableEpoch}, State) ->
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(_Reason, _State) ->
+terminate(_Reason, _StatemState, _State) ->
     net_kernel:monitor_nodes(false),
     ok.
 
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
+code_change(_OldVsn, StatemState, State, _Extra) ->
+    {ok, StatemState, State}.
 
 %% ---------------------------------------------------------------------------
 %% Internal helpers
@@ -2295,7 +2329,7 @@ member_names({Node, Name}) ->
             %% can fault on a corrupt payload, so keep it protected and fall to `error`.
             try
                 {Payload, Version, Released} =
-                    gen_server:call({Name, Node}, get_names_snapshot, ?GATHER_TIMEOUT),
+                    gen_statem:call({Name, Node}, get_names_snapshot, ?GATHER_TIMEOUT),
                 Names = decode_records(Payload),
                 true = is_map(Names) andalso is_integer(Version) andalso is_map(Released),
                 {ok, {Names, Version, Released}}
@@ -4014,9 +4048,9 @@ cast_to_member(To, Msg) ->
     do_cast_to_member(To, Msg).
 
 do_cast_to_member({Node, Name}, Msg) when Node =:= node() ->
-    gen_server:cast({Name, Node}, Msg);
+    gen_statem:cast({Name, Node}, Msg);
 do_cast_to_member({Node, Name}, Msg) ->
     case lists:member(Node, nodes()) of
-        true -> gen_server:cast({Name, Node}, Msg);
+        true -> gen_statem:cast({Name, Node}, Msg);
         false -> ok
     end.
