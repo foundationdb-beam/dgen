@@ -33,7 +33,16 @@
   `maps:keys` + `maps:with` identity projection is gone); and
   `assume_leadership` folds the ETS table straight into its monitor-ref maps.
   Measured kill→first-`yes` at 200k names: ~940ms → ~740ms (~3.1µs/name,
-  from ~4.2).
+  from ~4.2). A follow-up trims the snapshot codec: the "serve my replica"
+  sites (gather reply, resync serve, joiner snapshot) encode a pair list
+  folded straight off the ETS table (`encode_table/1` — no records-map
+  materialization; there is no native ETS→binary dump), and snapshot blobs
+  compress at zlib level 1 (encode 60ms → 37ms at 200k for ~40% more wire
+  bytes, still ~1MB). `decode_records/1` re-dispatches on the blob's contents,
+  so every wire shape — old and new — normalizes; the tolerant decoder ships
+  with the new sender, as with the map→binary switch before it. Worth ~3-5%
+  more off the serial election window, and halves the stall a snapshot-serving
+  member's loop takes (~156ms → ~70ms at 200k).
 
 - **Formal layers hardened and aligned.** The TLA+ model now covers the
   replication heartbeat (bounded to one in flight per leader) and splits the

@@ -822,6 +822,62 @@ defmodule DGen.RegistryTest do
   end
 
   # ---------------------------------------------------------------------------
+  # Snapshot codec (pure, unit-tested in isolation)
+  #
+  # encode_table/1 folds the ETS table straight into a pair list inside the blob
+  # (no records-map materialization); decode_records/1 must normalize every wire
+  # shape — this build's list-in-binary and map-in-binary, plus both pre-binary
+  # legacy forms — to the one map callers use. A shape the decoder silently
+  # mishandled would surface as a corrupt replica after a resync or handoff, so
+  # the tolerance is pinned here rather than trusted.
+  # ---------------------------------------------------------------------------
+
+  describe "snapshot codec (encode_table/1, decode_records/1)" do
+    test "a table round-trips through encode_table to the same records map" do
+      tab = :ets.new(:codec_bench, [:set, :public])
+      p1 = spawn_live()
+      p2 = spawn_live()
+      :ets.insert(tab, [{:a, p1, %{v: 1}, nil}, {:b, p2, %{}, "data"}])
+
+      assert %{a: {^p1, %{v: 1}, nil}, b: {^p2, %{}, "data"}} =
+               :dgen_registry_member.decode_records(:dgen_registry_member.encode_table(tab))
+    end
+
+    test "an empty table encodes to an empty map" do
+      tab = :ets.new(:codec_empty, [:set, :public])
+
+      assert %{} ==
+               :dgen_registry_member.decode_records(:dgen_registry_member.encode_table(tab))
+    end
+
+    test "a map-in-binary blob (the fan-out encoder) decodes to the same map" do
+      p1 = spawn_live()
+      records = %{a: {p1, %{}, nil}}
+
+      assert ^records =
+               :dgen_registry_member.decode_records(:dgen_registry_member.encode_records(records))
+    end
+
+    test "legacy wire shapes still normalize (rolling upgrade)" do
+      p1 = spawn_live()
+
+      # Pre-binary-era apply_names_snapshot: an on-heap [{name, record}] list.
+      assert %{a: {^p1, %{}, nil}} =
+               :dgen_registry_member.decode_records([{:a, {p1, %{}, nil}}])
+
+      # Pre-binary-era get_names_snapshot: a bare records map.
+      assert %{a: {^p1, %{}, nil}} =
+               :dgen_registry_member.decode_records(%{a: {p1, %{}, nil}})
+
+      # Pre-list-era binary: a map inside the blob (what an old node still sends).
+      assert %{a: {^p1, %{}, nil}} =
+               :dgen_registry_member.decode_records(
+                 :erlang.term_to_binary(%{a: {p1, %{}, nil}}, [:compressed])
+               )
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # plan_batch/4 batch-local overlay (pure, unit-tested in isolation)
   #
   # A group commit's plan is built *before* anything lands in the member's ETS

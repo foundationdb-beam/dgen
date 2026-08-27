@@ -350,6 +350,9 @@
 ]).
 %% Exported for unit testing the §5.6 conflict-detection predicate in isolation.
 -export([detect_conflicts/3]).
+%% Exported for unit testing the snapshot codec in isolation — every wire shape
+%% decode_records/1 tolerates, and encode_table/1's table-to-blob equivalence.
+-export([encode_table/1, encode_records/1, decode_records/1]).
 %% Exported for unit testing the group-commit batch planner in isolation — in
 %% particular, the batch-local overlay (`seed_lookup/3`, the `removed` marker) that lets
 %% a later op in the same batch see an earlier op's not-yet-committed decision without a
@@ -947,9 +950,9 @@ handle_call(
     _From,
     State = #state{names_tab = Tab, applied_version = Version, recently_released = Released}
 ) ->
-    %% Ship the (potentially huge) names map as an off-heap binary, same as the
-    %% distribute path — see encode_records/1.  The gathering leader decodes it.
-    {reply, {encode_records(current_records(Tab)), Version, Released}, State};
+    %% Ship the (potentially huge) replica as an off-heap binary, folded straight
+    %% off the table — see encode_table/1.  The gathering leader decodes it.
+    {reply, {encode_table(Tab), Version, Released}, State};
 %% ---- Elector calls (during lock period) ------------------------------------
 
 %% Called by the elector to atomically assume leadership and fan out the
@@ -1247,7 +1250,7 @@ handle_cast(
         applied_version = Version
     }
 ) ->
-    RecordsBin = encode_records(current_records(Tab)),
+    RecordsBin = encode_table(Tab),
     cast_to_member(
         FollowerId, {apply_names_snapshot, RecordsBin, Leader, [], #{}, Epoch, Version}
     ),
@@ -1923,7 +1926,7 @@ gather_maps(SelfNames, SelfVersion, OtherIds) ->
 %% existing followers to monitor the joiner via a small token-only {peer_joined}
 %% (their prefix-consistent replicas are untouched — no records travel there).
 onboard_joiner(MemberId, AllIds, Tokens, State = #state{member_id = Self, epoch = Epoch}) ->
-    RecordsBin = encode_records(current_records(State#state.names_tab)),
+    RecordsBin = encode_table(State#state.names_tab),
     cast_to_member(
         MemberId,
         {apply_names_snapshot, RecordsBin, Self, AllIds, Tokens, Epoch, State#state.applied_version}
@@ -3608,24 +3611,53 @@ current_records(Tab) ->
         fun({Name, Pid, Index, Data}, Acc) -> Acc#{Name => {Pid, Index, Data}} end, #{}, Tab
     ).
 
-%% Snapshot payload codec (see the "distribute" note above).  The records map is
-%% shipped as a single `term_to_binary` blob rather than an on-heap list of tuples.
-%% A large binary is a refc binary — stored off-heap and never scanned by GC — so a
-%% 100k+-name snapshot no longer bloats the sender's or receiver's process heap, nor
-%% thrashes their collectors while it sits in a mailbox; `[compressed]` also shrinks
-%% the wire bytes (names/pids compress well).  Encoding once and casting the *same*
-%% binary to every follower makes the fan-out share one blob instead of copying the
-%% whole list per follower.  `decode_records/1` also accepts the legacy list form, so
-%% a node running the old wire format during a rolling upgrade still applies.
--define(SNAPSHOT_ENCODE_OPTS, [compressed]).
+%% Snapshot payload codec (see the "distribute" note above).  A snapshot ships as
+%% a single `term_to_binary` blob rather than an on-heap term.  A large binary is
+%% a refc binary — stored off-heap and never scanned by GC — so a 100k+-name
+%% snapshot no longer bloats the sender's or receiver's process heap, nor thrashes
+%% their collectors while it sits in a mailbox.  Encoding once and casting the
+%% *same* binary to every follower makes the fan-out share one blob instead of
+%% copying the whole term per follower.
+%%
+%% Two encoders, by what the sender holds:
+%%
+%% - `encode_table/1` — the "serve my replica" sites (the gather reply, the
+%%   resync serve, the joiner snapshot).  There is no native ETS→binary dump
+%%   (`ets:tab2file` is a slower, disk-only walk of the same terms), and the
+%%   records MAP those sites used to build existed only to be encoded — at 200k
+%%   names ~96ms of pure map materialization ahead of the encode.  One `ets:foldl`
+%%   straight into a `[{Name, Record}]` pair list is ~3x cheaper, and the list
+%%   inside the blob decodes through `decode_records/1`'s existing list
+%%   normalization.
+%% - `encode_records/1` — the assume fan-out, where the reconstructed records map
+%%   is already in hand (list vs map inside the blob is a wash there).
+%%
+%% Compression is zlib level 1, deliberately: measured at 200k names, the default
+%% `[compressed]` (level 6) spent 60ms for a 0.76MB blob where level 1 spends
+%% 37ms for 1.07MB — decode time unchanged.  Snapshot encodes sit on the
+%% client-visible handoff/resync paths, so encode time buys more than the ~40%
+%% wire bytes it costs; going uncompressed (12ms) is off the table because the
+%% blob is ~10MB plain and crosses distribution once per follower.
+%%
+%% `decode_records/1` normalises every shape to the map all callers want,
+%% re-dispatching on what the blob contains: a map (this build's fan-out, and any
+%% pre-list-era sender), a `[{Name, Record}]` list (`encode_table/1`, and the
+%% pre-binary-era apply_names_snapshot wire), or a bare map term
+%% (pre-binary-era get_names_snapshot).  As with the map→binary switch before it,
+%% the tolerant decoder ships in the same release as the new sender, so
+%% mixed-version tolerance for list-in-binary begins one release back from here.
+-define(SNAPSHOT_ENCODE_OPTS, [{compressed, 1}]).
+
+encode_table(Tab) ->
+    Pairs = ets:foldl(
+        fun({Name, Pid, Index, Data}, Acc) -> [{Name, {Pid, Index, Data}} | Acc] end, [], Tab
+    ),
+    term_to_binary(Pairs, ?SNAPSHOT_ENCODE_OPTS).
 
 encode_records(Records) when is_map(Records) ->
     term_to_binary(Records, ?SNAPSHOT_ENCODE_OPTS).
 
-decode_records(Bin) when is_binary(Bin) -> binary_to_term(Bin);
-%% Legacy wire forms during a rolling upgrade: apply_names_snapshot shipped a
-%% `[{Name, Record}]` list, get_names_snapshot a bare records map.  Both normalise to
-%% the map every caller wants.
+decode_records(Bin) when is_binary(Bin) -> decode_records(binary_to_term(Bin));
 decode_records(List) when is_list(List) -> maps:from_list(List);
 decode_records(Map) when is_map(Map) -> Map.
 
