@@ -59,7 +59,17 @@ defmodule DGen.RegistrySimTest do
 
   defp spawn_live do
     pid = spawn(fn -> Process.sleep(:infinity) end)
-    on_exit(fn -> Process.exit(pid, :kill) end)
+
+    # `on_exit` is only callable from the test process. The membership-join test
+    # runs a concurrent writer in a Task; its handful of subjects are just
+    # sleeping pids with no resources, and their bindings die with the cluster,
+    # so leaking them for the VM's lifetime is the cheapest correct behavior.
+    try do
+      on_exit(fn -> Process.exit(pid, :kill) end)
+    rescue
+      ArgumentError -> :ok
+    end
+
     pid
   end
 
@@ -949,6 +959,66 @@ defmodule DGen.RegistrySimTest do
       else
         sample_follower(member, n, deadline, [count | acc])
       end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Membership join — the one replication path neither formal layer covered.
+  # ---------------------------------------------------------------------------
+
+  describe "membership join" do
+    @tag timeout: 120_000
+    test "a member joining mid-workload under loss onboards fully", %{tenant: tenant} do
+      # The continuing-leader join fast path (`onboard_joiner`/`{peer_joined}`)
+      # is explicitly outside the TLA+ model's scope, and until this test it was
+      # exercised only by the `:cluster` suite (excluded on `dgen_mem`) — so a
+      # regression here was visible to no formal layer at all. The join runs
+      # while writes continue AND the network is lossy, which is what makes it
+      # interesting: the joiner's snapshot or the followers' `{peer_joined}`
+      # casts can be dropped, and onboarding must then finish through gap
+      # detection, resync, and the heartbeat.
+      seed = 61
+      c = Cluster.start(tenant, 3, seed: seed, drop_p: 0.1, delay_p: 0.1)
+      on_exit(fn -> Cluster.stop(c) end)
+
+      pre = run_workload(c, 30, seed)
+      assert map_size(pre) > 0, "the pre-join workload acked nothing"
+
+      epoch_before =
+        c |> Cluster.alive() |> Enum.map(&:dgen_registry.get_epoch/1) |> Enum.max()
+
+      # Keep writing while the join happens — the join must not need quiet. Only
+      # the writer's OWN acked map is asserted below: merging it over `pre` would
+      # resurrect pre-join acks the writer later unregistered (absence from the
+      # second map means "no standing ack", not "untouched"), which reads as a
+      # lost binding and is not one. `pre` exists to give the joiner a populated
+      # replica to onboard.
+      writer = Task.async(fn -> run_workload(c, 40, seed + 1) end)
+      {c, joiner} = Cluster.join(c)
+      acked = Task.await(writer, 90_000)
+
+      assert_always!(c, seed)
+      assert_converged!(c, acked, seed)
+
+      # The joiner is a full replica-holding member, not a spectator.
+      {_node, leader} = Cluster.leader(c)
+      assert Cluster.bindings(joiner) == Cluster.bindings(leader)
+
+      # A healthy-cluster join must take the FAST path: the continuing leader
+      # onboards the joiner without a leadership change, so the epoch must not
+      # have moved. (An epoch bump here would mean the join deposed the leader
+      # and ran the full gather — a different, far more expensive code path.)
+      epoch_after =
+        c |> Cluster.alive() |> Enum.map(&:dgen_registry.get_epoch/1) |> Enum.max()
+
+      assert epoch_after == epoch_before,
+             "the join moved the epoch #{epoch_before} -> #{epoch_after}: it ran a " <>
+               "leadership change instead of the continuing-leader fast path"
+
+      # Non-vacuity: the loss policy engaged, so onboarding was actually
+      # tested against a lossy stream rather than a perfect one.
+      assert :eta_net.stats().dropped > 0,
+             "seed #{seed} dropped nothing — the fault policy did not engage"
     end
   end
 

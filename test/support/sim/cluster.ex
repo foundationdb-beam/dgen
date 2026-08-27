@@ -568,6 +568,61 @@ defmodule DGen.Sim.Cluster do
   so re-placing on it is the restart. Its new processes take a fresh position in
   the link-event fan-out, and any cut it died under is still in force.
   """
+  @doc """
+  Starts a NEW member into the running cluster — the membership-join path,
+  which no other fault or lifecycle helper reaches. Returns `{cluster, name}`.
+
+  On a healthy cluster this exercises the continuing-leader **fast path**
+  (`onboard_joiner` / `{peer_joined}` in `dgen_registry_member.erl`): the
+  leader snapshots only the joiner and tells existing followers to just
+  monitor it — no gather, no re-assume, epoch unchanged. That path is
+  explicitly OUT of the TLA+ model's scope (its handoff premise is "the gather
+  reaches every live member"), so a live test against the real code is the
+  only coverage it has; the joining test asserts the epoch did not move, which
+  is what distinguishes the fast path from a full leadership change.
+
+  The joiner is placed like any other member, so from the moment the topology
+  knows it its traffic is faultable — a join under loss leans on gap
+  detection/resync (and the heartbeat) to finish onboarding when the snapshot
+  itself is lost, which is precisely what makes it worth testing.
+  """
+  def join(%__MODULE__{} = c, ready_timeout \\ 30_000) do
+    index = (c.members |> Map.values() |> Enum.map(& &1.index) |> Enum.max()) + 1
+    name = :"#{c.keyspace}_m#{index}"
+
+    registry_opts =
+      c.opts
+      |> Keyword.get(:registry_opts, %{})
+      |> Map.put(:keyspace, c.keyspace)
+
+    {:ok, sup} = :dgen_registry.start_link(name, c.tenant, registry_opts)
+
+    # Before the tree can be monitored by a peer, for the reason in `start/3`.
+    if Keyword.get(c.opts, :simulate_peer_monitors, false),
+      do: :ok = place_tree(%{name: name, sup: sup, index: index})
+
+    case :dgen_registry.await_ready(name, ready_timeout) do
+      :ok -> :ok
+      other -> raise "joining member #{name} never became ready: #{inspect(other)}"
+    end
+
+    c = %{
+      c
+      | members:
+          Map.put(c.members, name, %{
+            name: name,
+            sup: sup,
+            index: index,
+            children: capture_children(sup)
+          })
+    }
+
+    # Same shape as `restart/3`: the new tree must be placed before it can be
+    # faulted, and the policy re-applied where this cluster owns the network.
+    if c.net == :owned, do: :ok = apply_policy(c), else: :ok = place_members(c)
+    {c, name}
+  end
+
   def restart(%__MODULE__{} = c, name, ready_timeout \\ 10_000) do
     m = Map.fetch!(c.members, name)
 
