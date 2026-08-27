@@ -3,6 +3,8 @@
 %% Small, dependency-free helpers shared across dgen modules (the BEAM/distribution
 %% analogue of dgen_key's key helpers).  Keep this module general: anything here
 %% should be useful to more than one caller and carry no dgen-specific state.
+%%
+%% *This documentation is LLM-generated. See the AI disclosure in README.md.*
 
 -define(DOCATTRS, ?OTP_RELEASE >= 27).
 

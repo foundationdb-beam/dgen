@@ -20,6 +20,8 @@
 %% supplies the macros that branch would otherwise leave undefined. Without that
 %% branch, `?ETA_LOG` in shipped code is a compile error in the only build that
 %% matters.
+%%
+%% *This documentation is LLM-generated. See the AI disclosure in README.md.*
 
 -ifndef(DGEN_ETA_HRL).
 -define(DGEN_ETA_HRL, true).

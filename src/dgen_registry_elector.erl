@@ -77,6 +77,8 @@
 %% never slip past the fence during its later term (the ABA case). Values written by
 %% older versions (a bare MemberId) are tolerated by the fence readers in
 %% `dgen_registry_names` until the next election rewrites the key.
+%%
+%% *This documentation is LLM-generated. See the AI disclosure in README.md.*
 
 -export([
     init/1,

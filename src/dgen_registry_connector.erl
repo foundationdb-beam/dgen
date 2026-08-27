@@ -79,6 +79,8 @@
 %%   `provided_externally` connector that observes **no elected leader for a sustained
 %%   window** logs a warning naming the delegated-connectivity contract, rather than
 %%   failing quietly.  See §4.6 of the design doc for the full rationale and contract.
+%%
+%% *This documentation is LLM-generated. See the AI disclosure in README.md.*
 
 -export([start_link/2]).
 -export([

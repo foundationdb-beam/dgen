@@ -31,6 +31,8 @@ backend() ->
 %% default. So one registry can be strict while another degrades open, with no global
 %% coupling. They are documented for end users in `docs/dgen_registry_design.md`
 %% (§8 Configuration); section references (e.g. `§5.6`) point there.
+%%
+%% *This documentation is LLM-generated. See the AI disclosure in README.md.*
 
 %% Resolve a knob: per-registry option > application env > built-in default.
 -spec get(config(), atom(), term()) -> term().

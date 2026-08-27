@@ -33,6 +33,8 @@
 %%    chunked term under the from-key.
 %% 5. The watch fires, the caller reads and clears the chunked reply.
 %% 6. On timeout the caller clears the chunked reply keys to avoid leaks.
+%%
+%% *This documentation is LLM-generated. See the AI disclosure in README.md.*
 
 -export([get_waiting_key/1, get_from/2, call/4, push_call/6, push_call/7]).
 

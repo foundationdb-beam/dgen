@@ -30,6 +30,8 @@
 %% list:  {BaseKey, <<"l">>}                        (marker, holds Id => FracIndex map)
 %%        {BaseKey, <<"l">>, FracIndex, Id, ...}    (recursive)
 %% ```
+%%
+%% *This documentation is LLM-generated. See the AI disclosure in README.md.*
 
 -export([
     get/2,

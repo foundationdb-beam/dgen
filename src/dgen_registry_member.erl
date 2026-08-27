@@ -312,6 +312,8 @@
 %%
 %% - **Full cluster restart**: all registered names are lost.  Applications
 %%   must re-register on startup.
+%%
+%% *This documentation is LLM-generated. See the AI disclosure in README.md.*
 
 %% (The group-commit batch size, the replicate-before-ack target, and the timeout
 %% are configurable per registry — see dgen_config:commit_batch_size/1,

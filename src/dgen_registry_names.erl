@@ -77,6 +77,8 @@
 %%   GRV may already post-date the change, which a conflict range would miss.
 %%
 %% A stale leader therefore can never commit.
+%%
+%% *This documentation is LLM-generated. See the AI disclosure in README.md.*
 
 -behaviour(dgen_transaction).
 
