@@ -232,13 +232,12 @@ defmodule DGen.RegistryMutationTest do
     end
   end
 
-  # A second mutation worth planting: revert the replication heartbeat
-  # (`?REPLICA_HEARTBEAT_INTERVAL` and its `handle_info(replica_heartbeat, …)`
-  # leader clause) to bring back the traffic-triggered resync gap, where a follower
-  # that loses the tail of the stream stays diverged while the cluster is quiet.
-  #
-  # Everything needed to catch it already exists: `quiet_p` makes the quiet period
-  # reachable and `check_quiescent/1` is evaluated precisely when nothing is
-  # happening. Add `-DMUTATION_QUIET_RESYNC` alongside the existing define and
-  # point the same criteria at it.
+  # The second planted mutation — `-DMUTATION_QUIET_RESYNC`, reverting the
+  # replication heartbeat — lives in its own suite,
+  # `dgen_registry_mutation_quiet_test.exs` (`--only mutation_quiet`), because its
+  # signature is the opposite shape from this one's: the victim follower is
+  # *behind* the leader, which is exactly what `same_version_same_replica`
+  # excuses, so these sweeping criteria are structurally blind to it and the
+  # discrimination has to be targeted and temporal instead. See that module's
+  # moduledoc for the reasoning.
 end

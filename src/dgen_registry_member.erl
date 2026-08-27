@@ -1727,8 +1727,7 @@ handle_info(resync_timeout, State) ->
 %% writes; every other gap-detection trigger needs traffic that a quiescent cluster
 %% does not have.
 handle_info(replica_heartbeat, State = #state{member_id = Self, leader = Self}) ->
-    #state{members = Members, epoch = Epoch, applied_version = Applied} = State,
-    broadcast_to_peers(Members, {names_batch, [], Epoch, Applied, Applied, Self}),
+    broadcast_heartbeat(State),
     arm(?REPLICA_HEARTBEAT_INTERVAL, replica_heartbeat),
     {noreply, State};
 handle_info(replica_heartbeat, State) ->
@@ -1736,6 +1735,8 @@ handle_info(replica_heartbeat, State) ->
     %% member heartbeats immediately if it is later elected.
     arm(?REPLICA_HEARTBEAT_INTERVAL, replica_heartbeat),
     {noreply, State};
+%% (broadcast_heartbeat/1, the leader clause's advertisement above, is defined
+%% beside broadcast_batch/5's MUTATION ifdef — it is itself mutation-planted.)
 %% Re-drive the destructive ops of a batch that failed to commit (see
 %% salvage_failed_plan): re-enqueue them if we are (still) the leader, or forward
 %% the pid-guarded clears to the current leader if we were deposed — so an
@@ -3282,6 +3283,26 @@ broadcast_batch(Members, [First | _] = Ops, PrevV, Version, Self) ->
     Epoch = bcast_epoch(First),
     Stripped = [strip_bcast_epoch(Op) || Op <- Ops],
     broadcast_to_peers(Members, {names_batch, Stripped, Epoch, PrevV, Version, Self}).
+-endif.
+
+-ifdef(MUTATION_QUIET_RESYNC).
+%% MUTATION (`DGEN_MUTATION=quiet_resync`, test builds only) — the heartbeat
+%% reverted to the pre-fix shape: the leader's timer fires and advertises
+%% nothing, so gap detection is traffic-triggered again and a follower that
+%% loses the *tail* of the stream stays diverged for as long as the cluster is
+%% quiet (sim README, finding 2).  Planted so the mutation suite can be asked to
+%% rediscover it; see test/dgen_registry_mutation_quiet_test.exs.
+broadcast_heartbeat(_State) ->
+    ok.
+-else.
+%% The leader's periodic empty batch, stamped {Applied, Applied}: a caught-up
+%% follower applies nothing, a behind one takes apply_bcast/6's gap branch and
+%% requests a resync.  The traffic-independent half of gap detection.
+broadcast_heartbeat(#state{
+    members = Members, epoch = Epoch, applied_version = Applied, member_id = Self
+}) ->
+    broadcast_to_peers(Members, {names_batch, [], Epoch, Applied, Applied, Self}),
+    ok.
 -endif.
 
 bcast_epoch({name_registered, _Name, _Pid, _Index, _Data, Epoch}) -> Epoch;

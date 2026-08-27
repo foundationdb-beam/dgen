@@ -37,7 +37,13 @@ exclusions =
 #
 #     DGEN_MUTATION=partial_batch mix compile --force
 #     DGEN_MUTATION=partial_batch DGEN_BACKEND=dgen_mem mix test --only mutation
-exclusions = exclusions ++ [:mutation]
+#
+# `:mutation_quiet` is the second planted defect (quiet_resync), with its own tag
+# so each mutation build runs exactly the suite that describes it:
+#
+#     DGEN_MUTATION=quiet_resync mix compile --force
+#     DGEN_MUTATION=quiet_resync mix test --only mutation_quiet
+exclusions = exclusions ++ [:mutation, :mutation_quiet]
 
 # The mirror-image hazard, guarded here because it actually happened: an
 # interrupted mutation workflow leaves `_build/test` holding beams with the defect
