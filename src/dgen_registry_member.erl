@@ -689,7 +689,7 @@ start_link(Name, Args) ->
 %% ---------------------------------------------------------------------------
 
 callback_mode() ->
-    handle_event_function.
+    [handle_event_function, state_enter].
 
 init(#{name := Name, tenant := Tenant, tuid := Tuid} = Args) ->
     Config = maps:get(config, Args, #{}),
@@ -782,6 +782,33 @@ init(#{name := Name, tenant := Tenant, tuid := Tuid} = Args) ->
 %% (an epoch, a ref).  Everything else falls through to the generic shim at the
 %% bottom, whose handlers' own leadership branches remain authoritative — the
 %% hoist changes where dispatch is visible, never what it decides.
+
+%% -- state enter: the leadership lifecycle, in one place ---------------------
+
+%% Phase 3: the assume/relinquish pairing lives on the role edges themselves,
+%% so no transition path — assume continuation, snapshot demotion, epoch nudge,
+%% or any added later — can forget half of it.  Entering `leader` seeds the
+%% subscription matches and arms the deferred monitor sweep (assume_leadership);
+%% leaving `leader` demonitors every registered pid (relinquish_leadership).
+%% What deliberately does NOT live here: reject_forwards fires on any change of
+%% leader IDENTITY, including follower→follower, which is not a state edge; and
+%% fail_pending_acks stays with do_leader_changed's lost-leadership branch —
+%% a re-assumed leader's stale pending acks are already fenced by their
+%% BatchRef, and resolving them early would change behavior, not just shape.
+%%
+%% One timing shift, deliberate and safe: a leader entering `assuming` now
+%% relinquishes at assume-start rather than at the gather continuation, so a
+%% subject dying during the gather window is unmonitored until the new term's
+%% sweep — which catches it with an immediate `noproc` DOWN, the same
+%% self-healing property the deferred sweep already rests on.
+handle_event(enter, OldState, leader, Data) when OldState =/= leader ->
+    {keep_state, assume_leadership(Data)};
+handle_event(enter, leader, NewState, Data) when NewState =/= leader ->
+    {keep_state, relinquish_leadership(Data)};
+handle_event(enter, _OldState, _NewState, Data) ->
+    %% Includes init's self-enter (searching -> searching) and every edge not
+    %% touching `leader`.
+    {keep_state, Data};
 
 %% -- the assume lifecycle ---------------------------------------------------
 
@@ -1780,25 +1807,25 @@ handle_info(
         FreshestRecords,
         State#state{recently_released = MergedReleased}
     ),
-    %% Reconstruct the local replica (pid + metadata) + inverted index wholesale, then
-    %% become leader, monitoring the reconstructed names.  Clearing assume_ref marks the
-    %% assume complete.
+    %% Reconstruct the local replica (pid + metadata) + inverted index wholesale,
+    %% then become leader.  Clearing assume_ref marks the assume complete; the
+    %% `leader` state edge this produces runs assume_leadership (subscription
+    %% reseed + monitor sweep) in the enter call — and the old inline relinquish
+    %% is gone too, because leaving `leader` already ran it when this assume
+    %% began.  `Subs` (pulled from the co-located elector off this loop, §4.9)
+    %% is seeded into Data here so the enter call's recompute_sub_matches
+    %% computes each watch set against the reconstructed replica; a silent
+    %% reseed — subscribers keep their view, and a subscribe racing the handoff
+    %% pushes a {presence_update} delta applied once established below.
     State0a = records_replace(State0, Records),
-    State1 = relinquish_leadership(State0a),
-    %% Seed the durable presence subscriptions (§4.9) with the set the gather helper
-    %% pulled from the co-located elector off this loop (`Subs`) — *before* assuming, so
-    %% assume_leadership -> recompute_sub_matches computes each watch set against the
-    %% reconstructed replica.  A silent reseed — it does not re-fire initial snapshots;
-    %% subscribers keep their view, and a subscribe racing the last moment of the handoff
-    %% pushes a {presence_update} delta we apply once established as leader below.
-    State2 = assume_leadership(State1#state{
+    State2 = State0a#state{
         leader = Self,
         epoch = Epoch,
         applied_version = MaxVersion,
         degraded = Degraded,
         assume_ref = undefined,
         subs = Subs
-    }),
+    },
     State3 = add_member_monitors(extra_member_ids(MemberId, AllIds, Self), State2),
     State4 = merge_peer_tokens(Tokens, State3),
     %% Encode the snapshot once; every follower's cast shares the one refc binary.
@@ -1993,15 +2020,14 @@ do_leader_changed(NewLeader, OldLeader, Self, State0) ->
             true -> reject_forwards(State0);
             false -> State0
         end,
+    %% The role-edge halves — relinquish on leaving `leader`, assume on entering
+    %% it — run in the state enter calls, off this function's returned Data.
     if
         OldLeader =:= Self, NewLeader =/= Self ->
             %% Lost leadership — resolve any direct registrations still awaiting
-            %% replica acks (their timers must not fire into a follower), then
-            %% demonitor registered Pids, keeping names for snapshot reads.
-            relinquish_leadership(fail_pending_acks(State#state{leader = NewLeader}));
-        OldLeader =/= Self, NewLeader =:= Self ->
-            %% Gained leadership — set up monitors for all currently known names.
-            assume_leadership(State#state{leader = NewLeader});
+            %% replica acks (their timers must not fire into a follower).  The
+            %% demonitor half runs on the leader-exit enter call.
+            fail_pending_acks(State#state{leader = NewLeader});
         true ->
             State#state{leader = NewLeader}
     end.
