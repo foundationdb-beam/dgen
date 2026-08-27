@@ -230,6 +230,13 @@ below.
 mix dst
 ```
 
+`mix dst` runs only the `:simulation`-tagged sweeps (the multi-seed soaks in
+both suites). The rest of the two suites — the targeted regressions here and
+the untagged determinism/plumbing tests in `dgen_registry_eta_test.exs` — ride
+an ordinary `mix test` (the deterministic ones need `DGEN_BACKEND=dgen_mem`;
+see `test_helper.exs` for what each backend excludes). The `:mutation` suite is
+opt-in and needs the defect compiled in — see `test_helper.exs`.
+
 ## Findings
 
 All three were found by this harness and are **fixed**. Each is kept here because

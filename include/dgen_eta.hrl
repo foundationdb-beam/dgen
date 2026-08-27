@@ -11,8 +11,9 @@
 %% `-include_lib` resolves through the code path, so `eta` would have to be
 %% findable in *every* compilation — which the library's own walkthrough handles by
 %% telling adopters to depend on it with `runtime: false`. dgen is a published
-%% package, where a dependency outside `only: :test` becomes a package requirement
-%% that only a Hex package can satisfy, and `eta` is a git dependency.
+%% package, and test tooling has no business becoming a package requirement for
+%% every consumer, so `eta` stays behind `only: :test` (pinned from Hex, ~> 0.1 —
+%% see mix.exs).
 %%
 %% So `eta` stays test-only, the `-include_lib` sits behind `-ifdef(DST)` where the
 %% preprocessor never resolves it in a release build, and the `-else` branch below

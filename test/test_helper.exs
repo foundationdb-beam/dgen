@@ -39,6 +39,32 @@ exclusions =
 #     DGEN_MUTATION=partial_batch DGEN_BACKEND=dgen_mem mix test --only mutation
 exclusions = exclusions ++ [:mutation]
 
+# The mirror-image hazard, guarded here because it actually happened: an
+# interrupted mutation workflow leaves `_build/test` holding beams with the defect
+# still compiled in — Mix does not recompile when only `DGEN_MUTATION` changes —
+# and every subsequent plain `mix test` then runs against a bug planted on
+# purpose. The mutation suite's own setup guards the opposite direction (flunks if
+# the define is *absent*); this is the only place that can flunk its *presence*.
+if System.get_env("DGEN_MUTATION") == nil do
+  {:module, _} = Code.ensure_loaded(:dgen_registry_member)
+
+  mutation_defines =
+    for {:d, d} <-
+          :dgen_registry_member.module_info(:compile) |> Keyword.get(:options, []),
+        d |> Atom.to_string() |> String.starts_with?("MUTATION"),
+        do: d
+
+  if mutation_defines != [] do
+    raise """
+    _build/test holds a MUTATED build (#{inspect(mutation_defines)}) but DGEN_MUTATION \
+    is not set — a previous mutation run left its planted defect in the build cache.
+    Recompile clean before testing:
+
+        MIX_ENV=test mix compile --force
+    """
+  end
+end
+
 # `:simulation` is the multi-seed fault-injection soak. It needs `dgen_mem` and
 # takes minutes, so it has its own entry point rather than riding on `mix test`:
 #

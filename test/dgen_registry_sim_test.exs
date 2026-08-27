@@ -6,7 +6,10 @@ defmodule DGen.RegistrySimTest do
   A run is: start an N-member cluster in this VM, apply a seeded random workload
   (register / unregister / set_metadata / re-register races) while
   `eta_net` injects seeded message loss and delay, check the always-true
-  invariants continuously, then heal, converge, and check the converged ones.
+  invariants at checkpoints during and after the workload, then heal, converge,
+  and check the converged ones. (Truly *continuous* — per-action — checking
+  exists only in the `eta_run` suite, `dgen_registry_eta_test.exs`, where the
+  scheduler owns every step; here a checkpoint is as fine-grained as it gets.)
 
   ## What "deterministic" does and does not mean here
 
@@ -232,8 +235,8 @@ defmodule DGen.RegistrySimTest do
     # forwarded op still blocks for its full caller-side `register_timeout`, so a
     # faulted run costs more wall clock than a clean one.
     #
-    # Tagged `:simulation` only so a tight edit/test loop can `--exclude` it; these
-    # run by default (see test_helper.exs), which is the point — this sweep is what
+    # Tagged `:simulation`, which test_helper.exs excludes from a plain `mix test` —
+    # these run under `mix dst`, the fault-injection entry point. This sweep is what
     # found the partial-batch divergence. Add seeds freely: the value is roughly
     # linear in how many interleavings get visited.
     for seed <- [11, 12, 13, 14, 15] do
@@ -903,6 +906,11 @@ defmodule DGen.RegistrySimTest do
       assert_converged!(c, acked, seed)
 
       assert length(Cluster.alive(c)) == 5
+
+      # The same non-vacuity guard every other lossy test carries: a run whose
+      # policy never engaged exercised nothing and must not report `ok`.
+      assert :eta_net.stats().dropped > 0,
+             "seed #{seed} dropped nothing — the fault policy did not engage"
     end
   end
 
