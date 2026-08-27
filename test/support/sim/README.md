@@ -239,7 +239,7 @@ opt-in and needs the defect compiled in — see `test_helper.exs`.
 
 ## Findings
 
-All three were found by this harness and are **fixed**. Each is kept here because
+All were found by this harness and are **fixed**. Each is kept here because
 the reasoning is the useful part — the mechanism, why it was invisible to the
 existing tests, and what now pins it down.
 
@@ -391,6 +391,44 @@ unchanged, so only callers who had already set it see a difference. What a timeo
 *means* still differs per call, deliberately: registration exits, unregister answers
 `ok` (the removal is stashed and re-driven), `set_metadata` answers
 `{error, no_leader}`.
+
+### 7. One unregister freed a name twice, double-issuing it — FIXED
+
+Found by the end-of-run **ack-history fold** (`check_final/2` on the harness), on
+its very first sweep — and by construction invisible to every replica-based check,
+because all members apply the same wrong batch and agree perfectly.
+
+The mechanism, three steps on the leader:
+
+1. A register for `B` is enqueued while a commit is in flight (holder `A` in ETS),
+   so it parks in the pending queue unplanned.
+2. An unregister arrives. The leader captures `ReleasedPid = A` and does its
+   **optimistic `row_delete`** — the name is free in ETS *now* — then enqueues
+   `{remove, Name, A, …}` behind the parked register.
+3. The batch plans in FIFO order. `B`'s add consults the (optimistically emptied)
+   table, answers **`yes` while `A`'s acked registration still stands**; the
+   remove then cleared the name **unconditionally** — deleting `B`, whom it never
+   targeted. A later register `C` gets `yes` too.
+
+Three `yes` acks for one name with a single unregister between them has no legal
+serialization (Guarantee 1), and the destroyed binding was an acked one
+(Guarantee 4, no fault anywhere). Reachable in production with no faults at all:
+a register and an unregister for one name arriving while a commit is in flight is
+ordinary concurrency. Every existing check missed it structurally — the sequential
+real-clock workload never parks a register behind an unregister, and replica
+comparisons see a cluster in perfect agreement about the wrong history.
+
+**Fix:** `plan_op/3`'s remove clause guards the clear against the *current*
+holder (batch overlay first, ETS fallback): a removal whose captured target is a
+pid clears only while the holder is that pid or nobody (nobody being the
+optimistic delete's own footprint). A different pid means the target binding is
+already gone — the unregister answers its idempotent `ok` and the new holder
+survives. A capture of `undefined` keeps its meaning: the unregister serializes
+after whatever bound the name, a legal linearization of unregister-by-name.
+
+Regression: the lossy eta sweep at seed 5 reproduces the exact interleaving
+deterministically, and `check_final/2` now folds the ack history on every
+fault-free-ending run of every sweep.
 
 ## A note on invariants that are not invariants
 

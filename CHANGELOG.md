@@ -2,6 +2,18 @@
 
 ## v0.4.1 (TBD)
 
+### Bug fixes
+
+- **`dgen_registry` — an unregister could destroy a binding it never targeted.**
+  A register parked behind an in-flight commit planned against the leader's
+  optimistically-emptied table and was acked `yes` while the previous holder's
+  registration still stood; the unregister's `remove` op then cleared the name
+  unconditionally, deleting the new holder. One unregister freed the name twice
+  (Guarantees 1 and 4 both violated), with no fault required — ordinary
+  register/unregister concurrency sufficed. The remove is now pid-guarded against
+  the current holder. Found by the simulation harness's new end-of-run
+  ack-history invariant (`test/support/sim/README.md`, finding 7).
+
 ### Enhancements
 
 - **`dgen_registry` — per-registry `connectivity` option.** `provided_externally`

@@ -81,6 +81,12 @@ defmodule DGen.RegistryEtaTest do
       # merely started it and found nothing to do.
       assert r.ops == 12, "not every operation was injected"
       assert r.steps > 100, "suspiciously few steps: #{r.steps}"
+
+      # The end-of-run invariants (UniqueBinding over the ack history, acked
+      # presence) actually ran — a clean ending on a fault-free run must reach
+      # `check_final/2` exactly once.
+      assert @harness.stats().final_checks == 1,
+             "check_final never ran — the end-of-run invariants were not evaluated"
     end
 
     @tag timeout: 300_000
@@ -209,12 +215,24 @@ defmodule DGen.RegistryEtaTest do
       assert Enum.all?(results, fn {_, r, _} -> r.ops == @max_ops end),
              "some seeds did not inject every operation"
 
+      # 4. The end-of-run invariants ran, over a non-empty history. This sweep
+      #    has no node faults, so `check_final/2` asserts on every seed: a
+      #    `final_acked` that stays at zero means UniqueBinding was folded over
+      #    an empty ack history and presence was demanded of nothing.
+      final_acked = results |> Enum.map(&elem(&1, 2).final_acked) |> Enum.sum()
+      seeds_with_final = Enum.count(results, &(elem(&1, 2).final_acked > 0))
+
+      assert seeds_with_final > div(Enum.count(@sweep), 2),
+             "only #{seeds_with_final} of #{Enum.count(@sweep)} seeds ended with any " <>
+               "surviving acked registration — the final invariants are passing vacuously"
+
       late = for {seed, r, _} <- results, r.sched.adopted_late > 0, do: seed
 
       IO.puts(
         "\n[eta sweep] #{Enum.count(@sweep)} seeds @ drop_p #{@drop_p}: " <>
           "#{total_drops} dropped across #{seeds_with_loss} seeds, " <>
-          "#{quiescent} quiescent checks, #{length(late)} seeds adopted late"
+          "#{quiescent} quiescent checks, #{final_acked} final acked bindings " <>
+          "across #{seeds_with_final} seeds, #{length(late)} seeds adopted late"
       )
     end
 

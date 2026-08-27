@@ -193,6 +193,10 @@ defmodule DGen.RegistrySimTest do
       on_exit(fn -> Cluster.stop(c) end)
 
       acked = run_workload(c, 120, seed)
+
+      # Non-vacuity for `acked_bindings_present`: presence of nothing is free.
+      assert map_size(acked) > 0, "the workload acked nothing"
+
       assert_always!(c, seed)
       assert_converged!(c, acked, seed)
 
@@ -336,6 +340,58 @@ defmodule DGen.RegistrySimTest do
       assert_converged!(c, acked, seed, crashed?: true)
     end
 
+    # Guarantee 4's strong half, asserted against the real code for the first
+    # time. Under the default degrade-open policy every crash test above must
+    # carve durability out (`crashed?: true`) because a singly-held acked binding
+    # may legitimately die with its holder — which left the design's central
+    # durability claim checked only by TLC, never against the implementation.
+    # `strict_replication` removes the excuse: a `yes` requires a version-visible
+    # second holder (§5.5), so every acked registration must survive one fault.
+    # Losing the *leader* is the hardest case — survival then rests on the §5.7
+    # handoff gather preserving every acked row, which is exactly the property
+    # the formal model's HandoffRace mutation shows breaking without its fence.
+    test "strict replication: every acked registration survives losing the leader", %{
+      tenant: tenant
+    } do
+      seed = 51
+      c = Cluster.start(tenant, 3, seed: seed, registry_opts: %{strict_replication: true})
+      on_exit(fn -> Cluster.stop(c) end)
+
+      acked = run_workload(c, 60, seed)
+
+      assert map_size(acked) > 0,
+             "the workload acked nothing, so the survival assertion below is vacuous"
+
+      {_node, leader_name} = Cluster.leader(c)
+      c = Cluster.crash(c, leader_name)
+
+      assert eventually(fn ->
+               case Cluster.leader(c) do
+                 nil -> false
+                 {_n, name} -> name != leader_name and name in Cluster.alive(c)
+               end
+             end),
+             "no new leader was elected after the leader was lost"
+
+      assert_always!(c, seed)
+      assert_converged!(c, acked, seed, crashed?: true)
+
+      # The point: the crash carve-out does not apply in strict mode. Every
+      # registration acked `yes` before the crash is still bound after it.
+      case Invariants.acked_bindings_present(c, acked) do
+        :ok ->
+          :ok
+
+        {:violation, details} ->
+          flunk("""
+          A strict-replication `yes` did not survive a single crash (seed #{seed}) —
+          Guarantee 4 broken against the real implementation.
+
+          #{inspect(details, pretty: true, limit: :infinity)}
+          """)
+      end
+    end
+
     test "a crashed member rejoins fresh and re-syncs the full replica", %{tenant: tenant} do
       seed = 33
       c = Cluster.start(tenant, 3, seed: seed)
@@ -404,6 +460,11 @@ defmodule DGen.RegistrySimTest do
              "the victim did not fall behind — the partition had no effect"
 
       Cluster.heal_partition(c, leader, victim)
+      # crashed?: true although nothing died: a partition can depose the leader and
+      # force a handoff gather that cannot reach the freshest member, and the
+      # bounded retry then assumes *degraded* — the availability tradeoff §5.7
+      # scopes out — after which an acked binding may be legitimately gone. The
+      # same scoping gates the harness's `check_final/2` (see `ever_cut` there).
       assert_converged!(c, acked, seed, crashed?: true)
 
       {_node, converged_leader} = Cluster.leader(c)

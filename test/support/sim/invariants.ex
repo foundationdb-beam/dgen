@@ -23,6 +23,12 @@ defmodule DGen.Sim.Invariants do
   - **Always** — `leader_epoch_unique/1`.
   - **At quiescence** — `same_version_same_replica/1`; see `check_quiescent/1`.
   - **After convergence only** — `unique_binding/2`, `acked_bindings_present/2`.
+  - **At end of run, under `eta_run`** — `RegistryHarness.check_final/2` evaluates
+    `acked_bindings_present/2` and a *history* form of UniqueBinding (folded from
+    the recorded `yes` acks, the same shape as the spec's cumulative `acked` ghost
+    set) on every fault-free normally-ending run. That fold is what caught
+    finding 7 — a violation no replica comparison can see, because every member
+    agrees about the wrong history.
   """
 
   alias DGen.Sim.Cluster

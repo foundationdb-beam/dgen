@@ -175,7 +175,12 @@ defmodule DGen.Sim.RegistryHarness do
        # every operation is. Cut pairs are `{lo, hi}`; `killed` never shrinks,
        # since a node kill is terminal for this run.
        cuts: MapSet.new(),
-       killed: MapSet.new()
+       killed: MapSet.new(),
+       # Whether ANY partition ever existed, healed or not. `check_final/2` needs
+       # history, not the current cut set: a partition that has since healed can
+       # still have cost an acked binding legitimately (a degraded handoff gather
+       # is the documented availability tradeoff), and healing does not un-lose it.
+       ever_cut: false
      }}
   end
 
@@ -285,7 +290,18 @@ defmodule DGen.Sim.RegistryHarness do
   @impl true
   def execute({:register, _member_i, name} = op, sut) do
     subject = spawn(fn -> Process.sleep(:infinity) end)
-    client = spawn_client(op, sut, &:dgen_registry.register_name({&1, name}, subject))
+
+    # The `yes` is recorded from inside the client, at the (scheduled, so
+    # deterministic) moment the answer arrives — it is the ack history
+    # `check_final/2` folds. Only `yes` is worth recording: a `no` changes no
+    # state, and a timeout may or may not have committed, which is exactly why
+    # the fold never relies on one.
+    client =
+      spawn_client(op, sut, fn member ->
+        result = :dgen_registry.register_name({member, name}, subject)
+        if result == :yes, do: record_event({:yes, name, subject})
+        result
+      end)
 
     %{
       sut
@@ -296,6 +312,12 @@ defmodule DGen.Sim.RegistryHarness do
   end
 
   def execute({:unregister, _member_i, name} = op, sut) do
+    # Recorded at *issue* time, in the driver, deliberately — the earliest point
+    # the removal could possibly take effect. An unregister is a zombie: it can
+    # commit long after its caller timed out (the removal is stashed and
+    # re-driven), so the only sound reading for `check_final/2` is "from here on,
+    # this name may legally change hands once more".
+    record_event({:unreg_issued, name})
     client = spawn_client(op, sut, &:dgen_registry.unregister_name({&1, name}))
     %{sut | clients: [client | sut.clients], next_op: sut.next_op + 1}
   end
@@ -316,7 +338,7 @@ defmodule DGen.Sim.RegistryHarness do
   # partition does.
   def execute({:partition, i, j}, sut) do
     Cluster.partition(sut.cluster, member_name(sut, i), member_name(sut, j))
-    %{sut | cuts: MapSet.put(sut.cuts, {i, j}), next_op: sut.next_op + 1}
+    %{sut | cuts: MapSet.put(sut.cuts, {i, j}), ever_cut: true, next_op: sut.next_op + 1}
   end
 
   def execute({:heal, i, j}, sut) do
@@ -408,16 +430,136 @@ defmodule DGen.Sim.RegistryHarness do
     if Invariants.compared(cluster, only: only) > 1, do: bump(:compared)
 
     case Invariants.check_quiescent(cluster, only: only) do
-      :ok ->
+      :ok -> :ok
+      {:violation, detail} -> {:violation, enrich(detail, sut)}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Final checks — the properties `check/1` can never assert
+  # ---------------------------------------------------------------------------
+
+  # `UniqueBinding` and `acked_bindings_present`, evaluated once, at the end of a
+  # normally-ending run. Neither is checkable mid-run (`unique_binding/2` over
+  # replicas false-positives on ordinary lag), and before this hook existed
+  # neither was evaluated under `eta_run` at all — Guarantee 1 had no
+  # deterministic coverage.
+  #
+  # Both are asserted only on a run with **no kills and no partitions, ever**
+  # (`ever_cut`, not the current cut set — healing does not un-lose anything).
+  # That scoping is the design's, not caution: under the default degrade-open
+  # policy a kill may legitimately drop a singly-held acked binding (Guarantee
+  # 4's stated exception), and a partition can force a *degraded* handoff gather
+  # — the documented availability tradeoff — after which an acked binding may be
+  # gone and its name legally re-issued. Asserting either property there would
+  # claim something the design does not.
+  #
+  # `UniqueBinding` is folded from the recorded **ack history**, not from
+  # replicas — the same shape as the spec's cumulative `acked` ghost set, so this
+  # is the invariant under its own name rather than a converged-snapshot proxy.
+  # The fold is deliberately conservative about concurrency: an issued unregister
+  # is a *credit* that excuses one later holder change, because it may commit
+  # anywhere in its `[issue, ∞)` window (stash + re-drive). Every real
+  # "name freed" consumes one committed unregister, and commits never exceed
+  # issues, so observed-changes > credits is a genuine double-`yes`.
+  @impl true
+  def check_final(_settled, %{cluster: cluster} = sut) do
+    bump(:final_checks)
+    faulted? = MapSet.size(sut.killed) > 0 or sut.ever_cut
+
+    with false <- faulted?,
+         events = recorded_events(),
+         :ok <- unique_binding_from_history(events, sut),
+         acked = surviving_acked(events),
+         _ = if(map_size(acked) > 0, do: bump_by(:final_acked, map_size(acked))),
+         :ok <- present_or_violation(cluster, acked, sut) do
+      :ok
+    else
+      true -> :ok
+      {:violation, _} = violation -> violation
+    end
+  end
+
+  defp present_or_violation(cluster, acked, sut) do
+    case Invariants.acked_bindings_present(cluster, acked) do
+      :ok -> :ok
+      {:violation, detail} -> {:violation, enrich(detail, sut)}
+    end
+  end
+
+  defp unique_binding_from_history(events, sut) do
+    initial = {%{}, %{}, []}
+
+    {_, _, violations} =
+      Enum.reduce(events, initial, fn
+        {:unreg_issued, name}, {holders, credits, v} ->
+          {holders, Map.update(credits, name, 1, &(&1 + 1)), v}
+
+        {:yes, name, pid}, {holders, credits, v} ->
+          case holders[name] do
+            prev when is_pid(prev) and prev != pid ->
+              # A holder change. Legal iff some unregister could have freed the
+              # name in between — spend a credit; with none left, two live pids
+              # were both told `yes` with nothing that could have unbound the
+              # first: the spec's UniqueBinding, violated.
+              case {Map.get(credits, name, 0), Process.alive?(prev)} do
+                {0, true} ->
+                  {Map.put(holders, name, pid), credits,
+                   [%{name: name, first: prev, second: pid} | v]}
+
+                {0, false} ->
+                  # The previous holder is dead by the time this fold runs, so its
+                  # death may be what freed the name (`DOWN` cleanup) — not a
+                  # double-`yes`. Subjects are immortal in this harness, so a dead
+                  # one means something *in the system* killed it; excusing the
+                  # change is the sound reading either way.
+                  {Map.put(holders, name, pid), credits, v}
+
+                {n, _} ->
+                  {Map.put(holders, name, pid), Map.put(credits, name, n - 1), v}
+              end
+
+            _ ->
+              {Map.put(holders, name, pid), credits, v}
+          end
+      end)
+
+    case violations do
+      [] ->
         :ok
 
-      {:violation, detail} ->
+      _ ->
         {:violation,
-         detail
-         |> Map.put(:members, member_status(cluster))
-         |> Map.put(:cuts, MapSet.to_list(sut.cuts))
-         |> Map.put(:net, :eta_net.stats())}
+         enrich(
+           %{
+             property: :unique_binding,
+             detail: "two pids were both acked `yes` for one name with no unregister between",
+             conflicts: violations
+           },
+           sut
+         )}
     end
+  end
+
+  # The registrations still owed presence at the end of the run: last `yes` per
+  # name, minus every name an unregister was *ever issued* for. Issue-time
+  # exclusion is the sound reading — a timed-out unregister may still commit
+  # (or already have, with its reply lost), so the name is owed nothing.
+  defp surviving_acked(events) do
+    {acked, unregistered} =
+      Enum.reduce(events, {%{}, MapSet.new()}, fn
+        {:yes, name, pid}, {acked, unreg} -> {Map.put(acked, name, pid), unreg}
+        {:unreg_issued, name}, {acked, unreg} -> {acked, MapSet.put(unreg, name)}
+      end)
+
+    Map.drop(acked, MapSet.to_list(unregistered))
+  end
+
+  defp enrich(detail, %{cluster: cluster} = sut) do
+    detail
+    |> Map.put(:members, member_status(cluster))
+    |> Map.put(:cuts, MapSet.to_list(sut.cuts))
+    |> Map.put(:net, :eta_net.stats())
   end
 
   @doc """
@@ -517,12 +659,33 @@ defmodule DGen.Sim.RegistryHarness do
 
   @stats :eta_registry_harness_stats
 
+  # The ack history `check_final/2` folds. Written from two places — the driver
+  # (unregister issuance, between steps) and register clients (the `yes`, at
+  # their own scheduled step) — whose interleaving the scheduler serializes, so
+  # the sequence is a function of the seed like everything else. Ordered by an
+  # ETS counter rather than by time: virtual time ties, real time lies.
+  @events :eta_registry_harness_events
+
   # `dropped` is the non-vacuity guard for a lossy policy; `noconnection` and
   # `signalled` are the ones for a node fault, and they are not interchangeable. A
   # run can partition a pair and drop nothing (the cut traffic was not
   # `names_batch`), and a run can partition a node no monitor crossed — which
   # exercises no recovery at all and reports the same `ok`.
-  @counters [:checks, :quiescent_checks, :compared, :dropped, :noconnection, :signalled]
+  #
+  # `final_checks`/`final_acked` are `check_final/2`'s: how often it ran, and how
+  # many acked registrations it actually demanded presence for. A sweep where
+  # `final_acked` stays zero verified UniqueBinding over an empty history and
+  # presence of nothing — the sweeps assert it climbs.
+  @counters [
+    :checks,
+    :quiescent_checks,
+    :compared,
+    :dropped,
+    :noconnection,
+    :signalled,
+    :final_checks,
+    :final_acked
+  ]
 
   @doc """
   Counts for the most recent run: how often the invariants were evaluated, and
@@ -540,12 +703,29 @@ defmodule DGen.Sim.RegistryHarness do
       :ets.new(@stats, [:named_table, :public, :set])
     end
 
+    if :ets.whereis(@events) == :undefined do
+      :ets.new(@events, [:named_table, :public, :ordered_set])
+    end
+
+    :ets.delete_all_objects(@events)
     :ets.insert(@stats, Enum.map(@counters, &{&1, 0}))
+    :ets.insert(@stats, {:event_seq, 0})
   end
 
   # check/1 runs in a process of eta_run's making, one per check, so the counter
   # cannot live in the harness state — it would be discarded with that process.
   defp bump(key), do: :ets.update_counter(@stats, key, 1)
+  defp bump_by(key, n), do: :ets.update_counter(@stats, key, n)
+
+  defp record_event(event) do
+    seq = :ets.update_counter(@stats, :event_seq, 1)
+    :ets.insert(@events, {seq, event})
+    :ok
+  end
+
+  defp recorded_events do
+    for {_seq, event} <- :ets.tab2list(@events), do: event
+  end
 
   defp net_counters do
     case :eta_net.running() do

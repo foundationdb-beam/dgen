@@ -3106,7 +3106,30 @@ plan_op({remove, Name, ReleasedPid, Origin}, Epoch, Acc) ->
     %% already-unbound name is an idempotent no-op, not a failure.
     Rs1 = unreg_reply(Origin, Rs),
     WasBound = is_pid(ReleasedPid),
-    case WasBound orelse (seed_lookup(WN, Tab, Name) =/= undefined) of
+    Current = seed_lookup(WN, Tab, Name),
+    %% Guard the clear against the *current* holder.  ReleasedPid is captured at
+    %% arrival, but this plan runs later — and the arrival-time optimistic
+    %% row_delete frees the name in ETS immediately, so a register that was already
+    %% enqueued (parked behind an in-flight commit) plans against the freed table,
+    %% answers `yes`, and binds a new pid before this remove is planned.  Clearing
+    %% unconditionally then deletes that new holder: one unregister frees the name
+    %% twice — once optimistically for the parked register, once durably against
+    %% the pid it never targeted — and three `yes` acks for one name with a single
+    %% unregister between them has no legal serialization (Guarantee 1).  Found by
+    %% the DST harness's end-of-run ack-history fold (`check_final`, seed 5 under
+    %% loss); invisible to every replica comparison because all members apply the
+    %% same wrong batch and agree.
+    %%
+    %% So: a removal whose captured target is a pid only clears while the name's
+    %% current holder (batch overlay first, ETS fallback) is that pid or nobody
+    %% (nobody = the optimistic delete, which is this removal's own footprint).  A
+    %% different current pid means the target binding is already gone — answer the
+    %% idempotent `ok` and keep the new holder.  A capture of `undefined` keeps its
+    %% existing meaning: the unregister serializes after whatever bound the name
+    %% (in-batch add included), which is a legal linearization of "unregister by
+    %% name", and clears it.
+    Rebound = WasBound andalso is_pid(Current) andalso Current =/= ReleasedPid,
+    case (WasBound orelse Current =/= undefined) andalso not Rebound of
         true ->
             Rel1 =
                 case WasBound of
