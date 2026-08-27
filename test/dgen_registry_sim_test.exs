@@ -402,6 +402,59 @@ defmodule DGen.RegistrySimTest do
       end
     end
 
+    # The deferred monitor sweep's load-bearing property, pinned: a new leader
+    # establishes its registered-process monitors AFTER becoming ready (chunked,
+    # off the client-visible window), which opens a window where a subject can die
+    # with no monitor anywhere watching it — the old leader's died with it, the
+    # new leader's does not exist yet. Deferral is safe only because a monitor
+    # created on an already-dead pid fires an immediate `noproc` DOWN, so the
+    # death is caught at establishment rather than lost. This test kills the
+    # subject inside that exact window and requires the reap plus re-issue.
+    test "a subject that dies during the handoff window is still reaped", %{tenant: tenant} do
+      seed = 71
+      c = Cluster.start(tenant, 3, seed: seed)
+      on_exit(fn -> Cluster.stop(c) end)
+
+      {_node, leader_name} = Cluster.leader(c)
+      [follower | _] = Enum.reject(Cluster.alive(c), &(&1 == leader_name))
+
+      subject = spawn_live()
+      :yes = :dgen_registry.register_name({follower, :handoff_orphan}, subject)
+
+      assert eventually(fn ->
+               Map.get(Cluster.bindings(follower), :handoff_orphan) == subject
+             end)
+
+      # Kill the leader, then the subject immediately — before the new leader's
+      # monitor sweep can possibly have reached it.
+      c = Cluster.crash(c, leader_name)
+      Process.exit(subject, :kill)
+
+      assert eventually(fn ->
+               case Cluster.leader(c) do
+                 nil -> false
+                 {_n, name} -> name != leader_name and name in Cluster.alive(c)
+               end
+             end),
+             "no new leader was elected after the leader was lost"
+
+      # The dead subject's binding must be reaped — driven by the sweep's noproc
+      # DOWN, since nothing else is watching this pid.
+      assert eventually(
+               fn -> :dgen_registry.whereis_name({follower, :handoff_orphan}) == :undefined end,
+               15_000
+             ),
+             "the dead subject's binding was never reaped — the deferred monitor " <>
+               "sweep lost a death that occurred inside the handoff window"
+
+      # And the name is re-issuable to a live pid — the uniqueness verdict sees
+      # the reaped state, not the stale binding.
+      successor = spawn_live()
+      assert :yes == :dgen_registry.register_name({follower, :handoff_orphan}, successor)
+
+      assert_always!(c, seed)
+    end
+
     test "a crashed member rejoins fresh and re-syncs the full replica", %{tenant: tenant} do
       seed = 33
       c = Cluster.start(tenant, 3, seed: seed)

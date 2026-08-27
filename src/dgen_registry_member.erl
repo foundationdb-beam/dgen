@@ -159,11 +159,15 @@
 %% Assumed when the elector calls `{elector_assume_and_distribute, …}`.  On a genuine
 %% leadership change the member reconstructs its names map by gathering the freshest of
 %% every reachable member's replica — the freshest map *is* the reconstructed state
-%% (there is no durable taken-set to reconcile against, §4.4), then sets up
-%% `erlang:monitor/2` for every entry and distributes `{apply_names_snapshot}` casts to
-%% all followers from its own process (same sender as future `{names_batch}`
-%% broadcasts — see elector moduledoc for the FIFO ordering guarantee).  Any stale Pid
-%% entries are removed when their DOWN signals arrive.
+%% (there is no durable taken-set to reconcile against, §4.4), then distributes
+%% `{apply_names_snapshot}` casts to all followers from its own process (same sender as
+%% future `{names_batch}` broadcasts — see elector moduledoc for the FIFO ordering
+%% guarantee).  Monitors for the registered pids are established by a chunked,
+%% deferred sweep off the client-visible window (see `{monitor_sweep, …}` /
+%% assume_leadership/1) — safe because a monitor on an already-dead pid fires an
+%% immediate `noproc` DOWN, so a death inside the window is caught at establishment
+%% rather than lost.  Any stale Pid entries are removed when their DOWN signals
+%% arrive.
 %%
 %% The gather is a **network** fan-out (an RPC per peer, bounded by ?GATHER_TIMEOUT), so
 %% it runs **off the member's loop**: the elector's assume call is answered `ok`
@@ -307,6 +311,12 @@
 %% How long a follower waits after requesting a resync (it observed a gap in the
 %% leader's broadcast stream) before it may request again.
 -define(RESYNC_RETRY, 2000).
+
+%% Names monitored per {monitor_sweep, …} step when a new leader establishes its
+%% registered-process monitors (see assume_leadership/1).  ~0.7us per monitor, so a
+%% chunk costs a few ms of loop time — small enough to interleave with live traffic,
+%% large enough that a 200k-name sweep is ~40 messages.
+-define(MONITOR_SWEEP_CHUNK, 5000).
 
 %% How often the leader broadcasts an **empty** batch stamped at its current applied
 %% version — a replication heartbeat.
@@ -501,8 +511,10 @@
     members :: #{dgen_registry_elector:member_id() => reference()},
     monitors :: #{reference() => dgen_registry_elector:member_id()},
     %% Registered-process monitors (leader only)
+    %% The registered-process monitors (leader only): Name => monitor ref.  There
+    %% is deliberately no reverse map — each monitor carries `{tag, {down, Name}}`
+    %% (erlang:monitor/3), so its DOWN arrives already naming the binding.
     name_to_ref :: #{term() => reference()},
-    ref_to_name :: #{reference() => term()},
     %% Follower-only: calls forwarded to the leader and awaiting their reply, keyed by
     %% the Ref the leader echoes back (`register` / `set_meta` / `unregister` kinds —
     %% see the pending_forward() type).  One map for all three, so there is a single
@@ -723,7 +735,6 @@ init(#{name := Name, tenant := Tenant, tuid := Tuid} = Args) ->
             members = #{},
             monitors = #{},
             name_to_ref = #{},
-            ref_to_name = #{},
             pending_forwards = #{},
             deferred_yes = [],
             pending_unregs = [],
@@ -1467,28 +1478,28 @@ handle_info(
 ) ->
     State1 = salvage_failed_plan(reject_plan(Plan, State), Plan),
     {noreply, maybe_start_commit(State1#state{committing = undefined})};
+%% A registered process died (leader only).  The monitor was created with
+%% `{tag, {down, Name}}` (erlang:monitor/3), so the death arrives already naming
+%% its binding — no reverse ref map to consult (or to build n entries of at every
+%% leadership assumption).  Park the auto-unregister in the group-commit buffer,
+%% carrying Ref so the flush can apply the ref-match guard (a stale DOWN for a
+%% name already re-registered must not evict the new binding).  If we have since
+%% lost leadership the flush drops it and the new leader, which monitors this pid
+%% itself, drives the removal.
+handle_info({{down, LogicalName}, Ref, process, _Pid, _Reason}, State) ->
+    {noreply, enqueue_op({down, LogicalName, Ref}, State)};
 handle_info({'DOWN', Ref, process, _Pid, _Reason}, State) ->
     #state{
         monitors = Monitors,
-        ref_to_name = RefToName,
         elector = Elector,
         member_id = Self
     } = State,
     case maps:get(Ref, Monitors, undefined) of
         undefined ->
-            %% Not a peer-member monitor — registered-process monitor (leader only).
-            case maps:get(Ref, RefToName, undefined) of
-                undefined ->
-                    {noreply, State};
-                LogicalName ->
-                    %% Park the auto-unregister in the group-commit buffer, carrying
-                    %% Ref so the flush can apply the ref-match guard (a stale DOWN
-                    %% for a name already re-registered must not evict the new
-                    %% binding).  If we have since lost leadership the flush drops it
-                    %% and the new leader, which monitors this pid itself, drives the
-                    %% removal.
-                    {noreply, enqueue_op({down, LogicalName, Ref}, State)}
-            end;
+            %% Not a peer-member monitor, and registered-process monitors carry a
+            %% `{down, Name}` tag (previous clause) — an untagged unknown DOWN is
+            %% a late straggler from a monitor already demonitored.  Ignore.
+            {noreply, State};
         Self ->
             %% Stale self-monitor — should not happen, ignore.
             {noreply, State};
@@ -1748,6 +1759,54 @@ handle_info(replica_heartbeat, State) ->
     {noreply, State};
 %% (broadcast_heartbeat/1, the leader clause's advertisement above, is defined
 %% beside broadcast_batch/5's MUTATION ifdef — it is itself mutation-planted.)
+%%
+%% The deferred monitor-establishment sweep (see assume_leadership/1): one chunk of
+%% the names table per message, so live traffic interleaves.  Three guards make it
+%% safe against everything that can move underneath it:
+%%   - the head fences on `leader =:= Self` AND the arming epoch, so deposition or
+%%     a newer assume strands stale steps at the fallthrough clause;
+%%   - a name already in name_to_ref is skipped — a registration committed since
+%%     the sweep began was monitored by apply_monitor_ops on its own commit;
+%%   - each pair is re-checked against the live table, so a name unregistered or
+%%     re-bound since its chunk was selected is skipped rather than monitored
+%%     against a stale pid (ETS select continuations are safe under concurrent
+%%     writes but see each object as of its own chunk).
+%% A monitored pid that died before its chunk arrived fires an immediate `noproc`
+%% DOWN, which is the property that makes deferral lose nothing.
+handle_info(
+    {monitor_sweep, Epoch, Cont0},
+    State = #state{member_id = Self, leader = Self, epoch = Epoch, names_tab = Tab}
+) ->
+    Select =
+        case Cont0 of
+            start ->
+                ets:select(Tab, [{{'$1', '$2', '_', '_'}, [], [{{'$1', '$2'}}]}], ?MONITOR_SWEEP_CHUNK);
+            _ ->
+                ets:select(Cont0)
+        end,
+    case Select of
+        '$end_of_table' ->
+            {noreply, State};
+        {Pairs, Cont1} ->
+            NTR1 =
+                lists:foldl(
+                    fun({Name, Pid}, Acc) ->
+                        case is_map_key(Name, Acc) orelse lookup_name(Tab, Name) =/= Pid of
+                            true -> Acc;
+                            false -> Acc#{Name => monitor_name(Name, Pid)}
+                        end
+                    end,
+                    State#state.name_to_ref,
+                    Pairs
+                ),
+            self() ! {monitor_sweep, Epoch, Cont1},
+            {noreply, State#state{name_to_ref = NTR1}}
+    end;
+handle_info({monitor_sweep, _Epoch, _Cont}, State) ->
+    %% Superseded — deposed, or a newer assume (higher epoch) owns monitoring now.
+    %% Whatever monitors this sweep did create were demonitored by
+    %% relinquish_leadership on the way out.
+    {noreply, State};
 %% Re-drive the destructive ops of a batch that failed to commit (see
 %% salvage_failed_plan): re-enqueue them if we are (still) the leader, or forward
 %% the pid-guarded clears to the current leader if we were deposed — so an
@@ -1835,32 +1894,27 @@ do_leader_changed(NewLeader, OldLeader, Self, State0) ->
             State#state{leader = NewLeader}
     end.
 
-%% Set up process monitors for every entry in the current names map.
-%% Any stale Pid entries (processes that died while this node was a follower)
-%% will self-correct when their DOWN signals arrive.  This is an O(n) table scan, but
-%% it runs once per leadership transition — a rare event that already does other O(n)
-%% work in the same call chain (the handoff gather, records_replace, index_rebuild) — so
-%% it is not the hot path the commit-plan seed is (see plan_batch/maybe_start_commit).
-assume_leadership(State = #state{names_tab = Tab}) ->
-    %% One pass over the table, straight into the two ref maps — no intermediate
-    %% records map and no pid projection.  This used to be
-    %% `record_pids(current_records(Tab))`, i.e. materialize the whole replica as
-    %% a map and then project it to pids, both thrown away immediately; measured
-    %% at 200k names those two allocations were ~115ms of the client-visible
-    %% handoff window (map materialization is ~0.4us/name, the projection
-    %% ~0.16us/name — see bench/registry_election_latency.exs).
-    {NTR, RTN} = ets:foldl(
-        fun({LogicalName, Pid, _Index, _Data}, {NTRAcc, RTNAcc}) ->
-            Ref = erlang:monitor(process, Pid),
-            {NTRAcc#{LogicalName => Ref}, RTNAcc#{Ref => LogicalName}}
-        end,
-        {#{}, #{}},
-        Tab
-    ),
+%% Become leader WITHOUT establishing the registered-process monitors inline: the
+%% sweep that creates them (~0.7us per monitor — 130ms+ of client-visible handoff
+%% window at 200k names) is deferred to chunked {monitor_sweep, …} self-sends that
+%% interleave with live traffic.  Correct, not just faster, because monitor
+%% creation is self-healing for past deaths: a monitor on an already-dead pid
+%% fires an immediate `noproc` DOWN (and `noconnection` for an unreachable one),
+%% so a subject that dies before its chunk arrives is caught at establishment,
+%% never lost.  The observable cost is a slightly longer window in which a dead
+%% pid's name reads as bound — a lag that is already legal and asynchronous
+%% (dead-pid cleanup has no promptness bound; see the design's Non-goals and the
+%% sim invariants' `dead_ok?`).  No safety invariant references monitor timing.
+%%
+%% The sweep is epoch-fenced: each step re-checks `leader =:= Self` and the epoch
+%% it was armed under, so deposition (or a newer assume) strands stale steps
+%% harmlessly — the same supersession discipline as `assume_ref`.
+assume_leadership(State = #state{epoch = Epoch}) ->
+    self() ! {monitor_sweep, Epoch, start},
     %% Seed each subscription's watch-set membership from the reconstructed replica, so
     %% the first commit under this leadership computes its deltas against the true
     %% current state (§4.9).  Leader-only derived state — a follower never reads it.
-    recompute_sub_matches(State#state{name_to_ref = NTR, ref_to_name = RTN}).
+    recompute_sub_matches(State).
 
 %% Recompute every subscription's watch-set and notify-set membership
 %% (`#{SubId => #{Name => Pid}}` each) by running its watch/notify queries against the
@@ -1889,7 +1943,7 @@ relinquish_leadership(State = #state{name_to_ref = NTR}) ->
         end,
         NTR
     ),
-    State#state{name_to_ref = #{}, ref_to_name = #{}, last_version = undefined}.
+    State#state{name_to_ref = #{}, last_version = undefined}.
 
 %% Gather every reachable member's names map across this (assuming) leader's own
 %% replica and every other reachable member.  Because the leader's broadcasts are
@@ -2510,7 +2564,6 @@ apply_committed_plan(Plan, Version, State) ->
     #state{
         member_id = Self,
         name_to_ref = NTR0,
-        ref_to_name = RTN0,
         members = Members,
         recently_released = Rel0,
         applied_version = PrevVersion
@@ -2519,7 +2572,7 @@ apply_committed_plan(Plan, Version, State) ->
     %% names in DBOp are touched, so a concurrent optimistic unregister of an untouched
     %% name (already removed from the table) is never clobbered.
     State0 = apply_dbop(State, DBOp, WNames, WMeta),
-    {NTR1, RTN1} = apply_monitor_ops(DBOp, WNames, NTR0, RTN0),
+    NTR1 = apply_monitor_ops(DBOp, WNames, NTR0),
     %% Replicate to followers first, so the replicate_sync below (FIFO behind it)
     %% is seen by a follower only after it already holds the batch's bindings.
     %%
@@ -2545,7 +2598,6 @@ apply_committed_plan(Plan, Version, State) ->
     Rel1 = lists:foldl(fun(NamePid, Acc) -> Acc#{NamePid => Now} end, Rel0, Released),
     State1 = State0#state{
         name_to_ref = NTR1,
-        ref_to_name = RTN1,
         last_version = Version,
         applied_version = Version,
         recently_released = Rel1
@@ -3241,21 +3293,21 @@ unreg_reply(Origin, Rs) -> [{Origin, ok} | Rs].
 %% Apply the durable delta's monitor side effects: for a clear, demonitor the name's
 %% prior ref; for a set (new/changed binding), demonitor the old ref and monitor the
 %% new pid; for a meta (metadata-only update), leave the existing monitor untouched (the
-%% pid is unchanged).  Returns the updated name_to_ref / ref_to_name maps.
-apply_monitor_ops(DBOp, WNames, NTR, RTN) ->
+%% pid is unchanged).  Monitors carry `{tag, {down, Name}}`, so the DOWN names its
+%% binding and no reverse ref map exists.  Returns the updated name_to_ref map.
+apply_monitor_ops(DBOp, WNames, NTR) ->
     maps:fold(
         fun
             (_Name, {meta, _PidNode}, Acc) ->
                 Acc;
-            (Name, clear, {NTRacc, RTNacc}) ->
-                demonitor_name(Name, NTRacc, RTNacc);
-            (Name, {set, _PidNode}, {NTRacc, RTNacc}) ->
-                {NTR1, RTN1} = demonitor_name(Name, NTRacc, RTNacc),
+            (Name, clear, NTRacc) ->
+                demonitor_name(Name, NTRacc);
+            (Name, {set, _PidNode}, NTRacc) ->
+                NTR1 = demonitor_name(Name, NTRacc),
                 Pid = maps:get(Name, WNames),
-                Ref = erlang:monitor(process, Pid),
-                {NTR1#{Name => Ref}, RTN1#{Ref => Name}}
+                NTR1#{Name => monitor_name(Name, Pid)}
         end,
-        {NTR, RTN},
+        NTR,
         DBOp
     ).
 
@@ -3905,14 +3957,20 @@ remove_member(MemberId, State = #state{members = Members, monitors = Monitors}) 
             }
     end.
 
-demonitor_name(LogicalName, NTR, RTN) ->
+demonitor_name(LogicalName, NTR) ->
     case maps:get(LogicalName, NTR, undefined) of
         undefined ->
-            {NTR, RTN};
+            NTR;
         OldRef ->
             erlang:demonitor(OldRef, [flush]),
-            {maps:remove(LogicalName, NTR), maps:remove(OldRef, RTN)}
+            maps:remove(LogicalName, NTR)
     end.
+
+%% The one place a registered-process monitor is created.  The tag makes the DOWN
+%% self-describing ({{down, Name}, Ref, …}); the flush-on-demonitor elsewhere
+%% covers tagged messages exactly as it covers 'DOWN' ones.
+monitor_name(Name, Pid) ->
+    erlang:monitor(process, Pid, [{tag, {down, Name}}]).
 
 %% Returns the list of member IDs to add as monitors for a given member during
 %% a join/member_down leadership transition.

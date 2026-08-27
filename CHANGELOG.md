@@ -42,7 +42,18 @@
   so every wire shape — old and new — normalizes; the tolerant decoder ships
   with the new sender, as with the map→binary switch before it. Worth ~3-5%
   more off the serial election window, and halves the stall a snapshot-serving
-  member's loop takes (~156ms → ~70ms at 200k).
+  member's loop takes (~156ms → ~70ms at 200k). A third round removes the
+  monitor storm from the window: registered-process monitors carry
+  `{tag, {down, Name}}` (`erlang:monitor/3`), so their DOWNs are
+  self-describing and the n-entry reverse ref map is gone from member state —
+  and a new leader establishes monitors via a chunked, epoch-fenced
+  `{monitor_sweep, …}` after it is ready, off the client-visible window.
+  Deferral is safe because a monitor on an already-dead pid fires an immediate
+  `noproc` DOWN (a death inside the window is caught at establishment, never
+  lost; dead-pid cleanup lag is already asynchronous by contract), pinned by a
+  regression that kills a subject inside the handoff window and requires the
+  reap. Cumulative kill→first-`yes` at 200k names: ~940ms originally →
+  ~450-490ms.
 
 - **Formal layers hardened and aligned.** The TLA+ model now covers the
   replication heartbeat (bounded to one in flight per leader) and splits the
