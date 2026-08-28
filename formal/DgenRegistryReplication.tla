@@ -26,8 +26,13 @@ CONSTANTS
     MaxChanLen,         \* state constraint on channel length, e.g. 2
     VersionGuardedAck,  \* TRUE = current code; FALSE = pre-guard bug (mutation)
     DegradeOpen,        \* FALSE = strict_replication; TRUE = degrade-open (mutation)
-    SafeAssume,         \* TRUE = fixed code (version-key-fenced handoff + monotonic
-                        \* snapshot); FALSE = the pre-fix handoff-gather race (mutation)
+    Heartbeat,          \* TRUE = the leader's periodic empty batch (the shipped
+                        \* quiescent-gap-detection mechanism); FALSE omits it
+    \* The §5.7 handoff fix is TWO guards, split so each can be mutated alone:
+    SafeAssumeGather,   \* TRUE = the assuming leader's gather is fenced against the
+                        \* durable version key; FALSE = the pre-fix stale gather
+    SafeAssumeSnap,     \* TRUE = snapshot apply is version-monotonic; FALSE = the
+                        \* pre-fix epoch-only guard (a stale snapshot can rewind)
     NoPid, NoMember     \* model values
 
 ASSUME NoPid \notin Pids
@@ -81,6 +86,7 @@ MaxOf(S) == CHOOSE x \in S : \A y \in S : x >= y
 Msg ==
        [type : {"bcast"}, name : Names, pid : Pids,
         epoch : 0..MaxEpoch, prev : Versions, ver : Versions]
+  \cup [type : {"hb"},    epoch : 0..MaxEpoch, ver : Versions]
   \cup [type : {"reply"}, name : Names, pid : Pids, ver : Versions]
   \cup [type : {"sync"},  ver : Versions]
   \cup [type : {"ack"},   ver : Versions]
@@ -134,10 +140,10 @@ Elect(m) ==
 \* acks are rejected and pending direct acks resolved-as-rejected, matching
 \* do_leader_changed/reject_forwards; then snapshots fan out to every other
 \* live member from this process (FIFO with later broadcasts).
-\* THE FIX (SafeAssume): the assuming leader must not reconstruct from a gather
-\* that is behind the durable version key.  `maxV` is the freshest applied_version
-\* any live member reports; `dbVersion` is the committed frontier (the version
-\* key, §4.4).  A live member can never be ahead of the frontier, so
+\* THE FIX, first half (SafeAssumeGather): the assuming leader must not reconstruct
+\* from a gather that is behind the durable version key.  `maxV` is the freshest
+\* applied_version any live member reports; `dbVersion` is the committed frontier
+\* (the version key, §4.4).  A live member can never be ahead of the frontier, so
 \* `maxV >= dbVersion` means "the freshest live member has applied every committed
 \* batch" — only then does its replica equal the true current map, so freshest-wins
 \* is sound.  Without this guard, a gather that races an in-flight (committed but
@@ -152,7 +158,7 @@ AssumeGather(m) ==
     /\ dbLeader = m
     /\ epoch[m] < dbEpoch
     /\ LET maxV == MaxOf({appliedVer[x] : x \in Live})
-       IN /\ (SafeAssume => maxV >= dbVersion)
+       IN /\ (SafeAssumeGather => maxV >= dbVersion)
           /\ \E src \in Live :
             /\ appliedVer[src] = maxV
             /\ rep' = [rep EXCEPT ![m] = rep[src]]
@@ -243,16 +249,22 @@ RegisterDirect(l, n, p) ==
 (* Broadcast delivery — mirrors apply_bcast/6 case for case                *)
 (***************************************************************************)
 
-\* Contiguous (prev = applied, or another message of the batch we are at):
-\* apply the row, advance applied_version (bump_applied), flush any deferred
-\* acks the advance releases (flush_deferred), cancel an outstanding resync.
+\* Contiguous (prev = applied): apply the row, advance applied_version
+\* (bump_applied), flush any deferred acks the advance releases
+\* (flush_deferred), cancel an outstanding resync.  Matches the shipped
+\* apply_bcast/6 case for case: since a batch ships as ONE message per commit
+\* version, `PrevV =:= Applied` is the only apply clause — a re-delivered
+\* duplicate falls to the `V =< Applied` drop below, exactly as in the code
+\* (the old `m.ver = appliedVer[f]` apply disjunct modeled the pre-fix
+\* multi-message batches and was dead in every config; see formal/README.md,
+\* "A closed abstraction gap").
 RecvBcastApply(s, f) ==
     /\ alive[f]
     /\ HeadIs(s, f, "bcast")
     /\ LET m == Head(chan[s][f]) IN
        /\ m.epoch >= epoch[f]
-       /\ (m.prev = appliedVer[f] \/ m.ver = appliedVer[f])
-       /\ LET newV    == IF m.ver > appliedVer[f] THEN m.ver ELSE appliedVer[f]
+       /\ m.prev = appliedVer[f]
+       /\ LET newV    == m.ver
               flushed == {d \in deferred[f] : d[3] <= newV}
           IN /\ rep' = [rep EXCEPT ![f][m.name] = m.pid]
              /\ appliedVer' = [appliedVer EXCEPT ![f] = newV]
@@ -271,7 +283,7 @@ RecvBcastDrop(s, f) ==
     /\ LET m == Head(chan[s][f]) IN
        \/ m.epoch < epoch[f]
        \/ /\ m.epoch >= epoch[f]
-          /\ m.prev # appliedVer[f] /\ m.ver # appliedVer[f]
+          /\ m.prev # appliedVer[f]
           /\ m.ver <= appliedVer[f]
     /\ chan' = Consume(s, f)
     /\ UNCHANGED <<dbLeader, dbEpoch, dbVersion, histMap, acked, crashes,
@@ -285,11 +297,66 @@ RecvBcastGap(s, f) ==
     /\ HeadIs(s, f, "bcast")
     /\ LET m == Head(chan[s][f]) IN
        /\ m.epoch >= epoch[f]
-       /\ m.prev # appliedVer[f] /\ m.ver # appliedVer[f]
+       /\ m.prev # appliedVer[f]
        /\ m.ver > appliedVer[f]
     /\ chan' = Consume(s, f)
     /\ resyncReq' = [resyncReq EXCEPT ![f] =
                        IF @ = NoMember THEN s ELSE @]
+    /\ UNCHANGED <<dbLeader, dbEpoch, dbVersion, histMap, acked, crashes,
+                   alive, rep, appliedVer, epoch, leaderView, deferred,
+                   pendingAcks>>
+
+(***************************************************************************)
+(* The heartbeat — the leader's periodic empty batch                       *)
+(***************************************************************************)
+
+\* {names_batch, [], Epoch, Applied, Applied, Self} every heartbeat interval:
+\* the traffic-independent gap reveal that fixed "a quiescent cluster stays
+\* diverged" (sim README, finding 2).  Guarded exactly like the code's
+\* `leader = Self` — which a deposed-but-uninformed leader still passes, so a
+\* stale heartbeat reaching a follower is a reachable state here and its
+\* harmlessness is CHECKED rather than assumed.
+\*
+\* At most ONE of this leader's heartbeats in flight anywhere: the interval
+\* (5s) dwarfs delivery, so bursts of the same advertisement are not real
+\* behavior, only a state-space multiplier — unconstrained, TLC blew past 60M
+\* distinct states without finishing; constrained, the full config completes.
+\* One in flight is enough to model everything a heartbeat can do, including
+\* the stale deposed-leader send.
+NoHbInFlight(l) ==
+    \A r \in Members : \A i \in 1..Len(chan[l][r]) : chan[l][r][i].type # "hb"
+
+HeartbeatBcast(l) ==
+    /\ Heartbeat
+    /\ alive[l]
+    /\ leaderView[l] = l
+    /\ NoHbInFlight(l)
+    /\ LET h == [type |-> "hb", epoch |-> epoch[l], ver |-> appliedVer[l]]
+       IN chan' = [chan EXCEPT ![l] =
+            [r \in Members |->
+               IF r = l \/ ~alive[r] THEN chan[l][r]
+               ELSE Append(chan[l][r], h)]]
+    /\ UNCHANGED <<dbLeader, dbEpoch, dbVersion, histMap, acked, crashes,
+                   alive, rep, appliedVer, epoch, leaderView, deferred,
+                   pendingAcks, resyncReq>>
+
+\* Receipt mirrors apply_bcast/6 on an empty batch with PrevV = Version:
+\* caught-up (ver = applied) takes the apply clause, which applies no rows and
+\* re-bumps to the same version — observably just cancel_resync (flush_deferred
+\* releases nothing: every deferred ack at or below applied was flushed when
+\* applied got there).  Behind (ver > applied) is a gap: the reveal this
+\* mechanism exists for.  Stale epoch, or ver < applied, drops.
+RecvHeartbeat(s, f) ==
+    /\ alive[f]
+    /\ HeadIs(s, f, "hb")
+    /\ LET m == Head(chan[s][f]) IN
+       /\ chan' = Consume(s, f)
+       /\ IF m.epoch >= epoch[f] /\ m.ver = appliedVer[f]
+          THEN resyncReq' = [resyncReq EXCEPT ![f] = NoMember]
+          ELSE IF m.epoch >= epoch[f] /\ m.ver > appliedVer[f]
+          THEN resyncReq' = [resyncReq EXCEPT ![f] =
+                               IF @ = NoMember THEN s ELSE @]
+          ELSE UNCHANGED resyncReq
     /\ UNCHANGED <<dbLeader, dbEpoch, dbVersion, histMap, acked, crashes,
                    alive, rep, appliedVer, epoch, leaderView, deferred,
                    pendingAcks>>
@@ -348,8 +415,9 @@ RecvSync(s, f) ==
                    pendingAcks, resyncReq>>
 
 \* With register_replicas = 1 the first distinct follower ack resolves the
-\* batch (the distinct-follower counting in the code only matters for
-\* register_replicas > 1 — note it in README as a v2 extension).
+\* batch.  The distinct-follower counting in the code only matters for
+\* register_replicas > 1, which this model does not cover (README, "Deliberately
+\* out of scope").
 RecvAck(s, l) ==
     /\ alive[l]
     /\ HeadIs(s, l, "ack")
@@ -387,24 +455,25 @@ DegradeTimeout(l) ==
 \* on a same-leader snapshot (a resync) the version advance releases them
 \* (flush_deferred).  A member that believed it led relinquishes.
 \*
-\* THE FIX (SafeAssume), second half: the re-baseline must be version-monotonic
+\* THE FIX, second half (SafeAssumeSnap): the re-baseline must be version-monotonic
 \* — a snapshot may not move a follower BACKWARD in applied_version.  The pre-fix
 \* code guarded only on epoch, so a stale snapshot (an old assume/resync snapshot
 \* delivered late, after the follower already applied a newer broadcast) would
 \* wholesale-overwrite the follower back to older state, silently dropping a row
-\* it — or a peer — had already acked.  With SafeAssume the apply requires
+\* it — or a peer — had already acked.  With SafeAssumeSnap the apply requires
 \* `m.ver >= appliedVer[f]`.  This is sound with the AssumeGather guard above:
 \* a legitimate new leader is caught up (its snapshot's version is >= the durable
 \* frontier >= any follower's applied_version), and a legitimate resync only ever
 \* moves a gapped follower FORWARD, so the guard rejects only genuinely stale
-\* snapshots.  In the real code: add a version check beside the `Epoch >= CurrentEpoch`
-\* check in handle_cast({apply_names_snapshot, ...}).
+\* snapshots.  In the real code this is the `Version >= CurrentVersion` conjunct
+\* beside `Epoch >= CurrentEpoch` in handle_cast({apply_names_snapshot, ...})
+\* (dgen_registry_member.erl) — shipped.
 RecvSnap(s, f) ==
     /\ alive[f]
     /\ HeadIs(s, f, "snap")
     /\ LET m == Head(chan[s][f]) IN
        /\ chan' = Consume(s, f)
-       /\ IF m.epoch >= epoch[f] /\ (SafeAssume => m.ver >= appliedVer[f])
+       /\ IF m.epoch >= epoch[f] /\ (SafeAssumeSnap => m.ver >= appliedVer[f])
           THEN LET changed == leaderView[f] # m.ldr
                    flushed == IF changed THEN {}
                               ELSE {d \in deferred[f] : d[3] <= m.ver}
@@ -483,12 +552,14 @@ DropMsg(s, r) ==
 
 Next ==
     \/ \E m \in Members :
-         Elect(m) \/ AssumeGather(m) \/ Crash(m) \/ DegradeTimeout(m)
+         \/ Elect(m) \/ AssumeGather(m) \/ Crash(m) \/ DegradeTimeout(m)
+         \/ HeartbeatBcast(m)
     \/ \E l \in Members, n \in Names, p \in Pids :
          \/ RegisterDirect(l, n, p)
          \/ \E f \in Members : RegisterForward(f, l, n, p)
     \/ \E s \in Members, r \in Members :
          \/ RecvBcastApply(s, r) \/ RecvBcastDrop(s, r) \/ RecvBcastGap(s, r)
+         \/ RecvHeartbeat(s, r)
          \/ RecvReply(s, r) \/ RecvSync(s, r) \/ RecvAck(s, r)
          \/ RecvSnap(s, r) \/ ServeResync(s, r) \/ DropMsg(s, r)
 
@@ -547,6 +618,14 @@ LeaderEpochUnique ==
     \A m1 \in Live : \A m2 \in Live :
       (m1 # m2 /\ leaderView[m1] = m1 /\ leaderView[m2] = m2)
         => epoch[m1] # epoch[m2]
+
+\* NOT an invariant — a reachability canary.  Every safety invariant above is
+\* vacuously satisfied by a protocol that never acks anyone, so the AckReachable
+\* config asserts this as an INVARIANT and MUST FAIL: TLC finding a counterexample
+\* is machine-checked proof that `acked` is populated through the main config's
+\* own (unmutated) guards.  If that config ever starts passing, the model has
+\* gone quiet — every other green run means much less.
+NoAcks == acked = {}
 
 (***************************************************************************)
 (* Model-checking bounds                                                   *)

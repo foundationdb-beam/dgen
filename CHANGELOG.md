@@ -2,215 +2,187 @@
 
 ## v0.4.1 (TBD)
 
+### Bug fixes
+
+- **`dgen_registry` — an unregister could destroy a binding it never targeted.**
+  A register parked behind an in-flight commit planned against the leader's
+  optimistically-emptied table and was acked `yes` while the previous holder's
+  registration still stood; the unregister's `remove` op then cleared the name
+  unconditionally, deleting the new holder. One unregister freed the name twice
+  (Guarantees 1 and 4 both violated), with no fault required — ordinary
+  register/unregister concurrency sufficed. The remove is now pid-guarded against
+  the current holder. Found by the simulation harness's new end-of-run
+  ack-history invariant (`test/support/sim/README.md`, finding 7).
+
+- **DST harness — `dgen_registry:await_ready/2` wedged the deterministic
+  suite.** Its poll loop's transformed `timer:sleep` ran in the eta driver
+  process, arming a virtual deadline nothing could reach; the readiness poll
+  now runs on the real clock via transform-free `dgen_utils` helpers.
+
 ### Enhancements
 
-- **`dgen_registry` — delegable distribution connectivity (`connectivity` option).**
-  Each registry runs a `connector` process that keeps the Erlang-distribution mesh in
-  step with membership. Meshing is a *node-level* concern (distribution is one shared set
-  of TCP links), but a node hosting many registries — an explicitly supported pattern,
-  e.g. one registry per tenant (§4.8) — runs one connector per registry, each doing its
-  own periodic durable `get_members` read and `connect_node` sweep. That work scales with
-  the number of registries on the node, not the cluster size.
+- **`dgen_registry_member` is a `gen_statem`.** Four states — `searching`,
+  `assuming`, `leader`, `follower` — derived as a projection of the role
+  fields in Data (so the projection cannot drift), with the leadership
+  lifecycle on state-enter calls: entering `leader` seeds subscriptions and
+  arms the monitor sweep, leaving it demonitors — no transition path can
+  forget half the pair. The handoff-gather continuation is valid only in
+  `assuming`, so a superseded gather is a visible state mismatch. Ported in
+  three fully-gated phases (behaviour swap, derived states + hoisted
+  dispatch, enter-call lifecycle); every phase landed with the full suite,
+  both determinism ratchets, both planted mutations, and the election bench
+  unchanged — the pinned mutation fixture replays without regeneration.
+  Execution amended the plan twice, deliberately: gap/resync and leader
+  reachability stay data, not state (both proved orthogonal to role — a
+  deposed-but-uninformed leader can be gapped, and an unreachable leader is a
+  link property), and the register/unregister stashes stay over gen_statem
+  `postpone` (the CP contract answers `ok` immediately where postpone would
+  defer the reply, and stash intents also originate from batch salvage, which
+  is not an event). Behavior is intended to be observably identical; the one
+  external shape change is `sys:get_state/1` returning `{State, Data}`.
 
-  The new per-registry `connectivity` option lets you collapse the duplication by hand:
+- **`dgen_registry` — leadership-handoff map allocations cut (~22% faster
+  client-visible election window).** The assume path materialized the replica
+  as fresh n-entry Erlang maps at least eight times; profiling
+  (`bench/registry_election_latency.exs`) attributed ~52% of the O(names)
+  handoff cost to that churn, with ETS writes under 5%. Now:
+  `detect_conflicts/3` compares records maps in place and allocates only for
+  divergent names (the all-agree handoff allocates nothing);
+  `resolve_conflicts` operates on the freshest records map directly, so the
+  no-conflict reconstruction passes it through by reference (the
+  `maps:keys` + `maps:with` identity projection is gone); and
+  `assume_leadership` folds the ETS table straight into its monitor-ref maps.
+  Measured kill→first-`yes` at 200k names: ~940ms → ~740ms (~3.1µs/name,
+  from ~4.2). A follow-up trims the snapshot codec: the "serve my replica"
+  sites (gather reply, resync serve, joiner snapshot) encode a pair list
+  folded straight off the ETS table (`encode_table/1` — no records-map
+  materialization; there is no native ETS→binary dump), and snapshot blobs
+  compress at zlib level 1 (encode 60ms → 37ms at 200k for ~40% more wire
+  bytes, still ~1MB). `decode_records/1` re-dispatches on the blob's contents,
+  so every wire shape — old and new — normalizes; the tolerant decoder ships
+  with the new sender, as with the map→binary switch before it. Worth ~3-5%
+  more off the serial election window, and halves the stall a snapshot-serving
+  member's loop takes (~156ms → ~70ms at 200k). A third round removes the
+  monitor storm from the window: registered-process monitors carry
+  `{tag, {down, Name}}` (`erlang:monitor/3`), so their DOWNs are
+  self-describing and the n-entry reverse ref map is gone from member state —
+  and a new leader establishes monitors via a chunked, epoch-fenced
+  `{monitor_sweep, …}` after it is ready, off the client-visible window.
+  Deferral is safe because a monitor on an already-dead pid fires an immediate
+  `noproc` DOWN (a death inside the window is caught at establishment, never
+  lost; dead-pid cleanup lag is already asynchronous by contract), pinned by a
+  regression that kills a subject inside the handoff window and requires the
+  reap. Cumulative kill→first-`yes` at 200k names: ~940ms originally →
+  ~450-490ms.
 
-  - `self_managed` (default) — unchanged: the registry runs its own proactive mesh and is
-    self-sufficient.
-  - `provided_externally` — the proactive mesh is **off** (no `connect_node`, no periodic
-    member-set read). The registry free-rides on the distribution links another registry
-    on the node maintains. The intended shape is one `self_managed` "system" registry
-    spanning every node, with many `provided_externally` "tenant" registries free-riding
-    on it.
+- **Formal layers hardened and aligned.** The TLA+ model now covers the
+  replication heartbeat (bounded to one in flight per leader) and splits the
+  §5.7 fix into its two guards, each proven independently necessary by its own
+  expected-fail config; new configs demonstrate the handoff race's
+  UniqueBinding half, machine-check ack reachability (the vacuity canary), and
+  characterize the *default* degrade-open mode (keeps everything but
+  two-holder durability). The DST harness gains end-of-run ack-history
+  invariants under `eta_run` (UniqueBinding in the spec's cumulative form,
+  acked-presence), a strict-replication leader-crash durability test, a
+  join-mid-workload-under-loss scenario (`Cluster.join/2`) pinning the
+  continuing-leader fast path, and a second planted mutation
+  (`DGEN_MUTATION=quiet_resync`) with its own targeted suite. Guard rails:
+  a plain test run now refuses a build cache still holding a planted
+  mutation, `formal/check.sh` is concurrency-safe (per-run metadir), and CI
+  runs every TLC config, both mutations, and the previously-uncovered
+  deterministic-suite ratchets.
 
-  Only the mesh is delegated; the registry-scoped backstops (leader-liveness probe,
-  stranded-member reap, durable-epoch nudge) stay active in both modes — they cannot be
-  offloaded to another registry. Delegation carries a contract: the provider registry must
-  span a node-superset of the consumer's nodes, or the consumer's node is silently
-  isolated (CP write refusals, §5.3). As a backstop, a `provided_externally` connector that
-  sees no elected leader for a sustained window logs a warning naming the contract. Any
-  value other than `provided_externally` resolves to `self_managed`, so a typo fails safe.
-
-  See `docs/dgen_registry_design.md` §4.6 (rationale and contract) and §8 (configuration).
+- **`dgen_registry` — per-registry `connectivity` option.** `provided_externally`
+  disables a registry's proactive distribution mesh so it can free-ride on the links
+  maintained by a `self_managed` registry on the same node (e.g. one system registry,
+  many tenant registries). Registry-scoped backstops stay active in both modes. The
+  provider must span a node-superset of the consumer's nodes; a sustained no-leader
+  window logs a warning. Unknown values fail safe to `self_managed` (the default).
+  See `docs/dgen_registry_design.md` §4.6 and §8.
 
 ## v0.4.0 (2026-07-12)
 
 ### Enhancements
 
-- **`dgen_registry` — a defined consistency model (Still considered experimental).** The
-  registry now has a precise, documented contract; see `docs/dgen_registry_design.md`
-  for the full design, guarantees, and non-goals. In brief:
+- **`dgen_registry` — a defined consistency model (still experimental).** Full
+  contract in `docs/dgen_registry_design.md`. Highlights:
 
-  - **CP and fenced.** Leadership is an emergent property of the backend: the elected
-    leader is fenced on a leader key, so a node that has lost leadership physically
-    cannot commit a registration — there is no split-brain dual-accept, and the
-    minority side of a partition refuses writes rather than inventing a second owner.
-  - **Single-fault singleton uniqueness.** At most one live process holds a name,
-    preserved across the failure of any single member. Pids are never persisted; the
-    durable footprint is ~2 keys per registry (a leader key and a version
-    counter), independent of how many names are registered.
-  - **Two-holder addressability.** A registration acknowledged `yes` is held by at
-    least two members (a forwarded registration by the leader and the forwarding
-    follower; a direct one by replicate-before-ack), so it survives any single node
-    loss. Tunable per registry via `register_replicas` / `replicate_timeout` /
-    `strict_replication` (default: one replica, degrade-open on timeout with
-    telemetry).
-  - **Dynamic membership with an automatic mesh.** Nodes join by starting the
-    registry and leave by stopping it — no node list to maintain. The registry keeps
-    Erlang distribution in step with membership: given nodes that *can* connect
-    (shared cookie, reachability), `nodes()` converges to every member without an
-    external discovery library.
-  - **Lock-free snapshot reads.** Each member keeps its local name replica in a
-    `protected` ETS table, so `whereis_name/1` resolves a name with an `ets:lookup/2`
-    directly in the *calling* process — no round-trip through the member's mailbox.
-    Many processes read concurrently without queuing behind the member, and the
-    semantics are unchanged (a still-snapshot, eventually-consistent read). The table
-    is recreated empty whenever a member (re)starts, so a read in that brief window
-    returns `undefined`.
-  - **Per-registration metadata.** A registration can carry metadata — an `index` map
-    and an opaque `data` payload — attached at register time (`register_name/3`) or
-    replaced later (`set_metadata/2`), and read back lock-free in the caller
-    (`get_metadata/1`) or authoritatively through the leader
-    (`get_metadata_consistent/1`). Metadata rides the same fenced group-commit pipeline
-    as names, replicates to followers, survives a leadership handoff (freshest wins),
-    and is removed automatically when the process exits or is unregistered — its
-    lifetime is exactly the registration's. See §4.7 of the design doc.
-  - **Indexed metadata queries.** Each member maintains an inverted index over the
-    registrations' `index` maps, so `query/2` (local snapshot) and `query_consistent/2`
-    (leader-authoritative) find every registration matching a conjunction of exact
-    equalities (AND-equal) over indexed attributes, returning `#{name, pid, index, data}`
-    matches. Queries run on the member's mailbox, so they observe a batch-consistent
-    snapshot (never a half-applied commit) at the cost of serialising — a deliberate
-    trade, since single-key reads stay lock-free. An empty constraint map is rejected;
-    `data` is not queryable.
-  - **Durable presence.** A caller registers a *watch*
-    query and a *notify* query under an application-chosen `SubId`; whenever a committed
-    batch changes which processes satisfy the watch query, the registry pushes
-    `{dgen_presence, SubId, Events}` (events `{joined | left, Name, Pid}`) to every process
-    matching the notify query — a live feed built on the one-shot `query/2` (§4.7).
-    Subscribing delivers an initial snapshot of the current watch set, and the feed is
-    correct for every way the set can move: register, unregister, process death, or a
-    `set_metadata` that shifts a row in or out of the query. **Subscriptions are durable**
-    — stored in the elector's backend-backed `dgen_server` state (keyed by `SubId`, an
-    idempotent upsert), so they outlive the whole cluster: an application can tie a
-    subscription to a database entity and have presence come back intact after a
-    scale-to-zero.
-  - **Formally verified replication.** The replication protocol's core safety
-    properties — prefix consistency, unique binding, two-holder durability across
-    a single node failure, and leader-epoch fencing — are checked exhaustively
-    against a TLA+ model of the protocol (`formal/`), not just tested. See
-    `formal/README.md` for how to run the checker and what it covers.
+  - **CP and fenced** — the leader is fenced on a backend key, so a deposed leader
+    cannot commit; no split-brain, minority partitions refuse writes.
+  - **Singleton uniqueness** across any single member failure; pids never persisted
+    (~2 durable keys per registry).
+  - **Two-holder addressability** — an acked registration is held by ≥2 members;
+    tunable via `register_replicas` / `replicate_timeout` / `strict_replication`.
+  - **Dynamic membership with an automatic mesh** — nodes join/leave by
+    starting/stopping the registry; no external discovery.
+  - **Lock-free snapshot reads** — `whereis_name/1` is an `ets:lookup/2` in the
+    calling process (eventually-consistent snapshot; empty briefly after member
+    restart).
+  - **Per-registration metadata** — an `index` map + opaque `data`, set via
+    `register_name/3` / `set_metadata/2`, read via `get_metadata/1` or
+    `get_metadata_consistent/1`; lifetime is exactly the registration's (§4.7).
+  - **Indexed queries** — `query/2` / `query_consistent/2` match AND-equal
+    constraints over indexed attributes against a batch-consistent snapshot.
+  - **Durable presence** — subscriptions (watch + notify queries under a `SubId`)
+    push `{dgen_presence, SubId, Events}` on membership changes; stored durably, so
+    they survive full cluster restarts.
+  - **Formally verified replication** — core safety properties checked against a
+    TLA+ model (`formal/`).
 
-- **`dgen_transaction` (new behaviour).** Owns a single backend transaction in its
-  own process (create → body → commit → retry, with caller-controlled retry
-  semantics), delivering the outcome to an owner. It is the substrate for the
-  registry's non-blocking, cached-GRV group commit.
+- **`dgen_transaction` (new behaviour)** — owns a single backend transaction in its
+  own process with caller-controlled retry; substrate for the registry's group commit.
 
-- **`dgen_server` — `consume_k` fully documented, and inlining disabled when
-  `consume_k > 1`.** The `consume_k` batch-size option is now documented (batch
-  semantics, the throughput/transaction-size trade-off, the single-consumer
-  property). When `consume_k > 1`, opportunistic inline handling of `call`s is
-  disabled so every call rides the durable queue and the batched consume loop —
-  keeping `consume_k` always in effect (and, for the registry, a stable consumer and
-  leader). `priority_call`/`priority_cast` still bypass the queue, as before.
+- **`dgen_server`** — `consume_k` documented; when `consume_k > 1`, inline `call`
+  handling is disabled so batching stays in effect. `priority_call`/`priority_cast`
+  still bypass the queue.
 
 ### Behavioral notes
 
-- **In rare cases, the registry may forcibly terminate a registered process to enforce uniqueness.**
-  Register only processes that can withstand being forcibly killed — supervised and
-  restart-safe, or transient by design. This is intentional (a singleton registry)
-  and configurable (`terminate_on_conflict`, default `true`). See §5.6 of the design
-  doc.
+- **The registry may forcibly kill a registered process to enforce uniqueness.**
+  Register only restart-safe processes. Configurable via `terminate_on_conflict`
+  (default `true`); see §5.6.
 
 ### Breaking changes
 
-- **`dgen_registry:start_link/3` (the `SupName`-embedding variant) is removed.** It
-  was unused and is superseded by the "zero atoms created per registry" change above:
-  the registry's own supervisor is never registered under a name (embedding it under
-  a caller-chosen name doesn't fit a nameless-by-design supervisor). `start_link/2`
-  and the options-map `start_link/3` (`Name, Tenant, Opts`) are unaffected. Callers
-  should hold onto the returned supervisor pid instead of a name.
-- **`dgen_registry:elector_name/1` is removed** in favor of `elector_pid/1`, which
-  returns the elector's current pid via supervisor lookup rather than a registered
-  name (the elector no longer has one). `member_name/1` and `names_table/1` are kept
-  for compatibility but are now identity functions (`member_name(Name) =:= Name`).
-- **`dgen_registry:register_name/2,3` exits on a call timeout instead of answering
-  `no`.** `no` is now strictly an adjudicated verdict (name taken / no leader /
-  leader unreachable); a timeout — where the registration may or may not have
-  committed — propagates as a call exit, matching `global`/`syn`/`gproc`
-  conventions, so a supervisor restarts the caller rather than acting on a wrong
-  "already taken" answer. The bound is configurable via the new `register_timeout`
-  application-environment knob (default `5000` ms; §8 of the design doc).
+- **`dgen_registry:start_link/3` (`SupName` variant) removed** — the registry
+  supervisor is nameless by design; hold the returned pid instead.
+- **`elector_name/1` removed** in favor of `elector_pid/1`; `member_name/1` and
+  `names_table/1` are now identity functions.
+- **`register_name/2,3` exits on call timeout instead of returning `no`** — `no` is
+  now strictly an adjudicated verdict. Timeout configurable via `register_timeout`
+  (default 5000 ms).
 
 ## v0.3.0 (2026-06-17)
 
 ### Enhancements
 
-- **Transactional callback variants** — `handle_cast_tx/3`, `handle_call_tx/4`, and
-  `handle_info_tx/3` are optional callback variants that receive a `tx_ctx()` map as
-  their first argument (`#{td := tenant(), tuid := tuid()}`).  When exported, the `_tx`
-  variant is preferred over the plain variant.  The `td` value is the open backend
-  transaction+directory pair for the current consume cycle, allowing callbacks to read
-  or write arbitrary keys atomically alongside the module-state commit.  The new
-  `tx_ctx/0` type is exported from `dgen_server`.
-
-- **`lock_timeout` option for `dgen_server`** — Sets the maximum milliseconds a
-  distributed lock may be held before other consumers treat it as stale and
-  clear it.  Previously a consumer killed (SIGKILL / VM abort) while holding
-  the lock would block all other consumers permanently if no new messages
-  arrived to trigger a re-check.  With `lock_timeout` set, a backstop timer is
-  scheduled whenever a live lock is observed: after the remaining timeout the
-  consumer re-evaluates staleness and clears the lock if the holder has not
-  done so.  `infinity` (the default) preserves the previous behaviour.
-  `dgen_registry` uses `lock_timeout: 6_000`.
-
-- **`dgen_registry`** — Experimental. An OTP-compatible process registry backed by the
-  configured storage backend.  Implements the four-function
-  `{via, dgen_registry, {Name, LogicalName}}` contract so standard OTP
-  processes (`gen_server`, `gen_statem`, etc.) can be started and addressed by
-  name across an Erlang cluster.  Writes and consistent reads go through an
-  elected leader; `whereis_name/1` (used by OTP via-tuple routing) is a
-  snapshot read from the local member's in-memory map with no backend
-  round-trip.  The leader monitors registered pids and propagates
-  `{name_unregistered}` to followers on process exit.  Start with
-  `dgen_registry:start_link(Name, Tenant)` and supply a supervisor name as the
-  first argument to `start_link/3` to embed it in an existing supervision tree.
-
-  Partition recovery is reliable: each join carries a unique token so stale
-  `member_down` messages from before a reconnect are discarded rather than
-  undoing the rejoin.  Leader transitions during a partition no longer
-  trigger automatic distribution reconnect.
+- **Transactional callbacks** — optional `handle_cast_tx/3`, `handle_call_tx/4`,
+  `handle_info_tx/3` receive a `tx_ctx()` (open transaction + directory) so callbacks
+  can read/write keys atomically with the state commit.
+- **`lock_timeout` option for `dgen_server`** — backstop timer clears a stale
+  distributed lock left by a killed consumer. Default `infinity` (old behavior);
+  `dgen_registry` uses 6000 ms.
+- **`dgen_registry`** (experimental) — OTP-compatible process registry over the
+  storage backend, addressed via `{via, dgen_registry, {Name, LogicalName}}`. Writes
+  and consistent reads go through an elected leader; `whereis_name/1` is a local
+  snapshot read. Partition recovery is token-fenced so stale `member_down` messages
+  can't undo a rejoin.
 
 ### Breaking changes
 
-- **`DGenServer` renamed to `DGen.Server`** — `use DGenServer` becomes `use DGen.Server`;
-  all `DGenServer.*` call sites become `DGen.Server.*`. The module now lives at
-  `lib/dgen/server.ex`.
-
-- **`handle_locked/3` → `handle_locked/4`** — a `db_ctx()` map is now prepended as
-  the first argument, matching the convention of `handle_call_tx/4` and friends.
-  `db_ctx()` carries `#{db := tenant(), tuid := tuid()}` where `db` is the DB-level
-  tenant (not a transaction); use `dgen_backend:transactional/2` inside the callback
-  to open explicit transactions.  Update all `handle_locked` implementations to accept
-  the new first argument.
+- **`DGenServer` → `DGen.Server`** (`lib/dgen/server.ex`).
+- **`handle_locked/3` → `handle_locked/4`** — a `db_ctx()` map is prepended as the
+  first argument.
 
 ## v0.2.0 (2026-04-05)
 
 ### Enhancements
 
-- **Dead-letter queue** — opt-in poison-message handling via the new
-  `dead_letter_threshold` start option (default `infinity`, i.e. disabled).
-  When set to a positive integer, messages that crash the consumer that many
-  times are moved to a dead-letter queue (DLQ) stored in FoundationDB instead
-  of being retried indefinitely. For `call` messages the blocked caller raises
-  `{dead_letter, N}`. The optional `handle_dead_letter/2` callback is invoked
-  when a message is dead-lettered.
-
-- `dgen_server:outbox_cast/1,2` — returns a `Cast = fun((Tx, Message) -> ok)`
-  closure for enqueuing a cast message atomically within the caller's own FDB
-  transaction. Call it before opening the transaction as a preparatory step;
-  the closure captures the queue directory and identifier internally. Intended
-  for callers already operating directly with a backend transaction who need
-  to compose the enqueue with other writes atomically.
+- **Dead-letter queue** — opt-in via `dead_letter_threshold`; messages crashing the
+  consumer that many times move to a DLQ, callers raise `{dead_letter, N}`, and the
+  optional `handle_dead_letter/2` callback fires.
+- **`dgen_server:outbox_cast/1,2`** — returns a closure for enqueuing a cast
+  atomically inside the caller's own backend transaction.
 
 ## v0.1.0 (2026-02-22)
 

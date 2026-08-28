@@ -2,6 +2,8 @@
 -behaviour(dgen_server).
 
 -define(DOCATTRS, ?OTP_RELEASE >= 27).
+
+-include("../include/dgen_eta.hrl").
 -define(SnapshotTimeout, 2000).
 
 -if(?DOCATTRS).
@@ -75,6 +77,8 @@
 %% never slip past the fence during its later term (the ABA case). Values written by
 %% older versions (a bare MemberId) are tolerated by the fence readers in
 %% `dgen_registry_names` until the next election rewrites the key.
+%%
+%% *This documentation is LLM-generated. See the AI disclosure in README.md.*
 
 -export([
     init/1,
@@ -116,14 +120,24 @@
 %% ---------------------------------------------------------------------------
 
 -if(?DOCATTRS).
--doc "Initialises the elector state with an empty member map and undefined leader.".
+-doc """
+Initialises the elector state with an empty member map and undefined leader.
+
+`name` is the co-located member's **identity** — it is what `elect_leader/5` turns
+into the local `member_id/0` when preferring the local member for leadership.
+`keyspace` is the registry's durable **prefix**, and is what the tuid is derived
+from; it defaults to `name`. The two differ only when a registry is started with
+`dgen_registry:start_link/3`'s `keyspace` option, which lets several members of one
+registry share a VM (see that function's docs).
+""".
 -endif.
--spec init(#{name := atom()}) -> {ok, dgen_server:tuid(), registry_state()}.
-init(#{name := Name}) ->
+-spec init(#{name := atom(), keyspace => atom()}) ->
+    {ok, dgen_server:tuid(), registry_state()}.
+init(Args = #{name := Name}) ->
     State = #{
         name => Name, members => #{}, leader => undefined, epoch => 0, subscriptions => #{}
     },
-    {ok, tuid(Name), State}.
+    {ok, tuid(maps:get(keyspace, Args, Name)), State}.
 
 -if(?DOCATTRS).
 -doc """
@@ -350,7 +364,7 @@ presence_push_action(Update) ->
 %% disconnected node (the same hazard call_to_member/2 guards against — see §5.7).
 push_to_leader({Node, Name}, Msg) ->
     case dgen_utils:node_reachable(Node) of
-        true -> gen_server:cast({Name, Node}, Msg);
+        true -> gen_statem:cast({Name, Node}, Msg);
         false -> ok
     end.
 
@@ -452,6 +466,6 @@ call_to_member({Node, Name}, Msg) ->
     %% never detected.  (This guard is independent of the now-removed distributed
     %% lock; keep it regardless — §5.7.)
     case dgen_utils:node_reachable(Node) of
-        true -> gen_server:call({Name, Node}, Msg, ?SnapshotTimeout);
+        true -> gen_statem:call({Name, Node}, Msg, ?SnapshotTimeout);
         false -> exit({nodedown, Node})
     end.

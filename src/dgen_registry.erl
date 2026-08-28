@@ -3,6 +3,50 @@
 
 -define(DOCATTRS, ?OTP_RELEASE >= 27).
 
+%% The transform, for a module that is mostly a supervisor and an API surface.
+%%
+%% What matters is *where this code runs*.  `register_name/2`, `unregister_name/1`,
+%% `whereis_name/1`, `query/2` and the rest execute in the **caller's** process, and
+%% under simulation the caller is a process the scheduler owns.  So every
+%% `gen_server:call/2,3` here has to be the one `eta_net` provides rather than
+%% OTP's -- not for the fault injection, but for the clock and the schedule.
+%%
+%% Left untransformed, such a call goes into `gen:do_call/4`, which is OTP code no
+%% transform reaches, and takes two real-time dependencies with it: a
+%% `receive ... after Timeout` on the wall clock, and a real `erlang:monitor` whose
+%% `DOWN` the VM delivers when it likes rather than when the schedule says.  Both
+%% put a scheduled process's progress outside the schedule, and neither shows up in
+%% `eta_run:audit/1` -- the run simply stops being a function of its seed.  Found
+%% exactly that way: clients parked in `gen:do_call/4` at the step where two runs
+%% of one seed first disagreed.
+-include("../include/dgen_eta.hrl").
+
+%% Supervisor flags that exist only to keep this tree schedulable under simulation.
+%%
+%% The simulation declares these supervisors to `eta_sched` — it has to, because
+%% `elector_pid/1` below asks a supervisor for its children, so every
+%% `get_leader/1`, `get_epoch/1` and `get_members/1` is a call into one. A process
+%% the scheduler owns must have no real timers, and on OTP 28 a supervisor does:
+%% `hibernate_after` arrived with a 1000ms default, implemented as a `gen_server`
+%% timeout, and `supervisor` is OTP code no parse transform reaches. So every
+%% supervisor armed a wall-clock timer that dropped a message into a scheduled
+%% process's mailbox whenever real time said so. It moved with machine load — six
+%% simulation suites running at once made it fail about one run in three, while
+%% one at a time looked clean — and it was the last thing keeping `mix dst` from
+%% being a function of its seed.
+%%
+%% Guarded twice over, so a release build is byte-for-byte what it was: `DST` is
+%% set only by the test profile, and the key does not exist before OTP 28.
+-ifdef(DST).
+-if(?OTP_RELEASE >= 28).
+-define(SUP_SIM_FLAGS, #{hibernate_after => infinity}).
+-else.
+-define(SUP_SIM_FLAGS, #{}).
+-endif.
+-else.
+-define(SUP_SIM_FLAGS, #{}).
+-endif.
+
 -if(?DOCATTRS).
 -moduledoc """
 OTP-compatible process registry implementing the `{via, dgen_registry, {RegistryName, LogicalName}}` contract.
@@ -102,6 +146,8 @@ watched query changes — `{dgen_presence, SubId, [{joined | left, Name, Pid}]}`
 Subscriptions are **durable** (stored in the elector's backend state, keyed by an
 application id), so they outlive the cluster — built for process-presence systems whose
 stakeholders are database entities. See §4.9 of the design doc.
+
+*This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
 -endif.
 
@@ -135,10 +181,11 @@ stakeholders are database entities. See §4.9 of the design doc.
     get_leader/1,
     get_members/1,
     get_epoch/1,
-    %% Readiness
+    %% Readiness and introspection
     ready/1,
     await_ready/1,
     await_ready/2,
+    status/1,
     %% Process identity helpers (exported for tests / introspection)
     member_name/1,
     names_table/1,
@@ -197,6 +244,37 @@ The supervisor itself is **not** registered under a name — hold onto the `pid(
 this returns (e.g. `Supervisor.stop/2` to tear it down) rather than looking it up
 later by `Name`, which now names the member, not the supervisor. See the
 "Process identity" note above.
+
+## `keyspace` — separating identity from the coordination keyspace
+
+`Name` normally plays three roles at once: this member's **identity** (the registered
+process name, the ETS table name, and the second element of its `member_id/0`), and
+the registry's **keyspace** (the tuid prefixing every durable key — the elector queue,
+the leader key, the version key).
+
+The optional `keyspace` option splits the second role out:
+
+```erlang
+dgen_registry:start_link(member_a, Tenant, #{keyspace => shared_registry}),
+dgen_registry:start_link(member_b, Tenant, #{keyspace => shared_registry}).
+```
+
+Both members now coordinate through *one* registry's durable state — one elector
+queue, one leader key, one version key — while keeping distinct identities, so they
+elect a leader between themselves and replicate to each other exactly as members on
+separate nodes do. It defaults to `Name`, which is the ordinary one-member-per-node
+deployment.
+
+This exists for **simulation**: `member_id/0` is `{node(), Name}`, so without it a
+single VM can host at most one member of a given registry and any multi-member test
+needs real distribution and real nodes. With it, an N-member cluster runs inside one
+BEAM — which is what makes deterministic, seeded, replayable simulation of the
+replication protocol possible (see `test/support/sim/`). It is **not** intended for
+production deployment: two members of one registry sharing a VM share a fate, so they
+are not two holders in the sense of Guarantee 4, and the connector's node-level
+backstops (§4.6) cannot distinguish them.
+
+Note that `delete/2` takes the **keyspace** name, not a member's `Name`.
 """.
 -endif.
 -spec start_link(Name :: atom(), Tenant :: dgen_backend:tenant(), Opts :: registry_opts()) ->
@@ -244,7 +322,13 @@ consistent (replication is asynchronous).
 -spec unregister_name({atom(), term()}) -> ok.
 unregister_name({RegistryName, LogicalName}) ->
     try
-        gen_server:call(member_name(RegistryName), {unregister, LogicalName})
+        gen_statem:call(
+            member_name(RegistryName),
+            {unregister, LogicalName},
+            %% Same caller-side bound as the other leader-routed writes — see
+            %% set_metadata/2.
+            dgen_config:register_timeout(#{})
+        )
     catch
         %% noproc: the registry is stopped/absent — nothing to unregister, `ok` is
         %% truthful.  timeout: the removal is already stashed on the member and will
@@ -323,7 +407,7 @@ exits — a usage error.
 -endif.
 -spec register_name({atom(), term()}, pid(), map()) -> yes | no.
 register_name({RegistryName, LogicalName}, Pid, MetaSpec) ->
-    gen_server:call(
+    gen_statem:call(
         member_name(RegistryName),
         {register, LogicalName, Pid, meta_of(MetaSpec)},
         dgen_config:register_timeout(#{})
@@ -344,7 +428,15 @@ mid-flight — retry).
 set_metadata({RegistryName, LogicalName}, MetaSpec) ->
     {Index, Data} = meta_of(MetaSpec),
     try
-        gen_server:call(member_name(RegistryName), {set_metadata, LogicalName, Index, Data})
+        gen_statem:call(
+            member_name(RegistryName),
+            {set_metadata, LogicalName, Index, Data},
+            %% Bounded by the same caller-side knob as register_name/2,3 rather than
+            %% `gen_server:call/2`'s hidden 5s default: this is a leader-routed write
+            %% on the same pipeline, so an operator who tunes how long a write may
+            %% block should not find one of them ignoring the setting.
+            dgen_config:register_timeout(#{})
+        )
     catch
         exit:_ -> {error, no_leader}
     end.
@@ -381,7 +473,7 @@ reflects the leader's committed view.
     {ok, #{pid := pid(), index := map(), data := term()}} | undefined.
 get_metadata_consistent({RegistryName, LogicalName}) ->
     try
-        gen_server:call(member_name(RegistryName), {get_metadata, LogicalName})
+        gen_statem:call(member_name(RegistryName), {get_metadata, LogicalName})
     catch
         exit:_ -> undefined
     end.
@@ -408,7 +500,7 @@ query(_RegistryName, Constraints) when map_size(Constraints) =:= 0 ->
     {error, empty_query};
 query(RegistryName, Constraints) ->
     try
-        gen_server:call(member_name(RegistryName), {query, Constraints})
+        gen_statem:call(member_name(RegistryName), {query, Constraints})
     catch
         exit:_ -> []
     end.
@@ -427,7 +519,7 @@ query_consistent(_RegistryName, Constraints) when map_size(Constraints) =:= 0 ->
     {error, empty_query};
 query_consistent(RegistryName, Constraints) ->
     try
-        gen_server:call(member_name(RegistryName), {query_consistent, Constraints})
+        gen_statem:call(member_name(RegistryName), {query_consistent, Constraints})
     catch
         exit:_ -> []
     end.
@@ -607,7 +699,7 @@ registered. More expensive than `whereis_name/1` but never stale.
 -spec whereis_name_consistent({atom(), term()}) -> pid() | undefined.
 whereis_name_consistent({RegistryName, LogicalName}) ->
     try
-        gen_server:call(member_name(RegistryName), {whereis, LogicalName})
+        gen_statem:call(member_name(RegistryName), {whereis, LogicalName})
     catch
         exit:_ -> undefined
     end.
@@ -650,13 +742,44 @@ registration will return `yes` (a name may already be taken, or leadership may m
 -endif.
 -spec ready(Name :: atom()) -> boolean().
 ready(Name) ->
-    try gen_server:call(member_name(Name), ready, ?READY_CALL_TIMEOUT) of
+    try gen_statem:call(member_name(Name), ready, ?READY_CALL_TIMEOUT) of
         Ready when is_boolean(Ready) -> Ready;
         _ -> false
     catch
         %% Member starting/restarting (noproc), or busy past the probe bound
         %% (timeout) — not ready yet.
         exit:_ -> false
+    end.
+
+-if(?DOCATTRS).
+-doc """
+Reports this node's member's own view of the registry, as a map:
+
+- `member_id` — this member's `member_id/0`.
+- `leader` — the member id it currently believes leads, or `undefined`.
+- `is_leader` — whether that belief names itself.
+- `epoch` — the leadership epoch it has heard (§4.2).
+- `synced` — whether it has applied a snapshot or assumed leadership.
+- `applied_version` — the commit version its replica has applied up to (§4.5).
+
+This is a member's **belief**, which is deliberately not the same thing as
+`get_leader/1`'s committed answer from the elector: a deposed leader that has not
+yet heard about the handoff still reports `is_leader => true` here while
+`get_leader/1` already names its successor. That gap is the fenced window of §5.1,
+and seeing it is the point of this call.
+
+Side-effect free — a plain state read, useful for operational introspection and for
+asserting replication invariants across members. Returns `undefined` if the member
+is not running.
+""".
+-endif.
+-spec status(Name :: atom()) -> map() | undefined.
+status(Name) ->
+    try gen_statem:call(member_name(Name), status, ?READY_CALL_TIMEOUT) of
+        Status when is_map(Status) -> Status;
+        _ -> undefined
+    catch
+        exit:_ -> undefined
     end.
 
 -if(?DOCATTRS).
@@ -680,17 +803,27 @@ not-yet-known leader. Safe to call from many nodes; it only reads local member s
 -endif.
 -spec await_ready(Name :: atom(), Timeout :: non_neg_integer()) -> ok | {error, timeout}.
 await_ready(Name, Timeout) ->
-    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    Deadline = dgen_utils:real_monotonic_ms() + Timeout,
     await_ready_loop(Name, Deadline).
 
+%% The poll sleeps and reads the clock through `dgen_utils`, which the eta
+%% transform does not touch, and that is load-bearing: this module carries the
+%% transform (see the include at the top), so a bare `timer:sleep/1` here becomes
+%% `eta_time:sleep/1` — and under `eta_run` this loop runs in the *driver* while
+%% the cluster starts, the one process whose transformed sleep arms a virtual
+%% deadline nothing will ever reach (`eta_time:sleep/1`'s own boundary rule).
+%% Observed as the whole run wedging in `await_ready_loop` whenever a member was
+%% not ready on the very first poll.  Readiness polling is a wall-clock concern:
+%% it runs before the schedule owns the system (or on a real node, where there is
+%% no schedule at all), exactly like the harness's own `await_quiescent/2`.
 await_ready_loop(Name, Deadline) ->
     case ready(Name) of
         true ->
             ok;
         false ->
-            case erlang:monotonic_time(millisecond) < Deadline of
+            case dgen_utils:real_monotonic_ms() < Deadline of
                 true ->
-                    timer:sleep(?READY_POLL_INTERVAL),
+                    dgen_utils:real_sleep(?READY_POLL_INTERVAL),
                     await_ready_loop(Name, Deadline);
                 false ->
                     {error, timeout}
@@ -811,12 +944,17 @@ init({Name, Tenant, Opts}) ->
     %% The elector is deliberately unnamed (`dgen_server:start_link/3`, no `Reg`):
     %% it has no registered name at all, local or otherwise. The member finds it by
     %% pid via this supervisor instead — see the "Process identity" moduledoc note.
+    %% `Name` is this member's identity; `Keyspace` is the durable prefix every
+    %% member of the registry coordinates through.  They are the same atom in the
+    %% ordinary one-member-per-node case; `keyspace` splits them so several members
+    %% of one registry can share a VM (see start_link/3's docs).
+    Keyspace = maps:get(keyspace, Opts, Name),
     ElectorSpec = #{
         id => elector,
         start =>
             {dgen_server, start_link, [
                 dgen_registry_elector,
-                #{name => Name},
+                #{name => Name, keyspace => Keyspace},
                 [{tenant, Tenant}, {consume_k, 50}]
             ]},
         restart => permanent,
@@ -827,8 +965,10 @@ init({Name, Tenant, Opts}) ->
 
     %% Tuid matches the elector's (both derive it from dgen_registry_elector:tuid/1)
     %% so the member can compute the leader key and the per-registry version key
-    %% directly, against the same keyspace the elector's fence writes.
-    Tuid = dgen_registry_elector:tuid(Name),
+    %% directly, against the same keyspace the elector's fence writes.  Derived from
+    %% `Keyspace`, not `Name`: every member of a registry must fence against the same
+    %% leader key even when their identities differ.
+    Tuid = dgen_registry_elector:tuid(Keyspace),
     MemberSpec = #{
         id => member,
         start =>
@@ -876,6 +1016,6 @@ init({Name, Tenant, Opts}) ->
     %% matters: elector first (both others discover it), then member (registers its
     %% name), then connector (walks from the member to the elector).
     {ok,
-        {#{strategy => one_for_all, intensity => 5, period => 10}, [
+        {maps:merge(#{strategy => one_for_all, intensity => 5, period => 10}, ?SUP_SIM_FLAGS), [
             ElectorSpec, MemberSpec, ConnectorSpec
         ]}}.

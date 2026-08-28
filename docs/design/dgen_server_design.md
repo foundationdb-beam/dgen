@@ -35,6 +35,8 @@ It is written to be read top to bottom. The early sections assume only that you
 know what a `gen_server` is; the later sections get more precise about the
 transaction model and failure behaviour.
 
+**This document is LLM generated.**
+
 ---
 
 ## 1. The one-minute model

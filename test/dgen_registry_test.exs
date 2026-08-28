@@ -110,9 +110,11 @@ defmodule DGen.RegistryTest do
     do: assert(eventually(fn -> not leader_has_sub?(reg, sub_id) end))
 
   defp leader_has_sub?(reg, sub_id) do
-    reg
-    |> :dgen_registry.member_name()
-    |> :sys.get_state()
+    # The member is a gen_statem: sys.get_state returns {StatemState, Data}, and
+    # the subscription maps live in the Data record.
+    {_statem_state, data} = reg |> :dgen_registry.member_name() |> :sys.get_state()
+
+    data
     |> Tuple.to_list()
     |> Enum.any?(fn v -> is_map(v) and Map.has_key?(v, sub_id) end)
   end
@@ -702,12 +704,22 @@ defmodule DGen.RegistryTest do
   # ---------------------------------------------------------------------------
 
   describe "detect_conflicts/3" do
+    # The detector takes RECORDS maps (`%{name => {pid, index, data}}`) and
+    # compares entries against the authority in place — the shape change that made
+    # the all-agree handoff allocation-free. `rec/1` builds the record wrapper;
+    # the semantics pinned below are unchanged from the pid-map era.
+    defp rec(pid), do: {pid, %{}, nil}
+
     test "two different live pids for one name is a conflict" do
       p1 = spawn_live()
       p2 = spawn_live()
 
       assert [{:n, ^p1, [^p2]}] =
-               :dgen_registry_member.detect_conflicts(%{n: p1}, [%{n: p1}, %{n: p2}], %{})
+               :dgen_registry_member.detect_conflicts(
+                 %{n: rec(p1)},
+                 [%{n: rec(p1)}, %{n: rec(p2)}],
+                 %{}
+               )
     end
 
     test "a recently-released name/pid pair is suppressed (lag, not conflict)" do
@@ -717,7 +729,11 @@ defmodule DGen.RegistryTest do
       released = %{{:n, p2} => System.system_time(:millisecond)}
 
       assert [] =
-               :dgen_registry_member.detect_conflicts(%{n: p1}, [%{n: p1}, %{n: p2}], released)
+               :dgen_registry_member.detect_conflicts(
+                 %{n: rec(p1)},
+                 [%{n: rec(p1)}, %{n: rec(p2)}],
+                 released
+               )
     end
 
     test "a release under one name does not mask a conflict on another name" do
@@ -728,7 +744,11 @@ defmodule DGen.RegistryTest do
       released = %{{:other, p2} => System.system_time(:millisecond)}
 
       assert [{:n, ^p1, [^p2]}] =
-               :dgen_registry_member.detect_conflicts(%{n: p1}, [%{n: p1}, %{n: p2}], released)
+               :dgen_registry_member.detect_conflicts(
+                 %{n: rec(p1)},
+                 [%{n: rec(p1)}, %{n: rec(p2)}],
+                 released
+               )
     end
 
     test "a legacy bare-pid trail entry (rolling upgrade) still suppresses" do
@@ -739,7 +759,11 @@ defmodule DGen.RegistryTest do
       released = %{p2 => System.system_time(:millisecond)}
 
       assert [] =
-               :dgen_registry_member.detect_conflicts(%{n: p1}, [%{n: p1}, %{n: p2}], released)
+               :dgen_registry_member.detect_conflicts(
+                 %{n: rec(p1)},
+                 [%{n: rec(p1)}, %{n: rec(p2)}],
+                 released
+               )
     end
 
     test "a dead divergent pid is not a conflict" do
@@ -748,19 +772,110 @@ defmodule DGen.RegistryTest do
       Process.exit(p2, :kill)
       eventually(fn -> not Process.alive?(p2) end)
 
-      assert [] = :dgen_registry_member.detect_conflicts(%{n: p1}, [%{n: p1}, %{n: p2}], %{})
+      assert [] =
+               :dgen_registry_member.detect_conflicts(
+                 %{n: rec(p1)},
+                 [%{n: rec(p1)}, %{n: rec(p2)}],
+                 %{}
+               )
+    end
+
+    test "a dead authority is not a conflict (nothing to defend)" do
+      p1 = spawn(fn -> :ok end)
+      Process.exit(p1, :kill)
+      eventually(fn -> not Process.alive?(p1) end)
+      p2 = spawn_live()
+
+      assert [] =
+               :dgen_registry_member.detect_conflicts(
+                 %{n: rec(p1)},
+                 [%{n: rec(p1)}, %{n: rec(p2)}],
+                 %{}
+               )
     end
 
     test "agreement across all maps is not a conflict" do
       p1 = spawn_live()
 
-      assert [] = :dgen_registry_member.detect_conflicts(%{n: p1}, [%{n: p1}, %{n: p1}], %{})
+      assert [] =
+               :dgen_registry_member.detect_conflicts(
+                 %{n: rec(p1)},
+                 [%{n: rec(p1)}, %{n: rec(p1)}],
+                 %{}
+               )
+    end
+
+    test "agreement with different metadata is still agreement (pids decide)" do
+      p1 = spawn_live()
+
+      assert [] =
+               :dgen_registry_member.detect_conflicts(
+                 %{n: {p1, %{v: 1}, nil}},
+                 [%{n: {p1, %{v: 2}, :other}}],
+                 %{}
+               )
     end
 
     test "a name with no authority (absent from the freshest map) is not a conflict" do
       p1 = spawn_live()
 
-      assert [] = :dgen_registry_member.detect_conflicts(%{}, [%{n: p1}], %{})
+      assert [] = :dgen_registry_member.detect_conflicts(%{}, [%{n: rec(p1)}], %{})
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Snapshot codec (pure, unit-tested in isolation)
+  #
+  # encode_table/1 folds the ETS table straight into a pair list inside the blob
+  # (no records-map materialization); decode_records/1 must normalize every wire
+  # shape — this build's list-in-binary and map-in-binary, plus both pre-binary
+  # legacy forms — to the one map callers use. A shape the decoder silently
+  # mishandled would surface as a corrupt replica after a resync or handoff, so
+  # the tolerance is pinned here rather than trusted.
+  # ---------------------------------------------------------------------------
+
+  describe "snapshot codec (encode_table/1, decode_records/1)" do
+    test "a table round-trips through encode_table to the same records map" do
+      tab = :ets.new(:codec_bench, [:set, :public])
+      p1 = spawn_live()
+      p2 = spawn_live()
+      :ets.insert(tab, [{:a, p1, %{v: 1}, nil}, {:b, p2, %{}, "data"}])
+
+      assert %{a: {^p1, %{v: 1}, nil}, b: {^p2, %{}, "data"}} =
+               :dgen_registry_member.decode_records(:dgen_registry_member.encode_table(tab))
+    end
+
+    test "an empty table encodes to an empty map" do
+      tab = :ets.new(:codec_empty, [:set, :public])
+
+      assert %{} ==
+               :dgen_registry_member.decode_records(:dgen_registry_member.encode_table(tab))
+    end
+
+    test "a map-in-binary blob (the fan-out encoder) decodes to the same map" do
+      p1 = spawn_live()
+      records = %{a: {p1, %{}, nil}}
+
+      assert ^records =
+               :dgen_registry_member.decode_records(:dgen_registry_member.encode_records(records))
+    end
+
+    test "legacy wire shapes still normalize (rolling upgrade)" do
+      p1 = spawn_live()
+
+      # Pre-binary-era apply_names_snapshot: an on-heap [{name, record}] list.
+      assert %{a: {^p1, %{}, nil}} =
+               :dgen_registry_member.decode_records([{:a, {p1, %{}, nil}}])
+
+      # Pre-binary-era get_names_snapshot: a bare records map.
+      assert %{a: {^p1, %{}, nil}} =
+               :dgen_registry_member.decode_records(%{a: {p1, %{}, nil}})
+
+      # Pre-list-era binary: a map inside the blob (what an old node still sends).
+      assert %{a: {^p1, %{}, nil}} =
+               :dgen_registry_member.decode_records(
+                 :erlang.term_to_binary(%{a: {p1, %{}, nil}}, [:compressed])
+               )
     end
   end
 
@@ -1049,6 +1164,14 @@ defmodule DGen.RegistryTest do
     version
   end
 
+  # A replication broadcast in the shape the leader actually sends: one
+  # `{:names_batch, Ops, Epoch, PrevV, Version, LeaderId}` message per committed
+  # batch, with the batch's ops carried inside it. A batch is delivered whole or
+  # not at all — see `broadcast_batch/5` in dgen_registry_member.
+  defp names_batch(ops, epoch, prev_v, version, leader) do
+    {:names_batch, ops, epoch, prev_v, version, leader}
+  end
+
   describe "epoch fencing" do
     test "name_registered with stale epoch is discarded", %{reg: reg} do
       member = :dgen_registry.member_name(reg)
@@ -1062,7 +1185,13 @@ defmodule DGen.RegistryTest do
       # version stamps are contiguous, so only the epoch causes the discard.
       GenServer.cast(
         member,
-        {:name_registered, :stale_name, pid, %{}, :undefined, epoch - 1, v, v + 1, leader}
+        names_batch(
+          [{:name_registered, :stale_name, pid, %{}, :undefined}],
+          epoch - 1,
+          v,
+          v + 1,
+          leader
+        )
       )
 
       # whereis_name now reads ETS in the caller (no member round-trip), so it can no
@@ -1083,7 +1212,13 @@ defmodule DGen.RegistryTest do
 
       GenServer.cast(
         member,
-        {:name_registered, :current_name, pid, %{}, :undefined, epoch, v, v + 1, leader}
+        names_batch(
+          [{:name_registered, :current_name, pid, %{}, :undefined}],
+          epoch,
+          v,
+          v + 1,
+          leader
+        )
       )
 
       # Barrier: ensure the member has processed the cast before the caller-side read.
@@ -1106,7 +1241,13 @@ defmodule DGen.RegistryTest do
       # snapshot instead of advancing with a hole in its replica).
       GenServer.cast(
         member,
-        {:name_registered, :gapped_name, pid, %{}, :undefined, epoch, v + 10, v + 11, leader}
+        names_batch(
+          [{:name_registered, :gapped_name, pid, %{}, :undefined}],
+          epoch,
+          v + 10,
+          v + 11,
+          leader
+        )
       )
 
       :sys.get_state(member)
@@ -1126,7 +1267,13 @@ defmodule DGen.RegistryTest do
 
       GenServer.cast(
         member,
-        {:name_unregistered, :persisted_name, :undefined, epoch - 1, v, v + 1, leader}
+        names_batch(
+          [{:name_unregistered, :persisted_name, :undefined}],
+          epoch - 1,
+          v,
+          v + 1,
+          leader
+        )
       )
 
       # Barrier: ensure the member has processed (and discarded) the stale cast.
@@ -1147,7 +1294,7 @@ defmodule DGen.RegistryTest do
 
       GenServer.cast(
         member,
-        {:name_unregistered, :to_remove, :undefined, epoch, v, v + 1, leader}
+        names_batch([{:name_unregistered, :to_remove, :undefined}], epoch, v, v + 1, leader)
       )
 
       # Barrier: ensure the member has processed the cast before the caller-side read.

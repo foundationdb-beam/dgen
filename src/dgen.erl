@@ -2,6 +2,11 @@
 
 -define(DOCATTRS, ?OTP_RELEASE >= 27).
 
+%% Runs *inside the caller's process*, which under simulation is a scheduled one,
+%% so it needs the transform for exactly the reason the servers do -- see the note
+%% above the include in `dgen_registry`.
+-include("../include/dgen_eta.hrl").
+
 -if(?DOCATTRS).
 -moduledoc false.
 -endif.
@@ -28,6 +33,8 @@
 %%    chunked term under the from-key.
 %% 5. The watch fires, the caller reads and clears the chunked reply.
 %% 6. On timeout the caller clears the chunked reply keys to avoid leaks.
+%%
+%% *This documentation is LLM-generated. See the AI disclosure in README.md.*
 
 -export([get_waiting_key/1, get_from/2, call/4, push_call/6, push_call/7]).
 

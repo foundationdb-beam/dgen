@@ -47,6 +47,8 @@ defmodule DGen.Registry do
   (lock-free / leader-routed, mirroring `whereis_name/1` /
   `whereis_name_consistent/1`). `query/2` / `query_consistent/2` find every
   registration whose `index` satisfies a conjunction of exact equalities.
+
+  *This documentation is LLM-generated. See the AI disclosure in `README.md`.*
   """
 
   @doc """
@@ -241,6 +243,17 @@ defmodule DGen.Registry do
   or joining a cluster to wait out leader election and the join handoff.
   """
   defdelegate await_ready(registry_name, timeout), to: :dgen_registry
+
+  @doc """
+  This node's member's own view of the registry, as a map with `:member_id`,
+  `:leader`, `:is_leader`, `:epoch`, `:synced`, and `:applied_version`.
+
+  This is the member's *belief*, deliberately distinct from `get_leader/1`'s
+  committed answer from the elector — a deposed leader that has not yet heard about
+  the handoff still reports `is_leader: true` here. Side-effect free; returns
+  `:undefined` if the member is not running.
+  """
+  defdelegate status(registry_name), to: :dgen_registry
 
   @doc """
   Returns the registered name of the member process for the given registry name.

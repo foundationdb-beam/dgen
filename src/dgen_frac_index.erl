@@ -12,6 +12,8 @@
 %% (0-9, A-Z, a-z in ASCII order). A new key can always be generated between
 %% any two existing keys, making this suitable for maintaining ordered lists
 %% in key-value stores without reindexing.
+%%
+%% *This documentation is LLM-generated. See the AI disclosure in README.md.*
 
 -export([
     first/0,

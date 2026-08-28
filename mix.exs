@@ -7,6 +7,8 @@ defmodule Dgen.MixProject do
       version: File.read!("VERSION") |> String.trim(),
       elixir: "~> 1.15",
       elixirc_paths: elixirc_paths(Mix.env()),
+      erlc_paths: erlc_paths(Mix.env()),
+      erlc_options: erlc_options(Mix.env()),
       aliases: aliases(),
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -14,6 +16,10 @@ defmodule Dgen.MixProject do
       name: "DGen",
       docs: docs()
     ]
+  end
+
+  def cli do
+    [preferred_envs: [dst: :test]]
   end
 
   defp package() do
@@ -64,6 +70,31 @@ defmodule Dgen.MixProject do
   defp elixirc_paths(:test), do: ["lib", "test/support"]
   defp elixirc_paths(_), do: ["lib"]
 
+  defp erlc_paths(_), do: ["src"]
+
+  defp erlc_options(:test), do: [:debug_info, {:d, :DST}] ++ mutation()
+  defp erlc_options(_), do: [:debug_info]
+
+  # A deliberately planted defect, for asking the eta framework to rediscover a bug
+  # we already understand.
+  #
+  #     DGEN_MUTATION=partial_batch mix compile --force
+  #     DGEN_MUTATION=partial_batch DGEN_BACKEND=dgen_mem mix test --only mutation
+  #
+  # `--force` is not optional. Mix does not reliably rebuild an Erlang module when
+  # only its compiler options change, so toggling this without it leaves the suite
+  # running yesterday's code — the same hazard the parse transforms have, and it
+  # fails in the direction that looks like success.
+  #
+  # Test builds only, so a mutation can never reach a release.
+  defp mutation do
+    case System.get_env("DGEN_MUTATION") do
+      nil -> []
+      "" -> []
+      name -> [{:d, :"MUTATION_#{String.upcase(name)}"}]
+    end
+  end
+
   def application do
     [
       extra_applications: [:logger]
@@ -73,6 +104,7 @@ defmodule Dgen.MixProject do
   defp deps do
     [
       {:erlfdb, "~> 1.0", optional: true},
+      {:eta, "~> 0.1.0", only: :test},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.40", only: :dev, runtime: false}
     ]
@@ -80,6 +112,7 @@ defmodule Dgen.MixProject do
 
   defp aliases do
     [
+      dst: &dst/1,
       lint: [
         "format --check-formatted",
         "cmd rebar3 fmt --check",
@@ -88,5 +121,15 @@ defmodule Dgen.MixProject do
         "docs --warnings-as-errors"
       ]
     ]
+  end
+
+  # The deterministic simulation suite: every `:simulation` test, on the in-memory
+  # backend.
+  #
+  #     mix dst                 # the whole simulation suite
+  #     mix dst --seed 0        # extra arguments pass through to `mix test`
+  defp dst(args) do
+    System.put_env("DGEN_BACKEND", "dgen_mem")
+    Mix.Task.run("test", ["--only", "simulation" | args])
   end
 end
