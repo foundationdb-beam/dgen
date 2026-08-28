@@ -849,7 +849,6 @@ handle_event(enter, _OldState, _NewState, Data) ->
     %% Includes init's self-enter (searching -> searching) and every edge not
     %% touching `leader`.
     {keep_state, Data};
-
 %% -- the assume lifecycle ---------------------------------------------------
 
 %% A continuing leader absorbs a join on the fast path; every other
@@ -886,7 +885,9 @@ handle_event(
 ) ->
     {noreply, Data1} = handle_info(Msg, Data),
     next(Data1, []);
-handle_event(info, {assume_gathered, _Ctx, _Self, _Freshest, _MaxV, _Peers, _Subs}, _AnyState, Data) ->
+handle_event(
+    info, {assume_gathered, _Ctx, _Self, _Freshest, _MaxV, _Peers, _Subs}, _AnyState, Data
+) ->
     {keep_state, Data};
 %% The joiner-gather continuation is leader work in the current term; the
 %% member-still-known guard stays on Data.
@@ -900,7 +901,6 @@ handle_event(
     next(Data1, []);
 handle_event(info, {joiner_gathered, _M, _A, _T, _E, _R}, _AnyState, Data) ->
     {keep_state, Data};
-
 %% -- leader-only periodic work ---------------------------------------------
 
 %% Only the leader advertises; everyone keeps the timer running so a later
@@ -919,7 +919,6 @@ handle_event(info, {monitor_sweep, Epoch, _Cont} = Msg, leader, Data = #state{ep
     next(Data1, []);
 handle_event(info, {monitor_sweep, _Epoch, _Cont}, _AnyState, Data) ->
     {keep_state, Data};
-
 %% -- leader-only protocol serves -------------------------------------------
 
 %% A follower's resync request: only a member that believes it leads answers
@@ -936,7 +935,6 @@ handle_event(cast, {unregister_req, _Ref, _FollowerId, _Name} = Msg, leader, Dat
     next(Data1, []);
 handle_event(cast, {unregister_req, _Ref, _FollowerId, _Name}, _AnyState, Data) ->
     {keep_state, Data};
-
 %% -- the generic shim -------------------------------------------------------
 
 handle_event({call, From}, Msg, _State, Data) ->
@@ -1964,7 +1962,9 @@ handle_info(
     Select =
         case Cont0 of
             start ->
-                ets:select(Tab, [{{'$1', '$2', '_', '_'}, [], [{{'$1', '$2'}}]}], ?MONITOR_SWEEP_CHUNK);
+                ets:select(
+                    Tab, [{{'$1', '$2', '_', '_'}, [], [{{'$1', '$2'}}]}], ?MONITOR_SWEEP_CHUNK
+                );
             _ ->
                 ets:select(Cont0)
         end,

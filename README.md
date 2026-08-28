@@ -47,7 +47,7 @@ DGen can be installed by adding `dgen` to your list of dependencies in
 ]}.
 ```
 
-Find the most recent version number on [Hex](hex.pm/packages/dgen).
+Find the most recent version number on [Hex](https://hex.pm/packages/dgen).
 
 ### Elixir
 
