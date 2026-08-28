@@ -118,8 +118,6 @@ Two configs qualify what a green main run means:
 ## How to run locally
 
 ```sh
-curl -fsSL -o formal/tla2tools.jar \
-  https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
 formal/check.sh DgenRegistryReplication                          # must pass — all invariants, full depth
 formal/check.sh DgenRegistryReplicationHeartbeat                 # must pass — all invariants with the heartbeat on
 formal/check.sh DgenRegistryReplicationDegradeOpenSafety         # must pass — the default mode's residual guarantees
@@ -132,15 +130,20 @@ formal/check.sh DgenRegistryReplicationDegradeOpen fail          # mutation — 
 formal/check.sh DgenRegistryReplicationAckReachable fail         # vacuity canary — must fail
 ```
 
-Requires Java 11+. `tla2tools.jar` and `formal/states/` (TLC's scratch
-directory) are gitignored; `check.sh` gives each run a private temp metadir,
-so concurrent invocations are safe. The three passing configs take 2.5-5.5 minutes each on a 10-core machine
-(timings below); every expected-fail config finishes in seconds. CI
-(`.github/workflows/formal.yml`) runs all ten on every push/PR with the jar
-pinned to v1.8.0 and sha256-checked — a locally downloaded newer TLC also
-works (results here were cross-checked on a 2026 build, which additionally
-writes `*_TTrace_*` counterexample files beside the spec; both paths are
-gitignored).
+Requires Java 11+ and nothing else: the TLC jar is **checked in** at
+`formal/vendor/tla2tools-v1.8.0.jar` and `check.sh` uses it automatically. (It
+used to be downloaded from the tlaplus GitHub release and pinned by sha256 —
+which broke twice, because the project republishes assets in place on the same
+tag; a vendored jar is immutable in git and hermetic.) To use a different TLC
+locally, drop it at `formal/tla2tools.jar` (gitignored, takes precedence) or
+set `TLA2TOOLS_JAR` — results here were cross-checked on a 2026 build, which
+additionally writes `*_TTrace_*` counterexample files beside the spec; those
+and `formal/states/` (TLC scratch) stay gitignored, and `check.sh` gives each
+run a private temp metadir so concurrent invocations are safe. The three
+passing configs take 2.5-5.5 minutes each on a 10-core machine (timings
+below); every expected-fail config finishes in seconds. CI
+(`.github/workflows/formal.yml`) runs all ten on every push/PR against the
+vendored jar.
 
 ## Mutation and pre-fix configs
 
@@ -261,6 +264,7 @@ formal/
   DgenRegistryReplicationNoGuard.cfg                mutation (pre-deferred_yes) — must fail
   DgenRegistryReplicationDegradeOpen.cfg            mutation (degrade-open loses DurableAcked) — must fail
   DgenRegistryReplicationAckReachable.cfg           vacuity canary (NoAcks) — must fail
+  vendor/tla2tools-v1.8.0.jar                       the checked-in TLC (see "How to run locally")
   check.sh                                          runner, local + CI (per-run metadir; concurrency-safe)
   README.md                                         this file
 .github/workflows/formal.yml                        CI workflow (all ten configs + the DST jobs)

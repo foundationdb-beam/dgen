@@ -25,7 +25,8 @@ dgen-*.tar
 /.elixir_ls/
 /.erlfdb_sandbox/
 
-# TLA+ model checker jar and TLC scratch directory (formal/PLAN.md §4).
+# A personal TLC jar (overrides the checked-in formal/vendor/ one — see
+# check.sh's resolution order) and TLC's scratch directory.
 formal/tla2tools.jar
 formal/states/
 # Counterexample traces TLC writes beside the spec on a violation, which the
