@@ -4,101 +4,23 @@
 
 ### Bug fixes
 
-- **`dgen_registry` — an unregister could destroy a binding it never targeted.**
-  A register parked behind an in-flight commit planned against the leader's
-  optimistically-emptied table and was acked `yes` while the previous holder's
-  registration still stood; the unregister's `remove` op then cleared the name
-  unconditionally, deleting the new holder. One unregister freed the name twice
-  (Guarantees 1 and 4 both violated), with no fault required — ordinary
-  register/unregister concurrency sufficed. The remove is now pid-guarded against
-  the current holder. Found by the simulation harness's new end-of-run
-  ack-history invariant (`test/support/sim/README.md`, finding 7).
-
-- **DST harness — `dgen_registry:await_ready/2` wedged the deterministic
-  suite.** Its poll loop's transformed `timer:sleep` ran in the eta driver
-  process, arming a virtual deadline nothing could reach; the readiness poll
-  now runs on the real clock via transform-free `dgen_utils` helpers.
+- Fixed a race where an unregister could delete a binding it didn't own,
+  freeing a name twice under ordinary concurrency.
+- Fixed the DST harness's readiness poll hanging on a virtual clock deadline.
 
 ### Enhancements
 
-- **`dgen_registry_member` is a `gen_statem`.** Four states — `searching`,
-  `assuming`, `leader`, `follower` — derived as a projection of the role
-  fields in Data (so the projection cannot drift), with the leadership
-  lifecycle on state-enter calls: entering `leader` seeds subscriptions and
-  arms the monitor sweep, leaving it demonitors — no transition path can
-  forget half the pair. The handoff-gather continuation is valid only in
-  `assuming`, so a superseded gather is a visible state mismatch. Ported in
-  three fully-gated phases (behaviour swap, derived states + hoisted
-  dispatch, enter-call lifecycle); every phase landed with the full suite,
-  both determinism ratchets, both planted mutations, and the election bench
-  unchanged — the pinned mutation fixture replays without regeneration.
-  Execution amended the plan twice, deliberately: gap/resync and leader
-  reachability stay data, not state (both proved orthogonal to role — a
-  deposed-but-uninformed leader can be gapped, and an unreachable leader is a
-  link property), and the register/unregister stashes stay over gen_statem
-  `postpone` (the CP contract answers `ok` immediately where postpone would
-  defer the reply, and stash intents also originate from batch salvage, which
-  is not an event). Behavior is intended to be observably identical; the one
-  external shape change is `sys:get_state/1` returning `{State, Data}`.
-
-- **`dgen_registry` — leadership-handoff map allocations cut (~22% faster
-  client-visible election window).** The assume path materialized the replica
-  as fresh n-entry Erlang maps at least eight times; profiling
-  (`bench/registry_election_latency.exs`) attributed ~52% of the O(names)
-  handoff cost to that churn, with ETS writes under 5%. Now:
-  `detect_conflicts/3` compares records maps in place and allocates only for
-  divergent names (the all-agree handoff allocates nothing);
-  `resolve_conflicts` operates on the freshest records map directly, so the
-  no-conflict reconstruction passes it through by reference (the
-  `maps:keys` + `maps:with` identity projection is gone); and
-  `assume_leadership` folds the ETS table straight into its monitor-ref maps.
-  Measured kill→first-`yes` at 200k names: ~940ms → ~740ms (~3.1µs/name,
-  from ~4.2). A follow-up trims the snapshot codec: the "serve my replica"
-  sites (gather reply, resync serve, joiner snapshot) encode a pair list
-  folded straight off the ETS table (`encode_table/1` — no records-map
-  materialization; there is no native ETS→binary dump), and snapshot blobs
-  compress at zlib level 1 (encode 60ms → 37ms at 200k for ~40% more wire
-  bytes, still ~1MB). `decode_records/1` re-dispatches on the blob's contents,
-  so every wire shape — old and new — normalizes; the tolerant decoder ships
-  with the new sender, as with the map→binary switch before it. Worth ~3-5%
-  more off the serial election window, and halves the stall a snapshot-serving
-  member's loop takes (~156ms → ~70ms at 200k). A third round removes the
-  monitor storm from the window: registered-process monitors carry
-  `{tag, {down, Name}}` (`erlang:monitor/3`), so their DOWNs are
-  self-describing and the n-entry reverse ref map is gone from member state —
-  and a new leader establishes monitors via a chunked, epoch-fenced
-  `{monitor_sweep, …}` after it is ready, off the client-visible window.
-  Deferral is safe because a monitor on an already-dead pid fires an immediate
-  `noproc` DOWN (a death inside the window is caught at establishment, never
-  lost; dead-pid cleanup lag is already asynchronous by contract), pinned by a
-  regression that kills a subject inside the handoff window and requires the
-  reap. Cumulative kill→first-`yes` at 200k names: ~940ms originally →
-  ~450-490ms.
-
-- **Formal layers hardened and aligned.** The TLA+ model now covers the
-  replication heartbeat (bounded to one in flight per leader) and splits the
-  §5.7 fix into its two guards, each proven independently necessary by its own
-  expected-fail config; new configs demonstrate the handoff race's
-  UniqueBinding half, machine-check ack reachability (the vacuity canary), and
-  characterize the *default* degrade-open mode (keeps everything but
-  two-holder durability). The DST harness gains end-of-run ack-history
-  invariants under `eta_run` (UniqueBinding in the spec's cumulative form,
-  acked-presence), a strict-replication leader-crash durability test, a
-  join-mid-workload-under-loss scenario (`Cluster.join/2`) pinning the
-  continuing-leader fast path, and a second planted mutation
-  (`DGEN_MUTATION=quiet_resync`) with its own targeted suite. Guard rails:
-  a plain test run now refuses a build cache still holding a planted
-  mutation, `formal/check.sh` is concurrency-safe (per-run metadir), and CI
-  runs every TLC config, both mutations, and the previously-uncovered
-  deterministic-suite ratchets.
-
-- **`dgen_registry` — per-registry `connectivity` option.** `provided_externally`
-  disables a registry's proactive distribution mesh so it can free-ride on the links
-  maintained by a `self_managed` registry on the same node (e.g. one system registry,
-  many tenant registries). Registry-scoped backstops stay active in both modes. The
-  provider must span a node-superset of the consumer's nodes; a sustained no-leader
-  window logs a warning. Unknown values fail safe to `self_managed` (the default).
-  See `docs/dgen_registry_design.md` §4.6 and §8.
+- `dgen_registry_member` rewritten as a `gen_statem` with explicit
+  searching/assuming/leader/follower states. `sys:get_state/1` now returns
+  `{State, Data}`.
+- Leadership handoff sped up (~2x faster election window at 200k names) by
+  cutting map allocations, shrinking the snapshot encoding, and deferring
+  monitor setup off the critical path.
+- Expanded TLA+ model and DST invariants covering replication and leader
+  handoff.
+- Added a per-registry `connectivity` option (`provided_externally`) to let a
+  registry share another registry's distribution mesh instead of running its
+  own. See `docs/dgen_registry_design.md` §4.6 and §8.
 
 ## v0.4.0 (2026-07-12)
 
