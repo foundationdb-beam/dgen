@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.4.1 (TBD)
+## v0.4.1 (2026-09-04)
 
 ### Bug fixes
 
@@ -13,6 +13,7 @@
 
 ### Enhancements
 
+- **`dgen_registry`** is now stable, and no longer experimental.
 - The `dgen_server` lock is now fenced. A busted holder is refused at commit and
   its message is retried, so `lock_timeout` can be tuned for recovery speed.
   `handle_locked/4` must be safe to run twice. See
