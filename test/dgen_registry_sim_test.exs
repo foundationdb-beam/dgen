@@ -507,20 +507,32 @@ defmodule DGen.RegistrySimTest do
       acked = run_workload(c, 20, seed)
 
       before = :eta_net.stats().signalled
+      epoch_before = Cluster.status(leader).epoch
       Cluster.partition(c, leader, victim)
 
       assert :eta_net.stats().signalled > before,
              "the partition told nobody a node had gone — every process on both " <>
                "sides is unplaced, so the topology is not what this test thinks"
 
-      # The victim is cut off in both directions, so the writes below cannot reach
-      # it and it must fall behind.
       acked = Map.merge(acked, run_workload(c, 30, seed + 1))
 
+      # The partition must have an observable effect, and it has two legitimate
+      # forms. Usually the leader keeps leading; the victim cannot receive its
+      # broadcasts and falls behind. But the cut can also depose the leader — the
+      # victim's `nodedown` sends it back to the elector, and the handoff can land
+      # on the third member, which reaches *both* sides. Then the victim is never
+      # behind at all: the cluster routed around the cut, and the effect shows up
+      # as the epoch instead. Which one happens is real-clock election timing, so
+      # asserting only the first made this test flaky. Both are the system
+      # working; only neither means the topology is not what this test thinks.
       assert eventually(fn ->
-               Cluster.applied_version(victim) < Cluster.applied_version(leader)
+               Cluster.applied_version(victim) < Cluster.applied_version(leader) or
+                 Enum.any?(Cluster.alive(c), fn m ->
+                   match?(%{epoch: e} when e > epoch_before, Cluster.status(m))
+                 end)
              end),
-             "the victim did not fall behind — the partition had no effect"
+             "the victim did not fall behind and no re-election happened — the " <>
+               "partition had no effect"
 
       Cluster.heal_partition(c, leader, victim)
       # crashed?: true although nothing died: a partition can depose the leader and
