@@ -104,7 +104,7 @@ defmodule Dgen.MixProject do
   defp deps do
     [
       {:erlfdb, "~> 1.0", optional: true},
-      {:eta, "~> 0.1.0", only: :test},
+      {:eta, "~> 0.1", only: :test},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.40", only: :dev, runtime: false}
     ]
