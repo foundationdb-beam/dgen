@@ -418,17 +418,26 @@ eliminated.
 **Lock flow:**
 
 1. The callback returns `{lock, NewState}`.
-2. The consumer commits `NewState` to the DB **and** writes a lock key
-   (`{Tuid, <<"k">>}`) in the same transaction.
+2. The consumer commits `NewState` to the DB, dequeues the message, **and**
+   writes a lock key (`{Tuid, <<"k">>}`, holding `{Timestamp, Token}`) — all in
+   the same transaction. `Token` is unique to this acquisition; the consumer
+   retains it along with the message's queue envelope.
 3. Any other consumer that tries to consume from the queue reads
    `is_locked = true` and parks itself on a DB watch instead of processing.
 4. The consumer that set the lock calls `handle_locked/4` with the **same**
    event type and message that triggered the lock, plus the committed
    `NewState`. This is the synchronous coordination window.
-5. After `handle_locked/4` returns (regardless of its return value), the lock
+5. The consumer commits the result of `handle_locked/4` in a **second**
+   transaction, conditional on the lock key still carrying its `Token`. If it
+   does not, the consumer was busted while it ran: nothing is written, the
+   message from step 2 is pushed back onto the queue in that same transaction,
+   and the consumer exits with `{lock_fenced, Requeued}`.
+6. After `handle_locked/4` returns (regardless of its return value), the lock
    key is cleared and the queue watch is notified in an `after` block —
-   always, even on exception.
-6. Parked consumers wake up, see `is_locked = false`, and resume normal queue
+   always, even on exception. The clear is conditional on the key still
+   carrying this consumer's `Token`: if it does not, this consumer was busted
+   while it ran and the lock now belongs to a successor, so it is left alone.
+7. Parked consumers wake up, see `is_locked = false`, and resume normal queue
    consumption.
 
 The lock therefore guarantees that between committing a state change and

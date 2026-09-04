@@ -7,9 +7,17 @@
 - Fixed a race where an unregister could delete a binding it didn't own,
   freeing a name twice under ordinary concurrency.
 - Fixed the DST harness's readiness poll hanging on a virtual clock deadline.
+- Fixed a lock holder that was busted mid-run releasing its successor's lock.
+- Fixed a lock holder that was busted mid-run overwriting its successor's
+  writes.
 
 ### Enhancements
 
+- The `dgen_server` lock is now fenced. A busted holder is refused at commit and
+  its message is retried, so `lock_timeout` can be tuned for recovery speed.
+  `handle_locked/4` must be safe to run twice. See
+  `docs/design/dgen_server_design.md` §4.4.
+- Added tests for `lock_timeout` and the `consume_batch` exit points.
 - `dgen_registry_member` rewritten as a `gen_statem` with explicit
   searching/assuming/leader/follower states. `sys:get_state/1` now returns
   `{State, Data}`.

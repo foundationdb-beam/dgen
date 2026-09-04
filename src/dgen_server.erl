@@ -61,8 +61,26 @@ The following options may be passed via the `Opts` proplist:
   lock persists until another consumer detects staleness: it re-checks
   `lock_timeout` ms after the lock was set and clears it if that deadline has
   passed.  `infinity` (the default) disables stale-lock detection entirely —
-  a dead holder will permanently block all consumers.  Set this to a value
-  safely larger than the worst-case `handle_locked` duration for your callback.
+  a dead holder will permanently block all consumers.
+
+  Busting is a time-based guess that the holder is dead, and nothing revokes a
+  holder that is merely slow, so the guess can be wrong.  The lock is **fenced**
+  against that: each acquisition stamps the key with a unique token, and a holder
+  may release the lock, and commit the result of `handle_locked/4`, only while the
+  key still carries its token.  A holder busted mid-run is therefore refused at
+  commit rather than overwriting what its successor has since written, and it
+  cannot release a successor's lock.
+
+  A fenced section is not lost.  The message that took the lock goes back on the
+  queue in the same transaction that refuses the commit, and the process exits with
+  `{lock_fenced, requeued}`; whichever consumer holds the lock next retries it.
+  Because `handle_locked/4` runs outside a transaction, its **external side effects
+  already happened and will happen again on the retry** — it must be safe to run
+  twice.
+
+  Since a wrong guess now costs a retry rather than silent data loss, set this for
+  the recovery time you want from a dead holder rather than above the worst-case
+  `handle_locked` duration.
 
 ## consume_k and inlining
 
@@ -246,7 +264,17 @@ is a component list will nest both encodings in the key path.
     cache_misses = 0 :: non_neg_integer(),
     dead_letter_threshold = infinity :: pos_integer() | infinity,
     consume_k = 1 :: pos_integer(),
-    lock_timeout = infinity :: pos_integer() | infinity
+    lock_timeout = infinity :: pos_integer() | infinity,
+    %% Token of the lock this process currently holds, set by set_lock/2 within the
+    %% transaction that acquired it.  Identifies *which* acquisition is ours, so
+    %% releasing and committing can tell our own lock from a successor's.
+    %% See clear_lock_owned/2 and owns_lock/2.
+    lock_token :: undefined | binary(),
+    %% The queue envelope of the message that took the lock, kept so a fenced
+    %% locked section can put it back rather than drop it (see consume_locked/5).
+    %% `undefined` for locks taken on the priority and inline paths, which have no
+    %% queued message behind them.
+    locked_envelope :: undefined | term()
 }).
 
 -type internalstate() :: #state{}.
@@ -980,7 +1008,10 @@ consume_batch(
                     {_, State2} = set_mod_state(Td, InitModState, ModState, State1),
                     dgen_queue:consume_peeked(Td, AllKVs, Quid),
                     PriorActions = lists:append(lists:reverse(AccActions)),
-                    State3 = State2#state{cache_misses = 0},
+                    %% This message leaves the queue here, in the transaction that
+                    %% takes the lock, so keep its envelope: if the locked section
+                    %% is later fenced, that is the only way to put it back.
+                    State3 = State2#state{cache_misses = 0, locked_envelope = Envelope},
                     case PriorActions of
                         [] -> {{lock, EventType, Msg}, ModState, State3};
                         _ -> {lock_batch, PriorActions, EventType, Msg, ModState, State3}
@@ -1078,43 +1109,77 @@ consume_locked(EventType, Msg, ModState, IsLocalReply, State = #state{tenant = T
                 erlang:error(Reason);
             {ok, OrigModState, CallbackResult, State1} ->
                 dgen_backend:transactional(Tenant, fun(Td) ->
-                    case
-                        handle_callback_result(
-                            Td,
-                            EventType,
-                            Msg,
-                            CallbackResult,
-                            OrigModState,
-                            State1
-                        )
-                    of
-                        {{reply, Reply, Actions}, LModState, State2} ->
-                            {call, From} = EventType,
-                            if
-                                IsLocalReply ->
-                                    {{reply, Reply, Actions}, LModState, State2};
-                                true ->
-                                    set_reply(Td, From, Reply),
-                                    {{noreply, Actions}, LModState, State2}
-                            end;
-                        {{noreply, Actions}, LModState, State2} ->
-                            {{noreply, Actions}, LModState, State2};
-                        {{stop, Reason, Actions}, LModState, State2} ->
-                            {{stop, Reason, Actions}, LModState, State2}
+                    %% Fence.  handle_locked/4 ran outside any transaction, so an
+                    %% arbitrary amount of time has passed since the lock was taken
+                    %% and another consumer may have judged this one dead and busted
+                    %% it.  CallbackResult was computed from the state read *before*
+                    %% the lock, so committing it now would overwrite whatever the
+                    %% successor has since done, silently.  Refuse instead.
+                    case owns_lock(Td, State1) of
+                        false ->
+                            fence(Td, State1);
+                        true ->
+                            case
+                                handle_callback_result(
+                                    Td,
+                                    EventType,
+                                    Msg,
+                                    CallbackResult,
+                                    OrigModState,
+                                    State1
+                                )
+                            of
+                                {{reply, Reply, Actions}, LModState, State2} ->
+                                    {call, From} = EventType,
+                                    if
+                                        IsLocalReply ->
+                                            {{reply, Reply, Actions}, LModState, State2};
+                                        true ->
+                                            set_reply(Td, From, Reply),
+                                            {{noreply, Actions}, LModState, State2}
+                                    end;
+                                {{noreply, Actions}, LModState, State2} ->
+                                    {{noreply, Actions}, LModState, State2};
+                                {{stop, Reason, Actions}, LModState, State2} ->
+                                    {{stop, Reason, Actions}, LModState, State2}
+                            end
                     end
                 end)
         after
             dgen_backend:transactional(Tenant, fun(Td) ->
-                clear_lock(Td, State)
+                clear_lock_owned(Td, State)
             end)
         end,
 
     case Result of
-        {{reply, _, _}, _, _} ->
-            finalize(Result);
+        {fenced, Requeued} ->
+            %% Raised only after the fencing transaction has committed, so the
+            %% requeue is durable before this process goes down.  Crashing is the
+            %% same disposition a failing callback gets: the mod state was not
+            %% written, no actions run, and the in-memory cache dies with the
+            %% process rather than being carried forward past a missed write.
+            erlang:error({lock_fenced, Requeued});
         _ ->
             finalize(Result)
     end.
+
+%% A fenced locked section: commit nothing of the callback's result, but put the
+%% message that took the lock back on the queue in the same transaction, so the
+%% refusal costs a retry rather than the message.  The retry is picked up by
+%% whichever consumer holds the lock now.
+%%
+%% The envelope is re-pushed verbatim, so a call keeps its reply slot (the waiting
+%% caller is never told; it simply waits for the retry) and the attempt counter is
+%% carried over unchanged — being fenced is not the message's fault and must not
+%% walk it toward the dead-letter queue.
+%%
+%% Priority and inline locks have no queued message (`locked_envelope` is
+%% undefined); for those the caller receives the exit.
+fence(_Td, #state{locked_envelope = undefined}) ->
+    {fenced, not_requeued};
+fence(Td, #state{locked_envelope = Envelope, tuid = Tuid}) ->
+    dgen_queue:push_k(Td, get_quid(Tuid), [Envelope]),
+    {fenced, requeued}.
 
 consume_info(Td, Info, State) ->
     case invoke_tx_callback(Td, handle_info, [Info], State) of
@@ -1158,10 +1223,19 @@ resolve_version(State = #state{mod_state_cache = {VF, ModStateResult}}) ->
 resolve_version(State) ->
     State.
 
+%% A lock records the time it was set — so staleness can be computed — and a token
+%% unique to this acquisition.  The token is what makes releasing safe: a holder
+%% busted mid-run must not clear the lock its successor now holds (clear_lock_owned/2).
+%%
+%% Runs inside the acquiring transaction, so on a commit conflict the whole closure
+%% re-runs and mints a fresh token; only the committed attempt's State survives, so
+%% the token in the returned State is always the one that actually landed.
 set_lock({Tx, Dir}, State = #state{tuid = Tuid}) ->
     B = dgen_config:backend(),
-    B:set(Tx, B:dir_pack(Dir, get_lock_key(Tuid)), term_to_binary(erlang:system_time(millisecond))),
-    State.
+    Token = crypto:strong_rand_bytes(8),
+    Value = term_to_binary({erlang:system_time(millisecond), Token}),
+    B:set(Tx, B:dir_pack(Dir, get_lock_key(Tuid)), Value),
+    State#state{lock_token = Token}.
 
 %% Single read of the lock key — returns not_locked | stale | {live, infinity | Ms}.
 %% Used by handle_consume to decide in one pass whether to clear, sleep, or proceed.
@@ -1176,29 +1250,74 @@ check_lock({Tx, Dir}, #state{tuid = Tuid, lock_timeout = Timeout}) ->
             {live, infinity};
         Value ->
             %% v0.3.0+ stores the set-time as a millisecond timestamp so we can
-            %% compute both staleness and the remaining wait in one decode.
+            %% compute both staleness and the remaining wait in one decode; v0.4.1+
+            %% pairs it with an acquisition token.  Both shapes are read, so a node
+            %% running the older writer stays interoperable during an upgrade.
             case (catch binary_to_term(Value)) of
+                {Ts, _Token} when is_integer(Ts) ->
+                    lock_liveness(Ts, Timeout);
                 Ts when is_integer(Ts) ->
-                    Elapsed = erlang:system_time(millisecond) - Ts,
-                    case Timeout of
-                        infinity ->
-                            {live, infinity};
-                        _ when Elapsed > Timeout ->
-                            stale;
-                        _ ->
-                            {live, Timeout - Elapsed}
-                    end;
+                    lock_liveness(Ts, Timeout);
                 _ ->
                     {live, infinity}
             end
     end.
 
+lock_liveness(Ts, Timeout) ->
+    Elapsed = erlang:system_time(millisecond) - Ts,
+    case Timeout of
+        infinity -> {live, infinity};
+        _ when Elapsed > Timeout -> stale;
+        _ -> {live, Timeout - Elapsed}
+    end.
+
+%% Unconditional release, used when busting a lock judged stale.  Safe there
+%% without a token check because check_lock/2 read the key in the same
+%% transaction: the read conflict fences this against a concurrent acquisition,
+%% so the clear can only commit if the value judged stale is still the one there.
 clear_lock(Td = {Tx, Dir}, #state{tuid = Tuid}) ->
     B = dgen_config:backend(),
     LockKey = B:dir_pack(Dir, get_lock_key(Tuid)),
     LockEnd = B:key_strinc(LockKey),
     B:clear_range(Tx, LockKey, LockEnd),
     dgen_queue:notify(Td, get_quid(Tuid)).
+
+%% Release for a holder letting go of a lock it acquired itself, which — unlike
+%% busting — happens in a *later* transaction than the one that took the lock.
+%% In between, a consumer that judged this holder stale may have busted it and
+%% taken the lock for its own locked section.  Clearing unconditionally would then
+%% release a lock this process does not hold, admitting a third consumer with no
+%% timeout elapsed and no fault: one late holder would unlock an arbitrarily long
+%% chain of successors.  So clear only a lock still carrying our own token.
+%%
+%% Declining to clear costs nothing.  A lock that really is this holder's leftover
+%% still carries its token and is cleared here; one that does not is a successor's
+%% live lock, which that successor will release, or the staleness path will bust.
+clear_lock_owned(Td, State) ->
+    case owns_lock(Td, State) of
+        true -> clear_lock(Td, State);
+        false -> ok
+    end.
+
+%% Does the lock key still carry the token this process acquired?
+%%
+%% The read is what makes fencing work: performed inside the transaction that is
+%% about to write, it puts the lock key in that transaction's conflict set, so a
+%% bust racing the commit forces a retry rather than slipping between the check
+%% and the write.  There is no window.
+owns_lock({Tx, Dir}, #state{tuid = Tuid, lock_token = Token}) when Token =/= undefined ->
+    B = dgen_config:backend(),
+    case B:wait(B:get(Tx, B:dir_pack(Dir, get_lock_key(Tuid)))) of
+        not_found ->
+            false;
+        Value ->
+            case (catch binary_to_term(Value)) of
+                {_Ts, Token} -> true;
+                _ -> false
+            end
+    end;
+owns_lock(_Td, #state{}) ->
+    false.
 
 get_lock_key(Tuid) ->
     dgen_key:extend(Tuid, <<"k">>).
