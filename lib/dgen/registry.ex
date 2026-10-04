@@ -51,6 +51,23 @@ defmodule DGen.Registry do
   *This documentation is LLM-generated. See the AI disclosure in `README.md`.*
   """
 
+  @spec child_spec(Keyword.t()) :: Supervisor.child_spec()
+  def child_spec(arg) do
+    %{
+      id: {__MODULE__, make_ref()},
+      start: {__MODULE__, :start_link, [arg]},
+      type: :supervisor,
+      restart: :permanent
+    }
+  end
+
+  @spec start_link(Keyword.t()) :: Supervisor.on_start()
+  def start_link(arg) do
+    name = Keyword.fetch!(arg, :name)
+    tenant = Keyword.fetch!(arg, :tenant)
+    start_link(name, tenant)
+  end
+
   @doc """
   Starts the registry `name` with default options.
 

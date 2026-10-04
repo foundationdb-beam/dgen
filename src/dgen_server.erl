@@ -219,7 +219,7 @@ is a component list will nest both encodings in the key path.
 
 -type server() :: gen_server:server_ref().
 -type option() ::
-    {tenant, dgen_backend:tenant()}
+    {tenant, dgen_backend:tenant() | function()}
     | {consume, boolean()}
     | {reset, boolean()}
     | {cache, boolean()}
@@ -461,13 +461,18 @@ parse_opts(Opts) ->
             undefined -> erlang:error({badarg, required, tenant});
             T -> T
         end,
+    Tenant2 =
+        if
+            is_function(Tenant) -> Tenant();
+            true -> Tenant
+        end,
     Consume = proplists:get_value(consume, Opts, true),
     Reset = proplists:get_value(reset, Opts, false),
     Cache = proplists:get_value(cache, Opts, true),
     DeadLetterThreshold = proplists:get_value(dead_letter_threshold, Opts, infinity),
     ConsumeK = proplists:get_value(consume_k, Opts, 1),
     LockTimeout = proplists:get_value(lock_timeout, Opts, infinity),
-    {Tenant, Consume, Reset, Cache, DeadLetterThreshold, ConsumeK, LockTimeout}.
+    {Tenant2, Consume, Reset, Cache, DeadLetterThreshold, ConsumeK, LockTimeout}.
 
 -spec init(term()) -> {ok, internalstate()} | {error, term()}.
 init({Tenant, Mod, Arg, Consume, Reset, Cache, DeadLetterThreshold, ConsumeK, LockTimeout}) ->

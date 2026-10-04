@@ -222,7 +222,7 @@ stakeholders are database entities. See §4.9 of the design doc.
 -if(?DOCATTRS).
 -doc "Starts the registry `Name` with default options. See `start_link/3` for per-registry tuning.".
 -endif.
--spec start_link(Name :: atom(), Tenant :: dgen_backend:tenant()) ->
+-spec start_link(Name :: atom(), Tenant :: dgen_backend:tenant() | function) ->
     supervisor:startlink_ret().
 start_link(Name, Tenant) ->
     start_link(Name, Tenant, #{}).
@@ -277,10 +277,17 @@ backstops (§4.6) cannot distinguish them.
 Note that `delete/2` takes the **keyspace** name, not a member's `Name`.
 """.
 -endif.
--spec start_link(Name :: atom(), Tenant :: dgen_backend:tenant(), Opts :: registry_opts()) ->
+-spec start_link(
+    Name :: atom(), Tenant :: dgen_backend:tenant() | function(), Opts :: registry_opts()
+) ->
     supervisor:startlink_ret().
 start_link(Name, Tenant, Opts) ->
-    supervisor:start_link(?MODULE, {Name, Tenant, Opts}).
+    Tenant2 =
+        if
+            is_function(Tenant) -> Tenant();
+            true -> Tenant
+        end,
+    supervisor:start_link(?MODULE, {Name, Tenant2, Opts}).
 
 %% ---------------------------------------------------------------------------
 %% OTP via-tuple registry contract
