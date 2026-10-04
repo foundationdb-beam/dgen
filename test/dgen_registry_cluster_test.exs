@@ -1541,13 +1541,18 @@ defmodule DGen.RegistryClusterTest do
              ),
              "the peer's replica did not converge on the removal"
 
-      # The name is genuinely free again.
+      # The name is genuinely free again. Leadership may still be settling: each
+      # side's backstop reap can re-elect during the partition, so the primary can
+      # come out of the heal as a stale leader whose fenced batch, or whose forward
+      # to the new leader, answers `no` ("leader changed, retry"). Give it the same
+      # budget as the convergence checks above, not the 2s default.
       pid2 = spawn(fn -> Process.sleep(:infinity) end)
       on_exit(fn -> Process.exit(pid2, :kill) end)
 
-      assert eventually(fn ->
-               :dgen_registry.register_name({reg, :redrive_me}, pid2) == :yes
-             end),
+      assert eventually(
+               fn -> :dgen_registry.register_name({reg, :redrive_me}, pid2) == :yes end,
+               20_000
+             ),
              "name was not re-registrable after the re-driven unregister"
     end
   end
