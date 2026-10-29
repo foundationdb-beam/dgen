@@ -8,6 +8,12 @@
   leadership moves before the leader answers it (including during the new
   leader's assume window). It is re-sent to the new leader, which decides it
   idempotently, so `no` stays reserved for a name held by another process.
+- A buffered unregister is no longer lost when its leader is deposed (or
+  re-elected) mid-commit with no leader known yet; its pid-guarded clear is held
+  until a leader can take it.
+- A registration is no longer answered `no` when its leader's commit fails or the
+  leader is deposed before answering it; it is retried, or re-sent to the next
+  leader.
 - `whereis_name/1` and `get_metadata/1` no longer briefly read a bound name as
   `undefined` while a member re-baselines its replica (a resync or handoff).
 
@@ -15,9 +21,10 @@
 
 - `dgen_registry_member`'s replica (table, index, applied version, epoch) and
   its admission rules are extracted into `dgen_registry_replica`, and its
-  in-flight client requests into `dgen_registry_intents`. The member publishes
-  `replica` and `intents` to `eta_observe` in place of the old per-field
-  stashes.
+  in-flight client requests into `dgen_registry_intents`, and the leader's write
+  pipeline into `dgen_registry_pipeline`. The member publishes `replica`,
+  `intents` and `pipeline` to `eta_observe` in place of the old per-field
+  state.
 
 ## v0.4.2 (2026-10-04)
 

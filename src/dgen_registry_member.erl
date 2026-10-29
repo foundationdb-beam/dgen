@@ -11,8 +11,7 @@
         replica,
         synced,
         intents,
-        committing,
-        num_pending
+        pipeline
     ]}
 ).
 
@@ -135,10 +134,11 @@
 %%
 %% A `set_metadata` forward is also asynchronous: the follower keeps `From` as an
 %% intent under a `Ref`, casts `{set_meta_req, Ref, Self, Name, Index, Data}`, and
-%% answers the caller when the leader's `{set_meta_reply, Ref, _}` arrives. No optimistic update is needed —
-%% routing the reply back through this member means the leader's `{names_batch, …}`
-%% broadcast (FIFO, ahead of the reply) has updated the follower's row before the caller
-%% is answered, preserving read-after-write for a subsequent local `get_metadata`.
+%% answers the caller when the leader's `{set_meta_reply, Ref, _}` arrives. No
+%% optimistic update is needed — routing the reply back through this member means the
+%% leader's `{names_batch, …}` broadcast (FIFO, ahead of the reply) has updated the
+%% follower's row before the caller is answered, preserving read-after-write for a
+%% subsequent local `get_metadata`.
 %%
 %% This async forward is required for deadlock-freedom: no member ever blocks its
 %% loop on a call to another member on the registration path. (A blocking forward
@@ -195,9 +195,9 @@
 %%     gen_statem's `postpone` (that, and the CP contract: an
 %%     unreachable-leader unregister answers `ok` NOW and keeps the intent,
 %%     where postpone would defer the reply; and intents also originate
-%%     internally from batch-salvage paths, which are not events).
-%%   - the commit pipeline (`committing`): ops must accumulate during an
-%%     in-flight commit, never be postponed.
+%%     internally from the leader pipeline's exits, which are not events).
+%%   - the commit pipeline (`dgen_registry_pipeline`): ops must accumulate
+%%     during an in-flight commit, never be postponed.
 %%
 %% ## Leader role
 %%
@@ -226,9 +226,9 @@
 %%
 %% The leader is the sole writer for the name table. It:
 %%
-%% - Serves all writes through one **group-commit buffer** — registrations
-%%   (`{register}` calls), unregisters (`{unregister}` casts), and auto-unregisters
-%%   (monitored-process `DOWN`s). Each is parked in the pending buffer; at most one
+%% - Serves all writes through one **group-commit pipeline** (`dgen_registry_pipeline`)
+%%   — registrations (`{register}` calls), unregisters (`{unregister}` casts), and
+%%   auto-unregisters (monitored-process `DOWN`s). Each is queued; at most one
 %%   commit runs at a time, so ops that arrive while a commit is in flight accumulate
 %%   and ride the next batch (`dgen_registry_names:start_commit/4`, whose only write is
 %%   a fenced bump of the per-registry version key — the name delta is applied in
@@ -244,7 +244,11 @@
 %%   `{names_batch, …}` broadcast. A name already held by a *different* live
 %%   pid is rejected (`no`); re-registering the *same* pid under the same name is an
 %%   idempotent `yes` (see plan_op/3); a `DOWN` whose ref no longer matches the current
-%%   binding is ignored; a fenced commit (leadership lost) rejects the whole batch.
+%%   binding is ignored.  An op the leader cannot finish — its commit failed or was
+%%   fenced, or the leader was deposed with it queued — leaves through one rule,
+%%   dgen_registry_pipeline:surrender/2: a registration is retried or re-driven to
+%%   the next leader, never answered `no`; an unregister is held as a pid-guarded
+%%   retract until a leader takes it, never dropped.
 %% - Handles `{whereis, LogicalName}` calls: consistent read from local map.
 %% - Handles `{unregister, LogicalName}` calls (and legacy casts): updates the map,
 %%   demonitors, replicates the batch, and answers the tracked
@@ -386,11 +390,11 @@
 %% follower per interval, independent of the number of registered names.
 -define(REPLICA_HEARTBEAT_INTERVAL, 5000).
 
-%% Delay before re-driving the destructive ops (removes/retracts/downs) of a batch
-%% that failed to commit — a backend error, a fence, or a worker death.  Registrations
-%% are simply rejected (callers retry), but a lost unregister/retract would leave a
-%% permanent replica divergence, so those are re-enqueued (still leader) or forwarded
-%% to the current leader (deposed) after this delay.
+%% Delay before retrying the ops of a batch that failed — a backend error, a fence, a
+%% worker death, or a commit under a leadership view that has since moved.  They are
+%% re-enqueued if this member still leads, or surrendered as deposed otherwise
+%% (dgen_registry_pipeline:surrender/2).  The delay keeps a persistently failing
+%% backend from spinning.
 -define(REQUEUE_DELAY, 1000).
 
 %% Bound on the per-peer aliveness probe used when adjudicating a suspected conflict.
@@ -418,11 +422,6 @@
 %% row shape as the member's names table) so a test can pre-populate the pre-batch state.
 -export([plan_batch/4]).
 
-%% A registration's metadata: an indexed map (queryable, a later increment) and an
-%% opaque data payload (returned verbatim).  A plain register_name/2 uses the empty
-%% default `{#{}, undefined}`.  See §4.7 of the design doc.
--type meta() :: {Index :: map(), Data :: term()}.
-
 %% A presence subscription's watch/notify queries, in the internal tagged form (see
 %% dgen_registry:query/0).  Extensible: only `{all, Constraints}` (AND-equal) exists today.
 -type query() :: {'all', #{term() => term()}}.
@@ -433,56 +432,6 @@
 %% database entity and re-address it (unsubscribe, re-subscribe) by the same stable key
 %% across a full cluster restart.
 -type sub_id() :: term().
-
-%% Where a write op came from, and how to answer it once committed:
-%%   - {local, From}:           a direct register/2,3 call to this leader; answered
-%%                              with gen_server:reply/2.
-%%   - {forward, MemberId, Ref}: a registration forwarded by a follower; answered
-%%                              with a {register_reply, Ref, _} cast to that member,
-%%                              which then answers its own caller.
-%%   - {meta, From}:            a set_metadata call made directly on this leader;
-%%                              answered with gen_server:reply/2.
-%%   - {forward_meta, MemberId, Ref}: a set_metadata forwarded by a follower; answered
-%%                              with a {set_meta_reply, Ref, _} cast to that member,
-%%                              which then answers its own caller (after the FIFO-ordered
-%%                              {names_batch} broadcast has updated the follower's row).
-%%   - {unreg, From}:           an unregister_name call made directly on this leader;
-%%                              answered `ok` with gen_server:reply/2 once committed.
-%%   - {forward_unreg, MemberId, Ref}: an unregister forwarded by a follower; answered
-%%                              with an {unregister_reply, Ref} cast to that member,
-%%                              which then answers its own caller `ok` (after the
-%%                              FIFO-ordered {names_batch} broadcast).
--type origin() ::
-    {local, gen_server:from()}
-    | {forward, dgen_registry_elector:member_id(), reference()}
-    | {meta, gen_server:from()}
-    | {forward_meta, dgen_registry_elector:member_id(), reference()}
-    | {unreg, gen_server:from()}
-    | {forward_unreg, dgen_registry_elector:member_id(), reference()}.
-
-%% A leader write op awaiting the next group commit.  All ride one fenced commit (a
-%% single version-key bump) and are applied to the local replica in arrival order, so
-%% the batched outcome equals sequential one-at-a-time processing:
-%%   - add:      a registration (with its metadata); the origin gets the deferred yes/no.
-%%   - set_meta: replace an existing registration's metadata; the origin ({meta, From})
-%%               gets `ok`, or `{error, not_registered}` if the name is not bound.
-%%   - remove:   an unregister (by name).  ReleasedPid is the pid that was bound when
-%%               the unregister was enqueued (or `undefined` if the name was unbound),
-%%               captured before the leader removes it from the replica optimistically.
-%%               A non-`undefined` ReleasedPid both drives the durable clear and is
-%%               recorded in `recently_released` (the conflict-detector trail, §5.6).
-%%               Origin (or `undefined` for a legacy cast / salvaged re-drive) is
-%%               answered `ok` once the batch commits.
-%%   - down:     an auto-unregister from a monitored process exit; Ref-guarded so a
-%%               stale DOWN for an already-re-registered name is ignored.  The pid is
-%%               dead, so it is *not* recorded in `recently_released`.
--type batch_op() ::
-    {add, LogicalName :: term(), Pid :: pid(), Meta :: meta(), Origin :: origin()}
-    | {set_meta, LogicalName :: term(), Index :: map(), Data :: term(), Origin :: origin()}
-    | {remove, LogicalName :: term(), ReleasedPid :: pid() | undefined,
-        Origin :: origin() | undefined}
-    | {retract, LogicalName :: term(), Pid :: pid()}
-    | {down, LogicalName :: term(), Ref :: reference()}.
 
 -record(state, {
     member_id :: dgen_registry_elector:member_id(),
@@ -542,21 +491,15 @@
     %% a forwarded reply, or (a gap-deferred `yes`) our replica catching up.  See
     %% dgen_registry_intents for the phases and the re-drive rules.
     intents = dgen_registry_intents:new() :: dgen_registry_intents:t(),
-    %% Leader-only: direct (local-origin) registrations that have committed but are
-    %% awaiting follower replica confirmation before being acked `yes` (the two-holder
-    %% invariant, §5.5/§8).  BatchRef => {Direct, TimerRef, Needed, Acked}, where
-    %% Direct is `[{Origin, Name, Pid}]`, Needed is the `register_replicas` target
-    %% (bounded by follower count), and Acked is the set of distinct followers that
-    %% confirmed.  Answered `yes` once `map_size(Acked) >= Needed`, or on timeout per
-    %% the `strict_replication` policy (degrade-open `yes`, or fail-closed `no` +
-    %% retract).
-    pending_acks = #{} ::
-        #{
-            reference() =>
-                {[{origin(), term(), pid()}], reference(), non_neg_integer(), #{
-                    dgen_registry_elector:member_id() => true
-                }}
-        },
+    %% Leader-only: every write op accepted and not yet answered — queued for the
+    %% next group commit, in the single in-flight commit, or (a direct registration)
+    %% awaiting a follower's confirmation before its `yes`.  See
+    %% dgen_registry_pipeline for the phases and the one rule for an op the leader
+    %% cannot finish.
+    pipeline = dgen_registry_pipeline:new() :: dgen_registry_pipeline:t(),
+    %% The epoch in which a fenced commit last made this member re-announce itself
+    %% (rejoin_once_fenced/1), so it does so at most once per epoch.
+    fence_rejoined = undefined :: undefined | non_neg_integer(),
     %% Token used in our own {join, Self, Token} announcement.  Refreshed on
     %% each nodeup so any stale {member_down, Self, OldToken} in the queue is
     %% discarded by the elector.
@@ -565,26 +508,6 @@
     %% Echoed back in {member_down, PeerId, Token} so the elector can distinguish
     %% a stale DOWN (from before a re-join) from a fresh one.
     peer_tokens :: #{dgen_registry_elector:member_id() => reference()},
-    %% Leader-only group-commit buffer: write ops (adds + removes) awaiting their
-    %% batched commit, as a FIFO queue (oldest at the front, the commit order).  An
-    %% add's From is the deferred caller (a local direct register or a forwarding
-    %% follower's call), answered via gen_server:reply/2 once the batch commits.
-    pending = queue:new() :: queue:queue(batch_op()),
-    %% Number of ops in `pending`, maintained incrementally so the batch size is
-    %% known in O(1) (no length/1 scan on the commit path).
-    num_pending = 0 :: non_neg_integer(),
-    %% Leader-only: the in-flight commit, or undefined when none is running.  Only
-    %% one commit runs at a time (group commit): ops arriving while it is in flight
-    %% accumulate in `pending` and are committed in the next batch once it completes.
-    %% Holds the worker correlation ref, the monitor ref (so a worker that dies
-    %% without delivering a result does not wedge the commit lock), and the plan to
-    %% apply on success.
-    committing = undefined ::
-        undefined | #{ref := reference(), mref := reference(), plan := map()},
-    %% Leader-only: the last committed version, pinned as the next commit's read
-    %% version to skip a GRV (cached GRV).  A stale value is handled by the worker
-    %% retrying with a fresh GRV.  Reset on losing leadership.
-    last_version = undefined :: undefined | integer(),
     %% Timer for an outstanding resync request (a gap was observed and a snapshot was
     %% requested from the broadcast's leader); `undefined` when none is outstanding.
     %% Cleared when any snapshot arrives; on expiry the next gap re-requests.
@@ -712,13 +635,8 @@ init(#{name := Name, tenant := Tenant, tuid := Tuid} = Args) ->
             members = #{},
             monitors = #{},
             name_to_ref = #{},
-            pending_acks = #{},
             join_token = make_ref(),
             peer_tokens = #{},
-            pending = queue:new(),
-            num_pending = 0,
-            committing = undefined,
-            last_version = undefined,
             recently_released = #{},
             kill_budget = #{},
             degraded = false,
@@ -1328,23 +1246,14 @@ handle_cast(
 %% followers (a duplicate ack from the same one does not count); once
 %% `register_replicas` of them have confirmed, the two-holder (or n-holder) invariant
 %% is met for that batch's direct registrations — answer them `yes`.
-handle_cast({replicate_ack, BatchRef, FollowerId}, State = #state{pending_acks = PA}) ->
-    case maps:get(BatchRef, PA, undefined) of
-        {Direct, TimerRef, Needed, Acked} ->
-            Acked1 = Acked#{FollowerId => true},
-            case map_size(Acked1) >= Needed of
-                true ->
-                    erlang:cancel_timer(TimerRef),
-                    deliver_direct(Direct),
-                    {noreply, State#state{pending_acks = maps:remove(BatchRef, PA)}};
-                false ->
-                    {noreply, State#state{
-                        pending_acks = PA#{BatchRef => {Direct, TimerRef, Needed, Acked1}}
-                    }}
-            end;
-        undefined ->
-            %% Already answered (enough acks or the timeout) — ignore.
-            {noreply, State}
+handle_cast({replicate_ack, BatchRef, FollowerId}, State = #state{pipeline = P}) ->
+    case dgen_registry_pipeline:ack(BatchRef, FollowerId, P) of
+        {done, Direct, TimerRef, P1} ->
+            erlang:cancel_timer(TimerRef),
+            deliver_direct(Direct),
+            {noreply, State#state{pipeline = P1}};
+        {waiting, P1} ->
+            {noreply, State#state{pipeline = P1}}
     end;
 %% Replication broadcast.  One message per committed batch, carrying `{Ops, Epoch,
 %% PrevVersion, Version, LeaderId}`: the batch's ops in commit order, the leader's
@@ -1516,71 +1425,37 @@ apply_presence_update(unsubscribe_all, State) ->
 %%     §5.6 termination.
 %%   - true: **fail closed** — reject (`no`) and retract the just-applied binding via
 %%     an unregister, so the caller never sees a `yes` that was not replicated.
-handle_info({replicate_timeout, BatchRef}, State = #state{pending_acks = PA, config = Config}) ->
-    case maps:take(BatchRef, PA) of
-        {{Direct, _TimerRef, Needed, Acked}, PA1} ->
-            State1 = State#state{pending_acks = PA1},
+handle_info({replicate_timeout, BatchRef}, State = #state{pipeline = P, config = Config}) ->
+    case dgen_registry_pipeline:ack_timeout(BatchRef, P) of
+        {expired, Direct, Needed, Got, P1} ->
+            State1 = State#state{pipeline = P1},
             case dgen_config:strict_replication(Config) of
                 false ->
-                    notify_degrade_open(Needed, map_size(Acked), length(Direct)),
+                    notify_degrade_open(Needed, Got, length(Direct)),
                     deliver_direct(Direct),
                     {noreply, State1};
                 true ->
                     {noreply, reject_and_retract_direct(Direct, State1)}
             end;
-        error ->
+        none ->
             %% Already answered by an ack — ignore.
             {noreply, State}
     end;
 %% Result of an in-flight group commit (from the dgen_transaction worker).
-handle_info(
-    {dgen_transaction, Ref, Reply},
-    State = #state{
-        committing = #{ref := Ref, mref := MRef, plan := Plan},
-        member_id = Self,
-        leader = Leader
-    }
-) ->
-    Epoch = epoch(State),
-    %% Drop the worker monitor (and any DOWN already queued behind this result —
-    %% signal ordering guarantees the result arrives before the DOWN).
-    erlang:demonitor(MRef, [flush]),
-    PlanEpoch = maps:get(epoch, Plan),
-    State1 =
-        case Reply of
-            {committed, Version} when Leader =:= Self, PlanEpoch =:= Epoch ->
-                apply_committed_plan(Plan, Version, State);
-            {committed, _Version} ->
-                %% The commit landed, but this member's leadership view moved while
-                %% the worker was in flight (deposed, or a new epoch).  Applying an
-                %% old-term plan over new-term state — or broadcasting it stamped
-                %% with the old epoch — would diverge the replicas, so the plan is
-                %% discarded: nothing was applied or broadcast (the durable effect
-                %% of a commit is only the version bump), callers are answered as
-                %% rejected and retry against the current leader, and the batch's
-                %% destructive ops are salvaged below so no unregister is lost.
-                salvage_failed_plan(reject_plan(Plan, State), Plan);
-            _Fenced_or_error ->
-                %% {aborted, fenced} (lost leadership) or {error, _} (backend
-                %% failure / retry exhausted): the batch did not commit.  Reject
-                %% every registration in it (callers retry); re-drive the
-                %% destructive ops so a lost unregister/retract cannot leave a
-                %% permanent replica divergence.
-                salvage_failed_plan(reject_plan(Plan, State), Plan)
-        end,
-    %% Start the next batch if more ops have accumulated.
-    {noreply, maybe_start_commit(State1#state{committing = undefined})};
-handle_info({dgen_transaction, _StaleRef, _Reply}, State) ->
-    %% Result for a commit we are no longer tracking — ignore.
-    {noreply, State};
-%% The commit worker died without delivering a result (e.g. it was killed).  Fail
-%% the batch so its registrations are answered and the commit lock is released.
-handle_info(
-    {'DOWN', MRef, process, _Pid, _Reason},
-    State = #state{committing = #{mref := MRef, plan := Plan}}
-) ->
-    State1 = salvage_failed_plan(reject_plan(Plan, State), Plan),
-    {noreply, maybe_start_commit(State1#state{committing = undefined})};
+handle_info({dgen_transaction, Ref, Reply}, State = #state{pipeline = P}) ->
+    case dgen_registry_pipeline:finish(Ref, P) of
+        {ok, Plan, MRef, P1} ->
+            %% Drop the worker monitor (and any DOWN already queued behind this
+            %% result — signal ordering guarantees the result arrives before the DOWN).
+            erlang:demonitor(MRef, [flush]),
+            State1 = commit_result(Reply, Plan, State#state{pipeline = P1}),
+            %% Start the next batch if more ops have accumulated.
+            {noreply, maybe_start_commit(State1)};
+        stale ->
+            %% Result for a commit we are no longer tracking — ignore.
+            {noreply, State}
+    end;
+
 %% A registered process died (leader only).  The monitor was created with
 %% `{tag, {down, Name}}` (erlang:monitor/3), so the death arrives already naming
 %% its binding — no reverse ref map to consult (or to build n entries of at every
@@ -1599,10 +1474,17 @@ handle_info({'DOWN', Ref, process, _Pid, _Reason}, State) ->
     } = State,
     case maps:get(Ref, Monitors, undefined) of
         undefined ->
-            %% Not a peer-member monitor, and registered-process monitors carry a
-            %% `{down, Name}` tag (previous clause) — an untagged unknown DOWN is
-            %% a late straggler from a monitor already demonitored.  Ignore.
-            {noreply, State};
+            %% Not a peer-member monitor (registered-process monitors carry a
+            %% `{down, Name}` tag, previous clause): the commit worker, or a late
+            %% straggler from a monitor already demonitored.
+            case dgen_registry_pipeline:worker_down(Ref, State#state.pipeline) of
+                {ok, Plan, P1} ->
+                    %% The worker died without delivering a result: the batch failed.
+                    State1 = State#state{pipeline = P1},
+                    {noreply, maybe_start_commit(surrender(failed, maps:get(ops, Plan), State1))};
+                stale ->
+                    {noreply, State}
+            end;
         Self ->
             %% Stale self-monitor — should not happen, ignore.
             {noreply, State};
@@ -1884,46 +1766,17 @@ handle_info(
             self() ! {monitor_sweep, Epoch, Cont1},
             {noreply, State#state{name_to_ref = NTR1}}
     end;
-%% Re-drive the destructive ops of a batch that failed to commit (see
-%% salvage_failed_plan): re-enqueue them if we are (still) the leader, or forward
-%% the pid-guarded clears to the current leader if we were deposed — so an
-%% unregister or strict-mode retract is never silently lost, which would otherwise
-%% leave replicas divergent (or a `no`-answered binding alive) until an unrelated
-%% handoff.
-handle_info({requeue_ops, Ops}, State = #state{leader = Leader, member_id = Self}) when
-    Leader =:= Self
-->
-    {noreply, lists:foldl(fun enqueue_op/2, State, Ops)};
-handle_info({requeue_ops, Ops}, State = #state{leader = Leader}) when Leader =/= undefined ->
-    lists:foreach(
-        fun
-            ({remove, Name, Pid, _Origin}) when is_pid(Pid) -> forward_retract(Leader, Name, Pid);
-            ({retract, Name, Pid}) -> forward_retract(Leader, Name, Pid);
-            %% A remove that never had a bound pid nets to nothing; a down is the
-            %% new leader's to observe via its own monitor.
-            (_) -> ok
-        end,
-        Ops
-    ),
-    {noreply, State};
+%% Retry the ops of a batch that failed (dgen_registry_pipeline:surrender/2): put
+%% them back in the pipeline if we still lead, otherwise surrender them as deposed —
+%% a local registration becomes an intent, an unregister an answered retract intent,
+%% so nothing is answered `no` or silently lost because leadership moved.  A local
+%% registration whose caller has died since is dropped: no one is left to answer, and
+%% retrying it would only bind a name for a request that was abandoned.
+handle_info({requeue_ops, Ops}, State = #state{leader = Self, member_id = Self}) ->
+    Live = [Op || Op <- Ops, caller_alive(Op)],
+    {noreply, maybe_start_commit(lists:foldl(fun enqueue_op/2, State, Live))};
 handle_info({requeue_ops, Ops}, State) ->
-    %% No leader right now (likely mid-handoff — the assume window, leader =
-    %% undefined).  Hold the pid-guarded clears as unregister intents so the assume
-    %% continuation (or the next snapshot) re-drives them, rather than dropping them
-    %% and leaving a divergence until an unrelated handoff.  Downs are dropped — the
-    %% new leader monitors those pids itself.
-    Stashed = lists:foldl(
-        fun
-            ({remove, Name, Pid, _Origin}, S) when is_pid(Pid) ->
-                submit_intent({unregister, Name, Pid}, answered, S);
-            ({retract, Name, Pid}, S) ->
-                submit_intent({unregister, Name, Pid}, answered, S);
-            (_, S) -> S
-        end,
-        State,
-        Ops
-    ),
-    {noreply, Stashed};
+    {noreply, surrender(deposed, Ops, State)};
 %% Periodic durable-epoch check (piggybacked on the mesh pass): the election record
 %% in the database is ahead of what this member has heard.  That means a leadership
 %% handoff happened that never reached us — the elector's post-commit assume action
@@ -2020,7 +1873,9 @@ relinquish_leadership(State = #state{name_to_ref = NTR}) ->
         end,
         NTR
     ),
-    State#state{name_to_ref = #{}, last_version = undefined}.
+    State#state{
+        name_to_ref = #{}, pipeline = dgen_registry_pipeline:new_term(State#state.pipeline)
+    }.
 
 %% Gather every reachable member's names map across this (assuming) leader's own
 %% replica and every other reachable member.  Because the leader's broadcasts are
@@ -2420,8 +2275,8 @@ route_register(Name, Pid, Meta, From, State = #state{leader = Leader, member_id 
 %% clear and the conflict trail (§5.6):
 %%   - Leader: optimistically remove the local row (a caller-side whereis_name/1 on this
 %%     node sees the delete at once) and park the durable removal in the group-commit
-%%     buffer with the caller as origin — answered `ok` on commit.  A batch that fails
-%%     salvages its removes, so `ok` means "accepted and re-driven", never "dropped".
+%%     pipeline with the caller as origin — answered `ok` on commit.  A batch that fails
+%%     retries its removes, so `ok` means "accepted and re-driven", never "dropped".
 %%   - Follower, reachable leader: delete the local row and forward as a *tracked*
 %%     intent under Ref (a dropped forward or deposed leader is recovered by
 %%     redrive_intents/2 — a pid-guarded retract to the then-current leader).
@@ -2527,59 +2382,31 @@ forward_msg(Ref, Self, {unregister, Name, _ReleasedPid}) ->
 forward_msg(Ref, Self, {set_meta, Name, Index, Data}) ->
     {set_meta_req, Ref, Self, Name, Index, Data}.
 
-%% Append a write op to the pending queue (FIFO), then try to start a commit.  If
-%% one is already in flight, the op just accumulates and rides the next batch
-%% (started when the in-flight commit completes).
-enqueue_op(Op, State = #state{pending = Pending, num_pending = NumPending}) ->
-    maybe_start_commit(State#state{
-        pending = queue:in(Op, Pending), num_pending = NumPending + 1
-    }).
+%% Append a write op to the pipeline, then try to start a commit.  If one is already
+%% in flight, the op just accumulates and rides the next batch (started when the
+%% in-flight commit completes).
+enqueue_op(Op, State = #state{pipeline = P}) ->
+    maybe_start_commit(State#state{pipeline = dgen_registry_pipeline:enqueue(Op, P)}).
 
-%% Start a group commit for the pending buffer if appropriate.  At most one commit
-%% runs at a time; ops that arrive while it is in flight accumulate and ride the
-%% next batch.  Plans the batch (in arrival order), spawns a dgen_transaction
-%% worker to commit it off this process's loop, and stashes the plan to apply when
-%% the worker reports back.
-maybe_start_commit(State = #state{committing = C}) when C =/= undefined ->
-    %% A commit is in flight; this batch waits for it.
-    State;
-maybe_start_commit(State = #state{num_pending = 0}) ->
-    State;
-maybe_start_commit(State = #state{member_id = Self, leader = Leader, pending = Pending}) when
-    Leader =/= Self
-->
-    %% Not (or no longer) the leader — reject every buffered registration and
-    %% set_metadata (caller retries against the new leader); forward buffered
-    %% removes/retracts to the new leader as pid-guarded retracts so an unregister
-    %% (or a strict-mode retraction whose caller already heard `no`) is not silently
-    %% lost with the deposition.  Downs are dropped: the new leader monitors the
-    %% pids itself and observes their exits directly.
-    lists:foreach(
-        fun
-            ({add, _N, _P, _Meta, Origin}) ->
-                deliver_reply(Origin, reject_value(Origin));
-            ({set_meta, _N, _I, _D, Origin}) ->
-                deliver_reply(Origin, reject_value(Origin));
-            ({remove, N, P, Origin}) ->
-                %% Forward the pid-guarded clear, and answer the tracked caller `ok`
-                %% (the forwarded retract carries the removal onward).
-                case is_pid(P) of
-                    true -> forward_retract(Leader, N, P);
-                    false -> ok
-                end,
-                case Origin of
-                    undefined -> ok;
-                    _ -> deliver_reply(Origin, reject_value(Origin))
-                end;
-            ({retract, N, P}) ->
-                forward_retract(Leader, N, P);
-            (_) ->
-                ok
-        end,
-        queue:to_list(Pending)
-    ),
-    State#state{pending = queue:new(), num_pending = 0};
-maybe_start_commit(State) ->
+%% Start a group commit for the queued ops if appropriate.  At most one commit runs
+%% at a time; ops that arrive while it is in flight accumulate and ride the next
+%% batch.  Plans the batch (in arrival order), spawns a dgen_transaction worker to
+%% commit it off this process's loop, and stashes the plan to apply when the worker
+%% reports back.  A member that no longer leads surrenders the queue instead.
+maybe_start_commit(State = #state{pipeline = P, leader = Leader, member_id = Self}) ->
+    case {dgen_registry_pipeline:in_flight(P), dgen_registry_pipeline:num_pending(P)} of
+        {true, _} ->
+            State;
+        {false, 0} ->
+            State;
+        {false, _} when Leader =/= Self ->
+            {Ops, P1} = dgen_registry_pipeline:take_pending(P),
+            surrender(deposed, Ops, State#state{pipeline = P1});
+        {false, _} ->
+            start_commit(State)
+    end.
+
+start_commit(State) ->
     Epoch = epoch(State),
     Tab = dgen_registry_replica:tab(State#state.replica),
     #state{
@@ -2587,19 +2414,14 @@ maybe_start_commit(State) ->
         tenant = Tenant,
         tuid = Tuid,
         name_to_ref = NTR,
-        pending = Pending,
-        num_pending = NumPending,
-        last_version = LastVersion,
+        pipeline = P,
         config = Config
     } = State,
-    %% Take up to `commit_batch_size` oldest ops (front of the queue); the rest ride
-    %% the following batch.  num_pending keeps the size O(1), so no length/1 scan.
-    %% Bounding the batch keeps a burst (e.g. a departing node's DOWN flood) from
-    %% coalescing into one enormous commit whose O(batch) plan/apply/broadcast would
-    %% freeze the loop — see dgen_config:commit_batch_size/1.
-    BatchSize = min(NumPending, dgen_config:commit_batch_size(Config)),
-    {ThisBatch, Rest} = take_n(Pending, BatchSize),
-    State1 = State#state{pending = Rest, num_pending = NumPending - BatchSize},
+    %% Take up to `commit_batch_size` oldest ops; the rest ride the following batch
+    %% (see dgen_config:commit_batch_size/1).
+    {ThisBatch, P1} = dgen_registry_pipeline:take_batch(dgen_config:commit_batch_size(Config), P),
+    LastVersion = dgen_registry_pipeline:read_version(P1),
+    State1 = State#state{pipeline = P1},
     %% plan_batch resolves each op's binding lazily (its own batch-local overlay, falling
     %% back to a point ets:lookup) rather than needing a pre-seeded map of the whole
     %% registry — see plan_batch's doc.  Planning cost is O(batch), not O(registry size).
@@ -2627,7 +2449,7 @@ maybe_start_commit(State) ->
                 Self,
                 #{owner => self(), ref => Ref, epoch => Epoch, read_version => LastVersion}
             ),
-            State1#state{committing = #{ref => Ref, mref => MRef, plan => Plan}}
+            State1#state{pipeline = dgen_registry_pipeline:start(Ref, MRef, Plan, P1)}
     end.
 
 %% Apply a committed batch: bind/clear the touched names in the local replica (a
@@ -2685,7 +2507,7 @@ apply_committed_plan(Plan, Version, State) ->
     Rel1 = lists:foldl(fun(NamePid, Acc) -> Acc#{NamePid => Now} end, Rel0, Released),
     State1 = State0#state{
         name_to_ref = NTR1,
-        last_version = Version,
+        pipeline = dgen_registry_pipeline:committed(Version, State0#state.pipeline),
         recently_released = Rel1
     },
     %% Answer callers.  Forwarded registrations and all rejections are answered
@@ -2847,7 +2669,7 @@ confirm_direct([], _Version, State) ->
 confirm_direct(
     Direct,
     Version,
-    State = #state{members = Members, member_id = Self, pending_acks = PA, config = Config}
+    State = #state{members = Members, member_id = Self, pipeline = P, config = Config}
 ) ->
     Needed = min(dgen_config:register_replicas(Config), map_size(Members)),
     case Needed =< 0 of
@@ -2865,7 +2687,7 @@ confirm_direct(
                 dgen_config:replicate_timeout(Config), {replicate_timeout, BatchRef}
             ),
             State#state{
-                pending_acks = PA#{BatchRef => {Direct, TimerRef, Needed, #{}}}
+                pipeline = dgen_registry_pipeline:await_acks(BatchRef, Direct, TimerRef, Needed, P)
             }
     end.
 
@@ -2936,22 +2758,6 @@ telemetry_available() ->
             Available
     end.
 
-%% Reject a batch that did not commit (fenced or errored): answer every op with its
-%% rejection verdict (`no` for a registration, `{error, no_leader}` for a set_metadata
-%% — the leader changed mid-flight, so the caller should retry).  No durable or monitor
-%% state changed.
-reject_plan(#{replies := RepliesRev}, State) ->
-    lists:foreach(fun({Origin, _}) -> deliver_reply(Origin, reject_value(Origin)) end, RepliesRev),
-    State.
-
-reject_value({meta, _From}) -> {error, no_leader};
-reject_value({forward_meta, _MemberId, _Ref}) -> {error, no_leader};
-%% A rejected batch's removes are salvaged and re-driven (salvage_failed_plan), so
-%% `ok` remains the truthful answer for an unregister even when its batch failed.
-reject_value({unreg, _From}) -> ok;
-reject_value({forward_unreg, _MemberId, _Ref}) -> ok;
-reject_value(_Origin) -> no.
-
 %% Answer a write op's origin.  A direct (local) registration, set_metadata, or
 %% unregister is answered with gen_server:reply/2; a forwarded one with the matching
 %% reply cast ({register_reply} / {set_meta_reply} / {unregister_reply}) to the
@@ -2977,18 +2783,6 @@ deliver_committed_reply({forward, MemberId, Ref}, Result, Version) ->
     cast_to_member(MemberId, {register_reply, Ref, Result, Version});
 deliver_committed_reply(Origin, Result, _Version) ->
     deliver_reply(Origin, Result).
-
-%% Dequeue exactly N ops from the front of the queue (oldest first), returning
-%% {OpsInOrder, RestQueue}.  The caller guarantees N =< the queue's length
-%% (tracked in num_pending), so the queue never empties early.
-take_n(Queue, N) ->
-    take_n(Queue, N, []).
-
-take_n(Queue, 0, Acc) ->
-    {lists:reverse(Acc), Queue};
-take_n(Queue, N, Acc) ->
-    {{value, Op}, Queue1} = queue:out(Queue),
-    take_n(Queue1, N - 1, [Op | Acc]).
 
 %% Fold the ordered ops into a plan: the working name overlay, the net durable delta
 %% (`dbop`: Name => {set, PidNode} | {meta, PidNode} | clear, last write wins), the
@@ -3018,8 +2812,8 @@ plan_batch(Ops, Tab, NTR, Epoch) ->
         %% apply a plan whose epoch is no longer current (leadership moved while the
         %% worker was in flight), and the broadcasts are stamped with it.
         epoch => Epoch,
-        %% The raw ops, kept so a failed batch's destructive ops (removes/retracts/
-        %% downs) can be salvaged (salvage_failed_plan) instead of silently dropped.
+        %% The raw ops, kept so a failed batch can be surrendered
+        %% (dgen_registry_pipeline:surrender/2): retried, or handed to the intents.
         ops => Ops
     },
     lists:foldl(fun(Op, Acc) -> plan_op(Op, Epoch, Acc) end, Init, Ops).
@@ -3210,7 +3004,7 @@ plan_op({down, Name, Ref}, Epoch, Acc) ->
             Acc
     end.
 
-%% Append an `ok` reply for a tracked unregister's origin; a legacy/salvaged remove
+%% Append an `ok` reply for a tracked unregister's origin; a legacy/retried remove
 %% (origin `undefined`) has no caller to answer.
 unreg_reply(undefined, Rs) -> Rs;
 unreg_reply(Origin, Rs) -> [{Origin, ok} | Rs].
@@ -3394,34 +3188,80 @@ reply_fenced(From, Value, Denied, State = #state{tenant = Tenant, tuid = Tuid, m
     end),
     ok.
 
-%% Forward a pid-guarded retract to the (believed) current leader — used when a
-%% durable clear this member owed (an unregister, or a strict-mode retraction)
-%% cannot ride its own commit pipeline anymore.  Best-effort by necessity: with no
-%% leader there is nowhere to send it, and a later handoff gather reconciles.
-forward_retract(undefined, _Name, _Pid) ->
-    ok;
+%% Send a pid-guarded retract to a reachable leader — how an unregister intent is
+%% re-driven (dgen_registry_intents).  With no reachable leader the intent holds it
+%% instead, so this is only ever called with a leader to send to.
 forward_retract(Leader, Name, Pid) ->
     cast_to_member(Leader, {retract_req, Name, Pid}).
 
-%% A batch failed to commit (fenced / backend error / worker death) or committed
-%% but its plan is no longer applicable (leadership moved in flight).  Its
-%% registrations were rejected — callers retry — but its destructive ops (removes,
-%% retracts, downs) must be re-driven: dropping an unregister would leave this
-%% member's optimistic delete diverged from every other replica until an unrelated
-%% handoff, and dropping a retract would leave a `no`-answered binding alive.
-%% Scheduled after a short delay so a persistently failing backend does not spin.
-salvage_failed_plan(State, #{ops := Ops}) ->
-    Destructive = [
-        strip_remove_origin(Op)
-     || Op <- Ops,
-        element(1, Op) =:= remove orelse element(1, Op) =:= retract orelse
-            element(1, Op) =:= down
-    ],
-    case Destructive of
-        [] -> ok;
-        _ -> arm(?REQUEUE_DELAY, {requeue_ops, Destructive})
-    end,
-    State.
+%% The result of the in-flight commit.  Applied only if it committed under the
+%% leadership view it was planned in; otherwise the batch failed.
+commit_result(Reply, Plan, State = #state{leader = Leader, member_id = Self}) ->
+    case Reply of
+        {committed, Version} when Leader =:= Self ->
+            case maps:get(epoch, Plan) =:= epoch(State) of
+                true ->
+                    apply_committed_plan(Plan, Version, State);
+                false ->
+                    %% Committed, but under an older epoch: applying an old-term plan
+                    %% over new-term state — or broadcasting it stamped with the old
+                    %% epoch — would diverge the replicas.  Nothing was applied or
+                    %% broadcast (the durable effect of a commit is only the version
+                    %% bump), so the batch is simply failed and retried.
+                    surrender(failed, maps:get(ops, Plan), State)
+            end;
+        {aborted, fenced} ->
+            %% A newer leader holds the durable record: we were deposed and have not
+            %% heard.  Retrying here would only be fenced again until the news
+            %% arrives, so ask for it now (see rejoin_once_fenced/1).
+            surrender(failed, maps:get(ops, Plan), rejoin_once_fenced(State));
+        _Deposed_or_error ->
+            %% Committed after we were deposed (discarded, as above), or {error, _}
+            %% (backend failure, retries exhausted): the batch failed.
+            surrender(failed, maps:get(ops, Plan), State)
+    end.
+
+%% A fenced commit is proof that this member was deposed without hearing it.  Re-
+%% announce to the elector, as the connector's periodic durable-epoch check would
+%% (`{durable_epoch, _}`), so the membership event it produces brings us up to date
+%% now, while the retried ops wait, rather than at the connector's next check (up to
+%% ~10 s).  Once per epoch: a member partitioned from the new leader keeps being
+%% fenced, and each join is a durable queue entry.
+rejoin_once_fenced(State = #state{fence_rejoined = Epoch}) when Epoch =/= undefined ->
+    case epoch(State) of
+        Epoch -> State;
+        _ -> rejoin_once_fenced(State#state{fence_rejoined = undefined})
+    end;
+rejoin_once_fenced(State) ->
+    #state{elector = Elector, member_id = Self, join_token = Token, synced = Synced} = State,
+    dgen_server:cast(Elector, {join, Self, Token, not Synced}),
+    State#state{fence_rejoined = epoch(State)}.
+
+%% Carry out dgen_registry_pipeline:surrender/2 for ops this leader cannot finish:
+%% answers, follower intents, and retries after ?REQUEUE_DELAY (a persistently
+%% failing backend must not spin).
+surrender(Reason, Ops, State) ->
+    lists:foldl(
+        fun
+            ({reply, Origin, Value}, S) ->
+                deliver_reply(Origin, Value),
+                S;
+            ({intent, Kind, From}, S) ->
+                submit_intent(Kind, From, S);
+            ({retry, Retry}, S) ->
+                arm(?REQUEUE_DELAY, {requeue_ops, Retry}),
+                S
+        end,
+        State,
+        dgen_registry_pipeline:surrender(Reason, Ops)
+    ).
+
+%% Is anyone still waiting on this op?  Only a direct registration's caller can be
+%% checked (it is a process on this node); everything else is kept.
+caller_alive({add, _Name, _Pid, _Meta, {local, {Caller, _Tag}}}) when node(Caller) =:= node() ->
+    is_process_alive(Caller);
+caller_alive(_Op) ->
+    true.
 
 %% Arm a timer, and say so.
 %%
@@ -3437,40 +3277,37 @@ arm(Delay, Msg) ->
     _ = ?ETA_LOG({arm, Msg, Delay}),
     erlang:send_after(Delay, self(), Msg).
 
-%% A salvaged remove's caller was already answered by reject_plan (`ok` — see
-%% reject_value); strip the origin so the re-driven op does not answer it twice.
-strip_remove_origin({remove, Name, Pid, _Origin}) -> {remove, Name, Pid, undefined};
-strip_remove_origin(Op) -> Op.
-
 %% Losing leadership with direct registrations still awaiting replica acks: resolve
 %% them now, by the same policy as a replicate timeout (§8).  Degrade-open answers
 %% `yes` (the binding committed under our term and we hold it, so the handoff gather
-%% carries it); fail-closed answers `no` and forwards the pid-guarded retract to the
-%% new leader, so the caller's `no` cannot leave the binding alive.
-fail_pending_acks(State = #state{pending_acks = PA}) when map_size(PA) =:= 0 ->
-    State;
-fail_pending_acks(State = #state{pending_acks = PA, leader = NewLeader, config = Config}) ->
+%% carries it); fail-closed answers `no` and hands the pid-guarded retract to the
+%% intents, which re-drive it to the new leader (or hold it until there is one), so
+%% the caller's `no` cannot leave the binding alive.
+fail_pending_acks(State = #state{pipeline = P, config = Config}) ->
+    {Batches, P1} = dgen_registry_pipeline:take_acks(P),
     Strict = dgen_config:strict_replication(Config),
-    maps:foreach(
-        fun(_BatchRef, {Direct, TimerRef, Needed, Acked}) ->
+    lists:foldl(
+        fun({Direct, TimerRef, Needed, Got}, S) ->
             erlang:cancel_timer(TimerRef),
             case Strict of
                 false ->
-                    notify_degrade_open(Needed, map_size(Acked), length(Direct)),
-                    deliver_direct(Direct);
+                    notify_degrade_open(Needed, Got, length(Direct)),
+                    deliver_direct(Direct),
+                    S;
                 true ->
-                    lists:foreach(
-                        fun({Origin, Name, Pid}) ->
+                    lists:foldl(
+                        fun({Origin, Name, Pid}, S1) ->
                             deliver_reply(Origin, no),
-                            forward_retract(NewLeader, Name, Pid)
+                            submit_intent({unregister, Name, Pid}, answered, S1)
                         end,
+                        S,
                         Direct
                     )
             end
         end,
-        PA
-    ),
-    State#state{pending_acks = #{}}.
+        State#state{pipeline = P1},
+        Batches
+    ).
 
 %% ---------------------------------------------------------------------------
 %% Row writes outside the stream (see dgen_registry_replica)

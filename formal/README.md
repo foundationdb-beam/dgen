@@ -230,7 +230,7 @@ dead in every reachable state rather than someone's way of hoping it was.
 | `HeartbeatBcast` / `RecvHeartbeat` | `handle_info(replica_heartbeat, …)` leader clause → `broadcast_heartbeat/1` (`{names_batch, [], E, V, V, Self}`) / the empty batch through `dgen_registry_replica:offer_batch/5` |
 | `CanCommit`'s `dbLeader/dbEpoch` conjuncts | the fenced version-key bump in `dgen_registry_names:start_commit/4` (§5.1) |
 | `RegisterForward` | follower `route_register` forward → leader `{register_req}` → group commit → `broadcast_batch/5` + `{register_reply, Ref, yes, Version}` |
-| `RegisterDirect` + `RecvSync`/`RecvAck` | leader-local `route_register` → `pending_acks` / `{replicate_sync}` / `{replicate_ack}` |
+| `RegisterDirect` + `RecvSync`/`RecvAck` | leader-local `route_register` → `dgen_registry_pipeline:await_acks/5` / `{replicate_sync}` / `{replicate_ack}` → `dgen_registry_pipeline:ack/3` |
 | `DegradeTimeout` | `handle_info({replicate_timeout, _})` with `strict_replication = false` |
 | `RecvBcastApply/Drop/Gap` | `dgen_registry_replica:offer_batch/5` → `applied` / `stale_epoch`+`duplicate` / `gap` (one `{names_batch, …}` per commit version); the member's `{names_batch}` handler reacts to the verdict |
 | `RecvReply` | `dgen_registry_intents:on_reply/4` incl. the `awaiting_version` phase; flushes are `dgen_registry_intents:on_version/2`, called from the `{names_batch}` handler's `applied` branch and on an accepted snapshot. On a leadership change the code re-drives a deferred ack as a fresh forward (`redrive/5`) where the spec drops it — a fresh `RegisterForward` in spec terms |

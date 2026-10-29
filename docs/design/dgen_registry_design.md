@@ -127,20 +127,22 @@ can resolve names concurrently without ever queuing behind the member's mailbox.
 
 **Registration blocks until decided; `no` is always adjudicated.**
 `register_name/2` answers `yes` if the name is now yours, or `no` **only** for an
-*adjudicated* refusal — the name is held by a different live process (or the opt-in
-`reject_when_degraded` prevention mode, §8). It never returns `no` merely because the
-registry is not ready: when there is no reachable leader (none elected yet at startup,
-a brief no-leader window during a handoff, or the leader is unreachable in a
-partition) the call **blocks** and is re-driven the moment a leader is established, so
-it succeeds if one appears within `register_timeout`. Returning `no` there would tell
-OTP's via machinery "already started" for a name that is not taken — a wrong decisive
-answer.
+*adjudicated* refusal — the name is held by a different live process (or one of the
+opt-in policies of §8: the `reject_when_degraded` prevention mode, or
+`strict_replication` failing a registration closed). It never returns `no` merely
+because the registry is not ready: when there is no reachable leader (none elected yet
+at startup, a brief no-leader window during a handoff, or the leader is unreachable in
+a partition) the call **blocks** and is re-driven the moment a leader is established,
+so it succeeds if one appears within `register_timeout`. Nor does it return `no`
+because leadership moved while the registration was in flight: one whose leader was
+deposed before answering, or whose commit failed, is retried or re-sent to the next
+leader, which decides it. Returning `no` there would tell OTP's via machinery "already
+started" for a name that is not taken — a wrong decisive answer.
 
 If no leader appears in time, the call **exits** on its `register_timeout` (§8,
 default 5 s) rather than inventing a verdict — the same posture `global`, `syn`, and
 `gproc`'s distributed mode take; the supervisor restarts the caller with fresh state.
-One consequence worth knowing: after such a timeout (or a `no` raced with a leader
-failover) the name *may* be durably bound to the pid you tried to register — a retry
+One consequence worth knowing: after such a timeout the name *may* be durably bound to the pid you tried to register — a retry
 then answers `yes` (re-registering the same pid under the same name is idempotent,
 §5.2), and if the caller instead abandons the pid, its exit clears the binding
 automatically.

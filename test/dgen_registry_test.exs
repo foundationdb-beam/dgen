@@ -1515,4 +1515,104 @@ defmodule DGen.RegistryTest do
       refute_receive {:"$gen_cast", {:register_reply, ^ref, _, _}}
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # Leader exits: an op the leader buffered but can no longer commit
+  #
+  # A leader that is re-elected without ever hearing it was deposed (the
+  # minority side of a partition) takes the genuine assume path, and its
+  # `leader` is `undefined` for the assume window. If an in-flight commit
+  # reports back inside that window, the buffered ops behind it are flushed with
+  # no leader to send them to. A buffered unregister must not be dropped there:
+  # its caller was answered `ok`, and its durable clear is owed (Non-goal 5).
+  # Nor may the registration whose commit was in flight be answered `no`: it is
+  # retried, and re-sent to whoever leads (dgen_registry_pipeline:surrender/2).
+  #
+  # The window is driven by hand: the member is suspended while a register (to
+  # put a commit in flight), an unregister (to sit buffered behind it) and an
+  # assume for a newer epoch are queued, then resumed. The elector is suspended
+  # too, so the assume's off-loop gather waits out its subscription pull
+  # (?SUBS_PULL_TIMEOUT), which holds the window open. A test process then plays
+  # the leader that actually won, by sending a snapshot naming it.
+  # ---------------------------------------------------------------------------
+
+  describe "a buffered op the leader can no longer commit" do
+    test "ops caught in the assume window reach the next leader, not `no` or nowhere", %{
+      reg: reg
+    } do
+      member = :dgen_registry.member_name(reg)
+      self_id = {node(), member}
+      epoch = :dgen_registry.get_epoch(reg)
+
+      held = spawn(fn -> Process.sleep(:infinity) end)
+      in_flight = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Enum.each([held, in_flight], &Process.exit(&1, :kill)) end)
+
+      :yes = :dgen_registry.register_name({reg, :held}, held)
+      v = applied_version(member)
+
+      # A suspension is counted per suspender, so it is undone here, not in on_exit.
+      elector = :dgen_registry.elector_pid(reg)
+      :erlang.suspend_process(elector)
+
+      try do
+        drive_assume_window(reg, member, self_id, epoch, held, in_flight, v)
+      after
+        :erlang.resume_process(elector)
+      end
+    end
+
+    defp drive_assume_window(reg, member, self_id, epoch, held, in_flight, v) do
+      :sys.suspend(member)
+      register = Task.async(fn -> :dgen_registry.register_name({reg, :in_flight}, in_flight) end)
+      Process.sleep(50)
+      unregister = Task.async(fn -> :dgen_registry.unregister_name({reg, :held}) end)
+      Process.sleep(50)
+
+      assume =
+        Task.async(fn ->
+          :gen_statem.call(
+            member,
+            {:elector_assume_and_distribute, self_id, [self_id], %{}, [], epoch + 1}
+          )
+        end)
+
+      Process.sleep(50)
+      :sys.resume(member)
+
+      assert :ok == Task.await(assume)
+      # The flush answers the buffered unregister's caller: proof it ran in the window.
+      assert :ok == Task.await(unregister)
+
+      # Non-vacuity: the member is still mid-assume.
+      {statem_state, _data} = :sys.get_state(member)
+      assert statem_state == :assuming
+
+      # Another member won the election; its snapshot still holds the binding.
+      winner = :"winner_#{:erlang.unique_integer([:positive])}"
+      Process.register(self(), winner)
+
+      GenServer.cast(
+        member,
+        {:apply_names_snapshot, %{held: {held, %{}, :undefined}}, {node(), winner}, [], %{},
+         epoch + 2, v}
+      )
+
+      assert_receive {:"$gen_cast", {:retract_req, :held, ^held}},
+                     1_000,
+                     "the buffered unregister's pid-guarded clear never reached the new " <>
+                       "leader — it was dropped when the buffer was flushed with no leader"
+
+      # The register whose commit was in flight (it landed under the old epoch, so it
+      # failed) is retried, finds this member deposed, and becomes an intent re-sent
+      # to the winner — its caller gets the winner's verdict, not a `no`.
+      assert_receive {:"$gen_cast", {:register_req, ref, _from, :in_flight, ^in_flight, _meta}},
+                     3_000,
+                     "the in-flight registration was not re-sent to the new leader"
+
+      assert Task.yield(register, 0) == nil, "the in-flight registration was answered early"
+      GenServer.cast(member, {:register_reply, ref, :yes, v})
+      assert :yes == Task.await(register)
+    end
+  end
 end

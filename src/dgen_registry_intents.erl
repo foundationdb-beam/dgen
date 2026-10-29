@@ -134,15 +134,19 @@ new() -> #intents{}.
 %% the member commits its own writes directly).
 %%
 %% An unregister or set_meta with a reachable leader is forwarded tracked: its caller
-%% waits for the commit.  Everything else takes the same path a re-drive would.
--spec submit(kind(), from(), integer(), route(), t()) -> {t(), [effect()]}.
+%% waits for the commit.  Everything else takes the same path a re-drive would —
+%% including an `answered` unregister, which the leader pipeline hands over when it
+%% cannot commit one (dgen_registry_pipeline:surrender/2).
+-spec submit(kind(), from() | answered, integer(), route(), t()) -> {t(), [effect()]}.
 submit({set_meta, _, _, _}, From, _Now, Route, T) when Route =:= none; Route =:= self ->
     {T, [{reply, From, {error, no_leader}}]};
 submit(Kind, From, Now, Route, T = #intents{next_seq = Seq}) ->
     I = #intent{kind = Kind, phase = awaiting_leader, from = From, at = Now, seq = Seq},
     T1 = T#intents{next_seq = Seq + 1},
     case Route of
-        {remote, L} when element(1, Kind) =/= register ->
+        %% An already-answered unregister (one the leader could not commit) is not a
+        %% caller's request by name: it re-drives as a pid-guarded retract instead.
+        {remote, L} when element(1, Kind) =/= register, From =/= answered ->
             Ref = make_ref(),
             {put(Ref, I#intent{phase = {forwarded, L}}, T1), [{forward, L, Ref, Kind}]};
         _ ->
