@@ -1184,7 +1184,7 @@ defmodule DGen.RegistryTest do
   # old assume/resync snapshot delivered late, after the member applied a newer
   # broadcast) would overwrite the replica *backward* and silently drop an already
   # -acked binding. The fix requires the snapshot's version to be >= the member's
-  # applied version. See formal/README.md "Discovered finding and the fix".
+  # applied version. See formal/README.md (the HandoffRace configs) and design §5.7.
   # ---------------------------------------------------------------------------
 
   describe "apply_names_snapshot version-monotonicity (handoff-gather race)" do

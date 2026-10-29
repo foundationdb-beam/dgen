@@ -273,8 +273,8 @@ RegisterDirect(l, n, p) ==
 \* version, `PrevV =:= Applied` is the only apply clause — a re-delivered
 \* duplicate falls to the `V =< Applied` drop below, exactly as in the code
 \* (the old `m.ver = appliedVer[f]` apply disjunct modeled the pre-fix
-\* multi-message batches and was dead in every config; see formal/README.md,
-\* "A closed abstraction gap").
+\* multi-message batches and was dead in every config; see the sim README,
+\* finding 1).
 RecvBcastApply(s, f) ==
     /\ alive[f]
     /\ HeadIs(s, f, "bcast")
