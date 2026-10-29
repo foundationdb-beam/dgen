@@ -348,9 +348,9 @@
 %% empty set, reconciled by a later delta / the next handoff.
 -define(SUBS_PULL_TIMEOUT, 1000).
 
-%% How often the periodic maintenance pass runs: it prunes `recently_released`
-%% (the conflict-detector trail, §5.6 — TTL from `dgen_config:conflict_release_ttl/1`)
-%% and the per-name `kill_budget` timestamps.  Trail pruning is *suspended* while any
+%% How often the periodic maintenance pass runs: it prunes the conflict-detector
+%% trail (§5.6 — TTL from `dgen_config:conflict_release_ttl/1`) and the per-name kill
+%% budget (dgen_registry_conflicts:prune/4).  Trail pruning is *suspended* while any
 %% current member is disconnected: a disconnected member misses unregister broadcasts
 %% entirely (they are dropped, not delayed), so its stale rows can surface at a rejoin
 %% gather arbitrarily later than any broadcast lag — the trail must outlive the
@@ -413,9 +413,6 @@
     terminate/3,
     code_change/4
 ]).
-%% Exported for unit testing the §5.6 conflict-detection predicate in isolation, and
-%% the off-loop liveness split it is run with (conflict_pids/3 → detect_conflicts/4).
--export([detect_conflicts/3, detect_conflicts/4, conflict_pids/3]).
 %% Exported for unit testing the group-commit batch planner in isolation — in
 %% particular, the batch-local overlay (`seed_lookup/3`, the `removed` marker) that lets
 %% a later op in the same batch see an earlier op's not-yet-committed decision without a
@@ -527,46 +524,14 @@
     %% that made us a follower meanwhile, harmlessly supersedes a stale gather.
     %% `undefined` when no assume is in flight.
     assume_ref = undefined :: undefined | reference(),
-    %% Conflict-detection trail (§5.6), kept on *every* member: name/pid pairs
-    %% explicitly released (an unregister of a live process) → the wall-clock ms it
-    %% happened.  Keyed by `{Name, Pid}` — not bare pid — so releasing a pid under
-    %% one of its names never masks a genuine conflict on *another* name the same
-    %% pid also holds (a pid may be registered under several names).  Bare-pid keys
-    %% from a pre-upgrade member's gathered trail are still honoured by the
-    %% detector during a rolling upgrade (see released_entry/3).
-    %% The leader records entries at commit; followers record them from the released
-    %% pid carried on {names_batch} unregister ops; and at a handoff gather every
-    %% reachable member's trail is merged into the new leader's, so the trail
-    %% survives leadership changes.  A gather suppresses a divergence on an entry
-    %% still in here (it was legitimately unregistered, a lagging member just has not
-    %% caught up), so only a reconstruction-drop divergence — which leaves no trail —
-    %% is killed.  TTL-pruned (dgen_config:conflict_release_ttl/1) by a periodic
-    %% self-message, with pruning suspended while any member is disconnected (a
-    %% partition must not outlive the trail that protects against its lagging rows).
-    recently_released = #{} :: #{{term(), pid()} | pid() => integer()},
-    %% Leader-only kill budget (§5.6): name → recent kill timestamps (ms).  Bounds
-    %% kills to `conflict_kill_budget` per name per window so a regenerating conflict
-    %% escalates to an operator instead of looping.
-    kill_budget = #{} :: #{term() => [integer()]},
-    %% Leader-only: `true` when this leader's most recent handoff reconstruction
-    %% stopped short of the durable version key, so it may be missing a committed
-    %% binding (see degraded/5).  Under `reject_when_degraded` the leader then
-    %% refuses to register a name it does not already hold (a potential re-issue,
-    %% §5.6).  Recomputed on every handoff; default off otherwise.
-    degraded = false :: boolean(),
+    %% Conflict repair (§5.6): the release trail (all members), the kill budget and
+    %% the `degraded` flag (leader only), and when a member last departed.  See
+    %% dgen_registry_conflicts.
+    conflicts = dgen_registry_conflicts:new() :: dgen_registry_conflicts:t(),
     %% Per-registry tuning options (from dgen_registry:start_link/3), resolved through
     %% dgen_config with application-env and built-in-default fallbacks.  Scopes the
     %% replication, termination, and degraded-reject knobs to this registry.
-    config = #{} :: dgen_config:config(),
-    %% Wall-clock ms of the most recent member departure this member observed
-    %% (remove_member/2).  Trail pruning (§5.6) is suspended not only while a
-    %% *current* member is disconnected but also within `conflict_release_ttl` of
-    %% any departure: a member dropped from the set during a partition is no
-    %% longer "a disconnected member", yet its stale rows can surface at a rejoin
-    %% gather — the trail that discriminates lag from divergence must outlive
-    %% that window too.  (A member that stays gone longer than the TTL is outside
-    %% the trail's protection horizon either way.)
-    last_departure = 0 :: integer()
+    config = #{} :: dgen_config:config()
 }).
 
 %% ---------------------------------------------------------------------------
@@ -638,11 +603,7 @@ init(#{name := Name, tenant := Tenant, tuid := Tuid} = Args) ->
             name_to_ref = #{},
             join_token = make_ref(),
             peer_tokens = #{},
-            recently_released = #{},
-            kill_budget = #{},
-            degraded = false,
-            config = Config,
-            last_departure = 0
+            config = Config
         },
         %% gen_statem has no handle_continue; the same "run after the supervisor
         %% unblocks" contract is an internal event queued from init's actions.
@@ -1011,11 +972,12 @@ handle_call({whereis, _LogicalName}, _From, State) ->
 handle_call(
     get_names_snapshot,
     _From,
-    State = #state{replica = R, recently_released = Released}
+    State = #state{replica = R, conflicts = C}
 ) ->
     %% Ship the (potentially huge) replica as an off-heap binary, folded straight
     %% off the table — see dgen_registry_replica:encode/1.  The gathering leader
     %% decodes it.
+    Released = dgen_registry_conflicts:trail(C),
     {reply, {dgen_registry_replica:encode(R), dgen_registry_replica:version(R), Released},
         State};
 
@@ -1105,7 +1067,7 @@ assume_genuine(MemberId, AllIds, Tokens, FreshIds, Epoch, State = #state{member_
         self(),
         State#state.tenant,
         State#state.tuid,
-        State#state.recently_released
+        State#state.conflicts
     ),
     %% Clear the leader for the window: we are mid-handoff with no stable leader, so
     %% writes block (no reachable leader) and are re-driven by the continuation — rather
@@ -1369,8 +1331,8 @@ handle_cast(
     %% Capture the bound pid (if any) *before* the optimistic removal: the plan seeds
     %% its working map from the (now mutated) table, so without this plan_op/3 could
     %% not tell a genuine unregister from a no-op and would skip the durable clear +
-    %% broadcast.  A bound pid is also recorded in `recently_released` on commit (the
-    %% conflict-detector trail, §5.6).
+    %% broadcast.  A bound pid is also recorded in the conflict-detector trail on commit
+    %% (§5.6).
     ReleasedPid = dgen_registry_replica:lookup_pid(R, LogicalName),
     {noreply,
         enqueue_op({remove, LogicalName, ReleasedPid, undefined}, row_delete(State, LogicalName))};
@@ -1555,17 +1517,11 @@ handle_info(
     State1 =
         case Result of
             {ok, {Records, _Version, Released}, Alive} ->
-                MergedReleased = merge_trails(State#state.recently_released, [Released]),
-                %% One materialization of our own replica (the authority) instead of
-                %% one plus two pid projections — detect_conflicts compares records
-                %% maps in place now.  The resolved map is discarded either way: the
-                %% leader's table is authoritative here, and a conflict resolution
-                %% only kills/alarms (the joiner is re-baselined by the snapshot).
+                %% Our own table is the authority here.  The resolved map is discarded:
+                %% a resolution only kills and alarms, and the joiner is re-baselined
+                %% by the snapshot either way.
                 OwnRecords = dgen_registry_replica:records(State#state.replica),
-                Conflicts = detect_conflicts(OwnRecords, [Records], MergedReleased, probed(Alive)),
-                {_Records, S1} = resolve_conflicts(
-                    Conflicts, OwnRecords, State#state{recently_released = MergedReleased}
-                ),
+                {_Records, S1} = repair_conflicts(OwnRecords, [Records], [Released], Alive, State),
                 S1;
             error ->
                 %% The joiner did not answer in time — onboard it regardless; a
@@ -1591,32 +1547,20 @@ handle_info(
     State = #state{member_id = Self, assume_ref = Ref}
 ) ->
     OtherIds = lists:delete(Self, AllIds),
-    PeerRecordMaps = [Recs || {Recs, _V, _Rel} <- maps:values(PeerResults)],
-    Degraded = degraded(MaxVersion, Frontier, OtherIds, FreshIds, PeerResults),
-    %% Merge every reachable member's released-pid trail into our own (§5.6): the trail
-    %% distinguishes "legitimately unregistered, reported by a lagging member" from a
-    %% genuine divergence, and must survive leadership changes.
-    MergedReleased = merge_trails(
-        State#state.recently_released, [Rel || {_Recs, _V, Rel} <- maps:values(PeerResults)]
+    Peers = maps:values(PeerResults),
+    Degraded = dgen_registry_conflicts:degraded(
+        MaxVersion, Frontier, OtherIds, FreshIds, PeerResults
     ),
-    %% Resolve genuine uniqueness conflicts the gather exposes (§5.6) — kill-both +
-    %% alarm + bounded budget; conflicted names are dropped (the fan-out propagates the
-    %% drop).  A no-op in the common conflict-free handoff — and an ALLOCATION-FREE
-    %% one: detect_conflicts compares the records maps in place, and with no
-    %% conflicts `Records` below IS `FreshestRecords`, untouched.  Metadata rides the
-    %% surviving bindings automatically (resolve_conflicts only ever *removes* names
-    %% from the records map).  This path used to project three pid maps, build a
-    %% union map, and re-project the survivors with maps:keys + maps:with — five
-    %% n-entry allocations discarded on every healthy handoff.
-    {Records, State0} = resolve_conflicts(
-        detect_conflicts(
-            FreshestRecords,
-            [SelfRecords | PeerRecordMaps],
-            MergedReleased,
-            probed(Alive)
-        ),
+    %% Repair the uniqueness conflicts the gather exposes (§5.6): conflicted names are
+    %% dropped from the reconstruction (the fan-out propagates the drop).  A no-op in
+    %% the common conflict-free handoff, where `Records` IS `FreshestRecords`.
+    %% Metadata rides the surviving bindings (a repair only ever removes names).
+    {Records, State0} = repair_conflicts(
         FreshestRecords,
-        State#state{recently_released = MergedReleased}
+        [SelfRecords | [Recs || {Recs, _V, _Rel} <- Peers]],
+        [Rel || {_Recs, _V, Rel} <- Peers],
+        Alive,
+        State
     ),
     %% Reconstruct the local replica (pid + metadata) + inverted index wholesale,
     %% then become leader.  Clearing assume_ref marks the assume complete; the
@@ -1631,7 +1575,7 @@ handle_info(
     State2 = State0#state{
         replica = dgen_registry_replica:adopt(Epoch, MaxVersion, Records, State0#state.replica),
         leader = Self,
-        degraded = Degraded,
+        conflicts = dgen_registry_conflicts:set_degraded(Degraded, State0#state.conflicts),
         assume_ref = undefined,
         subs = Subs
     },
@@ -1655,45 +1599,18 @@ handle_info(
     %% anything buffered while we assumed.  The gather made us synced; any
     %% outstanding resync is moot.
     {noreply, maybe_start_commit(redrive_intents(moved, mark_synced(cancel_resync(State4))))};
-%% Periodic maintenance: expire stale entries from the conflict-detection trail
-%% (§5.6) and the per-name kill-budget timestamps, then re-arm.  Trail pruning is
-%% suspended while any current member is disconnected: a disconnected member misses
-%% unregister broadcasts outright, so its stale rows can show up at a rejoin gather
-%% long after any broadcast lag — the trail must outlive the partition (see the
-%% ?PRUNE_INTERVAL note).
-handle_info(
-    prune_released,
-    State = #state{recently_released = Rel, kill_budget = KB, members = Members, config = Config}
-) ->
+%% Periodic maintenance: expire the conflict-detection trail and kill budget (§5.6 —
+%% see dgen_registry_conflicts:prune/4 for when the trail may expire), and intents
+%% whose callers have timed out (see prune_intents/1).  Then re-arm.
+handle_info(prune_released, State = #state{conflicts = C, members = Members, config = Config}) ->
     arm(?PRUNE_INTERVAL, prune_released),
     Now = erlang:system_time(millisecond),
     AllConnected = lists:all(
         fun({Node, _Name}) -> dgen_utils:node_reachable(Node) end,
         maps:keys(Members)
     ),
-    TTL = dgen_config:conflict_release_ttl(Config),
-    %% Pruning is also suspended within a TTL of the most recent member departure:
-    %% a member dropped from the set (so no longer "a disconnected member") may
-    %% rejoin with stale rows, and the trail must still discriminate lag from
-    %% divergence at that rejoin's gather (§5.6).  A member gone longer than the
-    %% TTL is outside the trail's protection horizon either way.
-    RecentDeparture = Now - State#state.last_departure < TTL,
-    Rel1 =
-        case AllConnected andalso not RecentDeparture of
-            true ->
-                Cutoff = Now - TTL,
-                maps:filter(fun(_Key, Ts) -> Ts >= Cutoff end, Rel);
-            false ->
-                Rel
-        end,
-    {_Count, Window} = dgen_config:conflict_kill_budget(Config),
-    KB1 = maps:filter(
-        fun(_Name, Tss) -> Tss =/= [] end,
-        maps:map(fun(_Name, Tss) -> [Ts || Ts <- Tss, Ts >= Now - Window] end, KB)
-    ),
-    %% Also drop intents whose callers have timed out (bounds them while no leader
-    %% appears — see prune_intents/1).
-    {noreply, prune_intents(State#state{recently_released = Rel1, kill_budget = KB1})};
+    C1 = dgen_registry_conflicts:prune(Now, AllConnected, Config, C),
+    {noreply, prune_intents(State#state{conflicts = C1})};
 %% The resync request we sent went unanswered (dropped cast, deposed target) —
 %% clear the guard so the next gap-observing broadcast (or the leader's replication
 %% heartbeat, which is one) requests again.
@@ -1927,18 +1844,23 @@ onboard_joiner(MemberId, AllIds, Tokens, State = #state{member_id = Self, replic
 %% (?ALIVE_PROBE_TIMEOUT each), and the continuation runs on the leader's loop.  Our
 %% own table is read from this helper (it is `protected`: readable by any process).
 spawn_joiner_gather(MemberId, AllIds, Tokens, Epoch, State) ->
-    #state{replica = Replica, recently_released = OwnTrail} = State,
+    #state{replica = Replica, conflicts = C} = State,
     Owner = self(),
     _ = spawn(fun() ->
         Result =
             case member_names(MemberId) of
                 {ok, {Records, _Version, Released} = Snapshot} ->
-                    Trail = merge_trails(OwnTrail, [Released]),
+                    Trail = dgen_registry_conflicts:trail(
+                        dgen_registry_conflicts:merge([Released], C)
+                    ),
                     %% The table dies with the member; if it already has, there is
                     %% no one to report to, so probe nothing rather than crash.
                     Alive =
                         try dgen_registry_replica:records(Replica) of
-                            Own -> probe_alive(conflict_pids(Own, [Records], Trail))
+                            Own ->
+                                probe_alive(
+                                    dgen_registry_conflicts:conflict_pids(Own, [Records], Trail)
+                                )
                         catch
                             error:badarg -> #{}
                         end,
@@ -1969,7 +1891,7 @@ spawn_joiner_gather(MemberId, AllIds, Tokens, Epoch, State) ->
 %%
 %% So are the conflict detector's liveness probes (§5.6), off the loop for the same
 %% reason as in spawn_joiner_gather/5: the continuation adjudicates with the results.
-spawn_assume_gather(Ctx, SelfRecords, SelfVersion, OtherIds, Elector, Owner, Tenant, Tuid, Trail) ->
+spawn_assume_gather(Ctx, SelfRecords, SelfVersion, OtherIds, Elector, Owner, Tenant, Tuid, C) ->
     _ = spawn(fun() ->
         %% Fall back to a self-only reconstruction if the gather ever throws, so the
         %% continuation still fires and the member is never stranded leaderless (it
@@ -1978,9 +1900,13 @@ spawn_assume_gather(Ctx, SelfRecords, SelfVersion, OtherIds, Elector, Owner, Ten
             gather_caught_up(SelfRecords, SelfVersion, OtherIds, Tenant, Tuid),
         Subs = fetch_subscriptions(Elector),
         Peers = maps:values(PeerResults),
-        Merged = merge_trails(Trail, [Rel || {_Recs, _V, Rel} <- Peers]),
+        Merged = dgen_registry_conflicts:trail(
+            dgen_registry_conflicts:merge([Rel || {_Recs, _V, Rel} <- Peers], C)
+        ),
         Witnesses = [SelfRecords | [Recs || {Recs, _V, _Rel} <- Peers]],
-        Alive = probe_alive(conflict_pids(FreshestRecords, Witnesses, Merged)),
+        Alive = probe_alive(
+            dgen_registry_conflicts:conflict_pids(FreshestRecords, Witnesses, Merged)
+        ),
         Owner !
             {assume_gathered, Ctx, SelfRecords, FreshestRecords, {MaxVersion, Frontier},
                 PeerResults, Subs, Alive}
@@ -2038,24 +1964,6 @@ gather_caught_up(SelfRecords, SelfVersion, OtherIds, Tenant, Tuid, Deadline) ->
             gather_caught_up(SelfRecords, SelfVersion, OtherIds, Tenant, Tuid, Deadline)
     end.
 
-%% Could this reconstruction be missing a committed binding (§5.6)?  Exactly when it
-%% stopped short of the durable version key: every replica is a prefix of the
-%% leader's stream, so the freshest one at the key IS the committed map, and one
-%% below it lacks whatever was committed past it.  Checked by the TLA+ model's
-%% DegradedFlagSound (formal/DgenRegistryReplication.tla).  Which members answered
-%% does not matter: a member that did not answer but was behind held nothing extra
-%% (a scale-down is not degraded), and one that did answer cannot hide a version.
-%%
-%% With the key unreadable (a backend hiccup) the version test has nothing to compare
-%% against, so it falls back to the reachability test it replaced: degraded if a
-%% member that could hold bindings — any not marked fresh (never synced) by the
-%% elector — did not answer the gather.
-degraded(MaxVersion, Frontier, _OtherIds, _FreshIds, _PeerResults) when is_integer(Frontier) ->
-    MaxVersion < Frontier;
-degraded(_MaxVersion, unknown, OtherIds, FreshIds, PeerResults) ->
-    Unreachable = OtherIds -- maps:keys(PeerResults),
-    lists:any(fun(Id) -> not lists:member(Id, FreshIds) end, Unreachable).
-
 %% Read the durable subscription set from the (co-located) elector — best-effort, under a
 %% short bound so a momentarily-busy elector cannot stall the gather helper: on timeout
 %% the leader assumes with the empty set and a later {presence_update} delta / the next
@@ -2104,99 +2012,27 @@ collect_gather(Ref, Waiting, Deadline, Acc) ->
         Acc
     end.
 
-%% Detect genuine uniqueness conflicts among the gathered maps (§5.6).  A conflict is
-%% a name held by *two different live pids* — the authority (the freshest map's pid)
-%% and some other member's pid that is (a) different, (b) not in `recently_released`
-%% (so a legitimately-unregistered-but-lagging binding is suppressed — that is the
-%% discriminator that makes this safe), and (c) actually alive.  Single-fault
-%% uniqueness (no durable taken-set) lets a partition produce this: a follower holds a
-%% binding the leader dropped on reconstruction and re-issued elsewhere.  A name the
-%% freshest map lacks entirely (authority `undefined`) is *not* a conflict — there is
-%% no second live claimant — so it is left to the freshest-wins reconstruction.
-%% Aliveness is probed only when a candidate divergence exists, so the common
-%% all-agree handoff costs no probes.  Returns `[{Name, AuthorityPid, [DivergentPid]}]`.
-%%
-%% Takes RECORDS maps (`#{Name => {Pid, Index, Data}}`) directly and compares each
-%% entry against the authority inline, accumulating only for *divergent* names — so
-%% the common all-agree handoff allocates nothing but the fold's loop frame.  This
-%% used to project every map to pids (`record_pids`) and build a name→pid-set map
-%% over the union first: at 200k names that was three full n-entry maps plus the
-%% union map (~0.9us/name) allocated and discarded on a path where a divergence is
-%% the rare case.  An entry from the freshest map itself always agrees with its own
-%% authority, so including it in `RecordMaps` is harmless.
-detect_conflicts(FreshestRecords, RecordMaps, Released) ->
-    detect_conflicts(FreshestRecords, RecordMaps, Released, fun is_pid_alive/1).
-
-%% As detect_conflicts/3, with liveness supplied by `Alive` rather than probed here —
-%% the form the member's loop uses, with probe_alive/1's results (see probed/1).
-detect_conflicts(FreshestRecords, RecordMaps, Released, Alive) ->
-    maps:fold(
-        fun(Name, PidSet, Acc) ->
-            Authority = authority(Name, FreshestRecords),
-            Others = [P || P <- maps:keys(PidSet), P =/= Authority],
-            case Others =:= [] orelse not (is_pid(Authority) andalso Alive(Authority)) of
-                true ->
-                    Acc;
-                false ->
-                    case [P || P <- Others, Alive(P)] of
-                        [] -> Acc;
-                        Divergent -> [{Name, Authority, Divergent} | Acc]
-                    end
-            end
+%% Detect and repair the conflicts among `Authority` and the witnesses' records
+%% (§5.6), with `Alive` the liveness probed off the loop and the witnesses' release
+%% trails merged into ours first.  Carries out the kills and alarms
+%% dgen_registry_conflicts:resolve/5 decides.  Returns the reconstruction with
+%% conflicted names dropped.
+repair_conflicts(Authority, Witnesses, Trails, Alive, State = #state{conflicts = C0}) ->
+    C1 = dgen_registry_conflicts:merge(Trails, C0),
+    Trail = dgen_registry_conflicts:trail(C1),
+    Conflicts = dgen_registry_conflicts:detect(Authority, Witnesses, Trail, probed(Alive)),
+    Now = erlang:system_time(millisecond),
+    {Records, C2, Effects} =
+        dgen_registry_conflicts:resolve(Conflicts, Authority, State#state.config, Now, C1),
+    lists:foreach(
+        fun
+            ({kill, Pid}) -> exit(Pid, kill);
+            ({alarm, {Name, APid, Divergent}, Action}) ->
+                alarm_conflict(Name, APid, Divergent, Action)
         end,
-        [],
-        candidates(FreshestRecords, RecordMaps, Released)
-    ).
-
-%% Every pid a conflict among these maps could turn on — each candidate name's
-%% authority and its divergent claimants — so their liveness can be probed ahead of
-%% adjudication, off the loop.
-conflict_pids(FreshestRecords, RecordMaps, Released) ->
-    lists:usort(
-        maps:fold(
-            fun(Name, PidSet, Acc) ->
-                [P || P <- [authority(Name, FreshestRecords) | maps:keys(PidSet)], is_pid(P)] ++
-                    Acc
-            end,
-            [],
-            candidates(FreshestRecords, RecordMaps, Released)
-        )
-    ).
-
-authority(Name, FreshestRecords) ->
-    case maps:get(Name, FreshestRecords, undefined) of
-        {Pid, _Index, _Data} -> Pid;
-        undefined -> undefined
-    end.
-
-%% Names some map binds to a pid other than the authority's, and not explicitly
-%% released from that name (the trail): `#{Name => #{Pid => true}}`.
-candidates(FreshestRecords, RecordMaps, Released) ->
-    lists:foldl(
-        fun(Map, Acc0) ->
-            maps:fold(
-                fun(Name, {Pid, _Index, _Data}, Acc) ->
-                    case maps:get(Name, FreshestRecords, undefined) of
-                        {Pid, _, _} ->
-                            %% Agrees with the authority — the common case, free.
-                            Acc;
-                        _AbsentOrDifferent ->
-                            case released_entry(Name, Pid, Released) of
-                                true ->
-                                    Acc;
-                                false ->
-                                    Pids = maps:get(Name, Acc, #{}),
-                                    Acc#{Name => Pids#{Pid => true}}
-                            end
-                    end
-                end,
-                Acc0,
-                Map
-            )
-        end,
-        #{},
-        RecordMaps
-    ).
+        Effects
+    ),
+    {Records, State#state{conflicts = C2}}.
 
 %% Probe every pid's liveness in parallel, bounded overall by about one
 %% ?ALIVE_PROBE_TIMEOUT.  Runs in the gather helpers, never on the member's loop.
@@ -2231,63 +2067,6 @@ probed(Alive) ->
             _ when node(Pid) =:= node() -> is_process_alive(Pid);
             _ -> false
         end
-    end.
-
-%% Merge release trails (§5.6), keeping each entry's latest release time.
-merge_trails(Trail, Others) ->
-    lists:foldl(
-        fun(T, Acc) -> maps:merge_with(fun(_K, A, B) -> max(A, B) end, Acc, T) end, Trail, Others
-    ).
-
-%% Was this pid explicitly released *from this name* recently?  Trail keys are
-%% {Name, Pid} pairs, so releasing a pid under one of its names never suppresses a
-%% genuine conflict on another name the same pid also holds.  Bare-pid keys — the
-%% legacy trail shape, seen in a pre-upgrade member's gathered trail during a
-%% rolling upgrade — are honoured too (the coarser, name-agnostic suppression the
-%% old code applied), until the mixed entries age out of the TTL.
-released_entry(Name, Pid, Released) ->
-    maps:is_key({Name, Pid}, Released) orelse maps:is_key(Pid, Released).
-
-%% Resolve detected conflicts (§5.6).  Kill-both (terminate the authority pid and
-%% every divergent pid), drop the name from the reconstructed map (the snapshot
-%% fan-out propagates the drop, so supervised processes restart and re-register
-%% cleanly under the single fenced leader), and alarm — subject to a per-name kill
-%% budget and the `terminate_on_conflict` config.  Operates on the freshest RECORDS
-%% map (values `{Pid, Index, Data}`) and only ever `maps:remove`s from it, so with
-%% no conflicts the map passes through by reference.  Returns `{CleanRecords, State}`.
-resolve_conflicts([], Names, State) ->
-    {Names, State};
-resolve_conflicts(Conflicts, Names, State = #state{config = Config}) ->
-    Terminate = dgen_config:terminate_on_conflict(Config),
-    lists:foldl(
-        fun({Name, Authority, Divergent}, {NAcc, S}) ->
-            resolve_one_conflict(Name, Authority, Divergent, Terminate, NAcc, S)
-        end,
-        {Names, State},
-        Conflicts
-    ).
-
-%% Detect-only mode: alarm + keep the authority binding (best-effort), no kill.
-resolve_one_conflict(Name, Authority, Divergent, false, Names, State) ->
-    alarm_conflict(Name, Authority, Divergent, detect_only),
-    {Names, State};
-resolve_one_conflict(
-    Name, Authority, Divergent, true, Names, State = #state{kill_budget = KB, config = Config}
-) ->
-    {Count, Window} = dgen_config:conflict_kill_budget(Config),
-    Now = erlang:system_time(millisecond),
-    Recent = [Ts || Ts <- maps:get(Name, KB, []), Ts >= Now - Window],
-    case length(Recent) < Count of
-        false ->
-            %% Budget exhausted — escalate to an operator and stop killing this name;
-            %% keep the authority binding so the name stays served.
-            alarm_conflict(Name, Authority, Divergent, budget_exhausted),
-            {Names, State};
-        true ->
-            Kill = [Authority || is_pid_alive(Authority)] ++ Divergent,
-            lists:foreach(fun(P) -> exit(P, kill) end, Kill),
-            alarm_conflict(Name, Authority, Divergent, terminated),
-            {maps:remove(Name, Names), State#state{kill_budget = KB#{Name => [Now | Recent]}}}
     end.
 
 alarm_conflict(Name, Authority, Divergent, Action) ->
@@ -2355,10 +2134,9 @@ member_names({Node, Name}) ->
 %% committed binding the reconstruction is missing, and registering it would be a
 %% re-issue.  A name
 %% already in the map flows to the normal dup path.  Default off (reactive posture).
-reject_new_when_degraded(Name, #state{degraded = true, replica = R, config = Config}) ->
-    dgen_config:reject_when_degraded(Config) andalso not dgen_registry_replica:exists(R, Name);
-reject_new_when_degraded(_Name, _State) ->
-    false.
+reject_new_when_degraded(Name, #state{conflicts = C, replica = R, config = Config}) ->
+    dgen_registry_conflicts:degraded(C) andalso dgen_config:reject_when_degraded(Config) andalso
+        not dgen_registry_replica:exists(R, Name).
 
 %% Route a registration to wherever it must go, deferring the caller's reply in every
 %% case except an adjudicated refusal.  `no` is answered *only* when the name is
@@ -2584,7 +2362,6 @@ apply_committed_plan(Plan, Version, State) ->
         member_id = Self,
         name_to_ref = NTR0,
         members = Members,
-        recently_released = Rel0,
         replica = R0
     } = State,
     PrevVersion = dgen_registry_replica:version(R0),
@@ -2616,12 +2393,11 @@ apply_committed_plan(Plan, Version, State) ->
     %% exactly what offer_batch/5 already knows how to repair.
     broadcast_batch(Members, lists:reverse(BcastsRev), PrevVersion, Version, Self),
     Now = erlang:system_time(millisecond),
-    %% Trail entries are {Name, Pid} pairs (§5.6 — see the recently_released doc).
-    Rel1 = lists:foldl(fun(NamePid, Acc) -> Acc#{NamePid => Now} end, Rel0, Released),
     State1 = State0#state{
         name_to_ref = NTR1,
         pipeline = dgen_registry_pipeline:committed(Version, State0#state.pipeline),
-        recently_released = Rel1
+        %% The batch's explicit releases extend the conflict trail (§5.6).
+        conflicts = dgen_registry_conflicts:released(Released, Now, State0#state.conflicts)
     },
     %% Answer callers.  Forwarded registrations and all rejections are answered
     %% immediately (a forwarded `yes` is already two-holder — leader + forwarding
@@ -3152,18 +2928,10 @@ send_replies(Replies) ->
 %% one name never masks a conflict on another name the same pid holds — keeps every
 %% member's copy of the trail in step, so it survives leadership changes via the
 %% handoff gather merge.
-record_released(Ops, State = #state{recently_released = Rel}) ->
+record_released(Ops, State = #state{conflicts = C}) ->
+    Pairs = [{Name, Pid} || {name_unregistered, Name, Pid} <- Ops, is_pid(Pid)],
     Now = erlang:system_time(millisecond),
-    State#state{
-        recently_released = lists:foldl(
-            fun
-                ({name_unregistered, Name, Pid}, Acc) when is_pid(Pid) -> Acc#{{Name, Pid} => Now};
-                (_Op, Acc) -> Acc
-            end,
-            Rel,
-            Ops
-        )
-    }.
+    State#state{conflicts = dgen_registry_conflicts:released(Pairs, Now, C)}.
 
 %% Broadcast a committed batch to every peer as a single `{names_batch, Ops, Epoch,
 %% PrevV, Version, LeaderId}` message: the batch's ops in commit order, the epoch it
@@ -3477,7 +3245,9 @@ remove_member(MemberId, State = #state{members = Members, monitors = Monitors}) 
                 members = maps:remove(MemberId, Members),
                 monitors = maps:remove(Ref, Monitors),
                 peer_tokens = maps:remove(MemberId, State#state.peer_tokens),
-                last_departure = erlang:system_time(millisecond)
+                conflicts = dgen_registry_conflicts:departed(
+                    erlang:system_time(millisecond), State#state.conflicts
+                )
             }
     end.
 

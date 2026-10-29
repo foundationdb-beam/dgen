@@ -28,8 +28,10 @@
 
 - `dgen_registry_member`'s replica (table, index, applied version, epoch) and
   its admission rules are extracted into `dgen_registry_replica`, and its
-  in-flight client requests into `dgen_registry_intents`, and the leader's write
-  pipeline into `dgen_registry_pipeline`. The member publishes `replica`,
+  in-flight client requests into `dgen_registry_intents`, the leader's write
+  pipeline into `dgen_registry_pipeline`, and conflict repair (the release trail,
+  detection, the kill remedy and budget, the `degraded` flag) into
+  `dgen_registry_conflicts`. The member publishes `replica`,
   `intents` and `pipeline` to `eta_observe` in place of the old per-field
   state.
 
