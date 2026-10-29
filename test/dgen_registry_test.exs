@@ -826,7 +826,7 @@ defmodule DGen.RegistryTest do
   # ---------------------------------------------------------------------------
   # Snapshot codec (pure, unit-tested in isolation)
   #
-  # encode_table/1 folds the ETS table straight into a pair list inside the blob
+  # encode/1 folds the replica's ETS table straight into a pair list inside the blob
   # (no records-map materialization); decode_records/1 must normalize every wire
   # shape — this build's list-in-binary and map-in-binary, plus both pre-binary
   # legacy forms — to the one map callers use. A shape the decoder silently
@@ -834,22 +834,25 @@ defmodule DGen.RegistryTest do
   # the tolerance is pinned here rather than trusted.
   # ---------------------------------------------------------------------------
 
-  describe "snapshot codec (encode_table/1, decode_records/1)" do
-    test "a table round-trips through encode_table to the same records map" do
-      tab = :ets.new(:codec_bench, [:set, :public])
+  describe "snapshot codec (dgen_registry_replica encode/1, decode_records/1)" do
+    test "a replica round-trips through encode to the same records map" do
       p1 = spawn_live()
       p2 = spawn_live()
-      :ets.insert(tab, [{:a, p1, %{v: 1}, nil}, {:b, p2, %{}, "data"}])
+
+      replica =
+        :dgen_registry_replica.new(:codec_bench)
+        |> :dgen_registry_replica.insert(:a, p1, %{v: 1}, nil)
+        |> :dgen_registry_replica.insert(:b, p2, %{}, "data")
 
       assert %{a: {^p1, %{v: 1}, nil}, b: {^p2, %{}, "data"}} =
-               :dgen_registry_member.decode_records(:dgen_registry_member.encode_table(tab))
+               :dgen_registry_replica.decode_records(:dgen_registry_replica.encode(replica))
     end
 
-    test "an empty table encodes to an empty map" do
-      tab = :ets.new(:codec_empty, [:set, :public])
+    test "an empty replica encodes to an empty map" do
+      replica = :dgen_registry_replica.new(:codec_empty)
 
       assert %{} ==
-               :dgen_registry_member.decode_records(:dgen_registry_member.encode_table(tab))
+               :dgen_registry_replica.decode_records(:dgen_registry_replica.encode(replica))
     end
 
     test "a map-in-binary blob (the fan-out encoder) decodes to the same map" do
@@ -857,7 +860,9 @@ defmodule DGen.RegistryTest do
       records = %{a: {p1, %{}, nil}}
 
       assert ^records =
-               :dgen_registry_member.decode_records(:dgen_registry_member.encode_records(records))
+               :dgen_registry_replica.decode_records(
+                 :dgen_registry_replica.encode_records(records)
+               )
     end
 
     test "legacy wire shapes still normalize (rolling upgrade)" do
@@ -865,15 +870,15 @@ defmodule DGen.RegistryTest do
 
       # Pre-binary-era apply_names_snapshot: an on-heap [{name, record}] list.
       assert %{a: {^p1, %{}, nil}} =
-               :dgen_registry_member.decode_records([{:a, {p1, %{}, nil}}])
+               :dgen_registry_replica.decode_records([{:a, {p1, %{}, nil}}])
 
       # Pre-binary-era get_names_snapshot: a bare records map.
       assert %{a: {^p1, %{}, nil}} =
-               :dgen_registry_member.decode_records(%{a: {p1, %{}, nil}})
+               :dgen_registry_replica.decode_records(%{a: {p1, %{}, nil}})
 
       # Pre-list-era binary: a map inside the blob (what an old node still sends).
       assert %{a: {^p1, %{}, nil}} =
-               :dgen_registry_member.decode_records(
+               :dgen_registry_replica.decode_records(
                  :erlang.term_to_binary(%{a: {p1, %{}, nil}}, [:compressed])
                )
     end

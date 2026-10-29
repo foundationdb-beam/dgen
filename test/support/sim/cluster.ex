@@ -362,8 +362,26 @@ defmodule DGen.Sim.Cluster do
   `eta_observe` reads the fields the member publishes on every callback return, so
   this works on a frozen system. That is what lets `Invariants` be used unchanged
   from under `eta_sched`. See `eta_observe`.
+
+  The member publishes its stream position as one opaque `replica` field (see
+  `dgen_registry_replica`); it is flattened here into the `epoch` and
+  `applied_version` keys `dgen_registry:status/1` answers with, so the two views
+  stay comparable field for field.
   """
-  def status(name), do: :eta_observe.read(name)
+  def status(name) do
+    case :eta_observe.read(name) do
+      %{replica: replica} = published ->
+        published
+        |> Map.delete(:replica)
+        |> Map.merge(%{
+          epoch: :dgen_registry_replica.epoch(replica),
+          applied_version: :dgen_registry_replica.version(replica)
+        })
+
+      other ->
+        other
+    end
+  end
 
   @doc "The member id every live member's elector currently agrees leads, or nil if they disagree."
   def leader(%__MODULE__{} = c) do

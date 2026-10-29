@@ -246,13 +246,13 @@ RegisterDirect(l, n, p) ==
                    leaderView, deferred, resyncReq>>
 
 (***************************************************************************)
-(* Broadcast delivery — mirrors apply_bcast/6 case for case                *)
+(* Broadcast delivery — mirrors dgen_registry_replica:offer_batch/5       *)
 (***************************************************************************)
 
 \* Contiguous (prev = applied): apply the row, advance applied_version
-\* (bump_applied), flush any deferred acks the advance releases
+\* (offer_batch's `applied`), flush any deferred acks the advance releases
 \* (flush_deferred), cancel an outstanding resync.  Matches the shipped
-\* apply_bcast/6 case for case: since a batch ships as ONE message per commit
+\* offer_batch/5 case for case: since a batch ships as ONE message per commit
 \* version, `PrevV =:= Applied` is the only apply clause — a re-delivered
 \* duplicate falls to the `V =< Applied` drop below, exactly as in the code
 \* (the old `m.ver = appliedVer[f]` apply disjunct modeled the pre-fix
@@ -340,7 +340,7 @@ HeartbeatBcast(l) ==
                    alive, rep, appliedVer, epoch, leaderView, deferred,
                    pendingAcks, resyncReq>>
 
-\* Receipt mirrors apply_bcast/6 on an empty batch with PrevV = Version:
+\* Receipt mirrors offer_batch/5 on an empty batch with PrevV = Version:
 \* caught-up (ver = applied) takes the apply clause, which applies no rows and
 \* re-bumps to the same version — observably just cancel_resync (flush_deferred
 \* releases nothing: every deferred ack at or below applied was flushed when
@@ -466,8 +466,8 @@ DegradeTimeout(l) ==
 \* frontier >= any follower's applied_version), and a legitimate resync only ever
 \* moves a gapped follower FORWARD, so the guard rejects only genuinely stale
 \* snapshots.  In the real code this is the `Version >= CurrentVersion` conjunct
-\* beside `Epoch >= CurrentEpoch` in handle_cast({apply_names_snapshot, ...})
-\* (dgen_registry_member.erl) — shipped.
+\* beside `Epoch >= CurrentEpoch` in dgen_registry_replica:offer_snapshot/4
+\* (dgen_registry_replica.erl) — shipped.
 RecvSnap(s, f) ==
     /\ alive[f]
     /\ HeadIs(s, f, "snap")

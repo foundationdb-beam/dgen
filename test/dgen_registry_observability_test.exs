@@ -36,7 +36,7 @@ defmodule DGen.RegistryObservabilityTest do
 
   # The published view and the member's own state record must agree.
   defp assert_agrees!(name, context) do
-    published = :eta_observe.read(name)
+    published = Cluster.status(name)
     actual = :dgen_registry.status(name)
 
     assert is_map(published), "#{context}: #{name} published nothing"
@@ -65,7 +65,7 @@ defmodule DGen.RegistryObservabilityTest do
 
       leaders =
         for name <- Cluster.alive(c),
-            s = :eta_observe.read(name),
+            s = Cluster.status(name),
             s.leader == s.member_id,
             do: name
 
@@ -89,7 +89,7 @@ defmodule DGen.RegistryObservabilityTest do
 
       # applied_version moves with the writes, which is the point of republishing
       # on every callback rather than only on leadership transitions.
-      assert :eta_observe.read(leader).applied_version > 0
+      assert Cluster.status(leader).applied_version > 0
     end
 
     test "across a leadership change", %{tenant: tenant} do
@@ -97,7 +97,7 @@ defmodule DGen.RegistryObservabilityTest do
       on_exit(fn -> Cluster.stop(c) end)
 
       {_node, old_leader} = Cluster.leader(c)
-      old_epoch = :eta_observe.read(old_leader).epoch
+      old_epoch = Cluster.status(old_leader).epoch
 
       Cluster.crash(c, old_leader)
 
@@ -112,7 +112,7 @@ defmodule DGen.RegistryObservabilityTest do
       assert_all_agree!(c, "after a leadership change")
 
       {_node, new_leader} = Cluster.leader(c)
-      new = :eta_observe.read(new_leader)
+      new = Cluster.status(new_leader)
 
       assert new.leader == new.member_id
       assert new.epoch > old_epoch, "the epoch did not advance"
@@ -171,14 +171,14 @@ defmodule DGen.RegistryObservabilityTest do
 
       [name] = Cluster.alive(c)
       member = Process.whereis(name)
-      expected = :eta_observe.read(name)
+      expected = Cluster.status(name)
       assert expected.leader == expected.member_id
 
       :erlang.suspend_process(member)
 
       try do
         # The whole point: a live read of a process that cannot answer anything.
-        assert :eta_observe.read(name) == expected
+        assert Cluster.status(name) == expected
 
         # And the failure mode it replaces. Not an error — a plausible answer,
         # which is what makes an invariant built on it quietly vacuous.

@@ -227,14 +227,14 @@ dead in every reachable state rather than someone's way of hoping it was.
 |---|---|
 | `Elect` | `dgen_registry_elector` committing a membership/leadership change (abstracted to one durable write) |
 | `AssumeGather` (incl. the `SafeAssumeGather` version-key fence) | the `assuming` statem state: `assume_genuine/6` → `spawn_assume_gather` → `gather_caught_up/6` → the `{assume_gathered}` continuation, valid only in `assuming` for its arming ref. The continuing-leader join fast path (`assume_fast_path/6` / `onboard_joiner` / `{peer_joined}`) dispatches in the `leader` state and is OUT OF SCOPE here (see above) |
-| `HeartbeatBcast` / `RecvHeartbeat` | `handle_info(replica_heartbeat, …)` leader clause → `broadcast_heartbeat/1` (`{names_batch, [], E, V, V, Self}`) / the empty batch through `apply_bcast/6`'s three-way split |
+| `HeartbeatBcast` / `RecvHeartbeat` | `handle_info(replica_heartbeat, …)` leader clause → `broadcast_heartbeat/1` (`{names_batch, [], E, V, V, Self}`) / the empty batch through `dgen_registry_replica:offer_batch/5` |
 | `CanCommit`'s `dbLeader/dbEpoch` conjuncts | the fenced version-key bump in `dgen_registry_names:start_commit/4` (§5.1) |
 | `RegisterForward` | follower `route_register` forward → leader `{register_req}` → group commit → `broadcast_batch/5` + `{register_reply, Ref, yes, Version}` |
 | `RegisterDirect` + `RecvSync`/`RecvAck` | leader-local `route_register` → `pending_acks` / `{replicate_sync}` / `{replicate_ack}` |
 | `DegradeTimeout` | `handle_info({replicate_timeout, _})` with `strict_replication = false` |
-| `RecvBcastApply/Drop/Gap` | `apply_bcast/6` (the three-way case split; one `{names_batch, …}` per commit version) |
-| `RecvReply` | `handle_register_reply/4` incl. `deferred_yes`; flushes are `bump_applied/2` → `flush_deferred/1` |
-| `RecvSnap` (incl. the `SafeAssumeSnap` version-monotonic guard) | `handle_cast({apply_names_snapshot, ...})` — the `Epoch >= CurrentEpoch andalso Version >= CurrentVersion` guard |
+| `RecvBcastApply/Drop/Gap` | `dgen_registry_replica:offer_batch/5` → `applied` / `stale_epoch`+`duplicate` / `gap` (one `{names_batch, …}` per commit version); the member's `{names_batch}` handler reacts to the verdict |
+| `RecvReply` | `handle_register_reply/4` incl. `deferred_yes`; flushes are the `{names_batch}` handler's `applied` branch → `flush_deferred/1` |
+| `RecvSnap` (incl. the `SafeAssumeSnap` version-monotonic guard) | `dgen_registry_replica:offer_snapshot/4` (the `Epoch >= CurrentEpoch andalso V >= Applied` guard), called from `handle_cast({apply_names_snapshot, ...})` |
 | `ServeResync` / `resyncReq` | `{resync_req}` handler / `request_resync/2` |
 | `Crash` | member/node death; the ETS replica dies with the process |
 | `DropMsg` | casts lost on an Erlang-distribution disconnect (signal-ordering semantics) |
