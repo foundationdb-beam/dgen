@@ -20,7 +20,8 @@ in theory, be substituted, but for now FDB is the only implemented backend.
 - **`dgen_server`** — the `gen_server` programming model (same callbacks, same
   return shapes), backed by durable state and a durable message queue instead
   of process memory. Any number of processes, on any number of nodes, can
-  consume from the same server concurrently.
+  consume from the same server concurrently, and via strict serializability
+  of FoundationDB, `gen_server` semantics are preserved.
 - **`dgen_registry`** — an OTP-compatible process registry: give a running
   process a logical name and find or message it by name from anywhere in the
   cluster, via the standard `{via, dgen_registry, {RegistryName, LogicalName}}`

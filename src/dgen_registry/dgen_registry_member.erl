@@ -3,7 +3,7 @@
 
 -define(DOCATTRS, ?OTP_RELEASE >= 27).
 
--include("../include/dgen_eta.hrl").
+-include("../../include/dgen_eta.hrl").
 -eta_observe(
     {state, [
         member_id,
