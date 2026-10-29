@@ -56,7 +56,7 @@ VARIABLES
     epoch,       \* [Members -> Nat]: last epoch learned (set by snapshots/assume)
     leaderView,  \* [Members -> Members \cup {NoMember}]: believed leader;
                  \* leaderView[m] = m  <=>  m believes it is the leader
-    deferred,    \* [Members -> SUBSET (Names \X Pids \X Nat)]: deferred_yes
+    deferred,    \* [Members -> SUBSET (Names \X Pids \X Nat)]: intents awaiting_version
     pendingAcks, \* [Members -> SUBSET (Names \X Pids \X Nat)]: leader-side
                  \* direct registrations awaiting a replicate_ack
     resyncReq,   \* [Members -> Members \cup {NoMember}]: outstanding resync
@@ -137,9 +137,11 @@ Elect(m) ==
 \* Modeled atomically; the gather reaches every live member (see module
 \* header).  Freshest-wins: adopt the max-applied_version replica (version
 \* tie => identical content, which PrefixConsistency asserts).  Deferred
-\* acks are rejected and pending direct acks resolved-as-rejected, matching
-\* do_leader_changed/reject_forwards; then snapshots fan out to every other
-\* live member from this process (FIFO with later broadcasts).
+\* acks are dropped and pending direct acks resolved-as-rejected; then snapshots
+\* fan out to every other live member from this process (FIFO with later
+\* broadcasts).  (The code re-drives a dropped deferred ack as a fresh forward —
+\* dgen_registry_intents:redrive/5 — which is just another RegisterForward here,
+\* so dropping it is the sound abstraction for the safety properties.)
 \* THE FIX, first half (SafeAssumeGather): the assuming leader must not reconstruct
 \* from a gather that is behind the durable version key.  `maxV` is the freshest
 \* applied_version any live member reports; `dbVersion` is the committed frontier
@@ -369,7 +371,7 @@ RecvHeartbeat(s, f) ==
 \* on a leadership change (an unknown-Ref reply is ignored).  Otherwise:
 \* applied >= ver  -> ack now (the broadcast/snapshot already delivered the
 \*                    row; the follower is a version-visible second holder);
-\* gapped + guard  -> defer (deferred_yes), released by flush_deferred;
+\* gapped + guard  -> defer (awaiting_version), released by on_version;
 \* gapped, no guard-> the pre-guard bug: optimistic row write + immediate
 \*                    ack.  The row exists but at a version the freshest-wins
 \*                    gather ignores — the silent-loss window.

@@ -10,9 +10,7 @@
         leader,
         replica,
         synced,
-        pending_forwards,
-        pending_unregs,
-        deferred_yes,
+        intents,
         committing,
         num_pending
     ]}
@@ -80,14 +78,14 @@
 %%
 %% The member still subscribes to `nodeup`/`nodedown` via `net_kernel:monitor_nodes/1`.
 %% On `{nodeup, Node}` it does two things: it re-announces itself to the elector
-%% (`{join, Self}`), and it promptly re-drives any unregisters it stashed while the
-%% leader was unreachable (`redrive_pending_unregs`, Non-goal 5).  The re-announce
+%% (`{join, Self}`), and it promptly re-drives its unresolved intents — notably any
+%% unregister held while the leader was unreachable (Non-goal 5).  The re-announce
 %% handles an Erlang-level partition that caused both sides to remove each other from the
 %% member set via `{member_down}` while the DB stayed healthy: once distribution
 %% reconnects, both sides re-join and the elector reconstitutes the cluster without a
-%% restart.  The stashed-unregister re-drive means the removal reaches the (now-reachable)
-%% leader immediately, rather than waiting for the re-onboarding snapshot.  (The connector subscribes to node
-%% events independently for its mesh bookkeeping.)  The connector also nudges this
+%% restart.  The re-drive means a held removal reaches the (now-reachable) leader
+%% immediately, rather than waiting for the re-onboarding snapshot.  (The connector
+%% subscribes to node events independently for its mesh bookkeeping.)  The connector also nudges this
 %% member with `{durable_epoch, E}` when the committed election epoch has moved ahead of
 %% what the member has heard — a missed handoff — prompting a re-join.
 %%
@@ -99,18 +97,22 @@
 %% no-leader window during a handoff, or the elected leader is unreachable in a
 %% partition), the registration is **not** answered `no` — that would be a false
 %% `already_started` to OTP's via machinery.  Instead the caller is *blocked*: the
-%% request is stashed in `pending_registers` and re-driven (`redrive_registers/1`) the
-%% moment a leader is established (assuming leadership, or applying a leader's snapshot),
-%% so it succeeds if a leader appears within the caller's `register_timeout` and
+%% request becomes an **intent** (`dgen_registry_intents`) that is re-driven the moment
+%% a leader is established (assuming leadership, or applying a leader's snapshot), so
+%% it succeeds if a leader appears within the caller's `register_timeout` and
 %% otherwise the caller's own `gen_server:call` times out (§3 of the design doc — a
-%% timeout exits rather than returning a verdict).  The stash is pruned by wall-clock
-%% age so a prolonged no-leader window (a partition) cannot grow it without bound.  All
-%% register routing is in `route_register/5`.
+%% timeout exits rather than returning a verdict).  The same holds when leadership
+%% moves *after* a registration was forwarded: the forward is re-driven to the new
+%% leader rather than answered `no` — registering the same pid under the same name is
+%% idempotent (§5.2), so re-sending can only produce the right answer.  Intents are
+%% pruned by wall-clock age so a prolonged no-leader window (a partition) cannot grow
+%% them without bound.  All register routing is in `route_register/5`.
 %%
 %% Forwards `{register, …}` and `{unregister, …}` to the leader. The register
-%% forward is **asynchronous**: the follower stashes the caller's `From` (with the
-%% registration's metadata) under a `Ref`, casts `{register_req, Ref, Self, Name, Pid,
-%% Meta}` to the leader, and replies `{noreply}` — it never blocks on the leader. When
+%% forward is **asynchronous**: the follower keeps the caller's `From` (with the
+%% registration's metadata) as an intent under a `Ref`, casts `{register_req, Ref,
+%% Self, Name, Pid, Meta}` to the leader, and replies `{noreply}` — it never blocks on
+%% the leader. When
 %% the leader's `{register_reply, Ref, yes|no, Version}` arrives, the follower (on
 %% `yes`) writes the registration's row (pid + metadata) into its own table and then
 %% answers the caller; on `no` the table is left unchanged.  The `yes` ack is
@@ -118,22 +120,22 @@
 %% to the batch's commit `Version` — normally already true, since the batch's
 %% `{names_batch}` broadcast precedes the reply (FIFO).  If that broadcast was
 %% gap-refused (the follower missed an earlier batch and awaits a resync), the ack is
-%% *deferred* until the resync lands (`deferred_yes` / `flush_deferred`), so the
+%% *deferred* until the resync lands (the intent's `awaiting_version` phase), so the
 %% "second holder" is always version-visible to the freshest-wins handoff gather —
 %% otherwise a single leader crash could silently drop an acked binding whose only
 %% surviving copy sat in a gapped replica the gather's version comparison ignores.
 %%
 %% An `{unregister, …}` is likewise a tracked, call-shaped forward (`unregister_req` /
-%% `unregister_reply`): the follower deletes its row optimistically, stashes the
-%% caller under a `Ref`, and — if the reply never comes (dropped cast, deposed
-%% leader) or no leader was reachable at all — re-drives the removal as a
-%% pid-guarded retract on the next snapshot/leadership event (`redrive_unregs`), so
+%% `unregister_reply`): the follower deletes its row optimistically, keeps the
+%% caller as an intent under a `Ref`, and — if the reply never comes (dropped cast,
+%% deposed leader) or no leader was reachable at all — re-drives the removal as a
+%% pid-guarded retract on the next snapshot/leadership event (`redrive_intents/2`), so
 %% an explicit unregister is never silently lost.  Explicit unregisters are rare, so
 %% the extra round-trip costs nothing that matters.
 %%
-%% A `set_metadata` forward is also asynchronous: the follower stashes `From` under a
-%% `Ref`, casts `{set_meta_req, Ref, Self, Name, Index, Data}`, and answers the caller
-%% when the leader's `{set_meta_reply, Ref, _}` arrives. No optimistic update is needed —
+%% A `set_metadata` forward is also asynchronous: the follower keeps `From` as an
+%% intent under a `Ref`, casts `{set_meta_req, Ref, Self, Name, Index, Data}`, and
+%% answers the caller when the leader's `{set_meta_reply, Ref, _}` arrives. No optimistic update is needed —
 %% routing the reply back through this member means the leader's `{names_batch, …}`
 %% broadcast (FIFO, ahead of the reply) has updated the follower's row before the caller
 %% is answered, preserving read-after-write for a subsequent local `get_metadata`.
@@ -147,8 +149,9 @@
 %% both the leader and the forwarding follower hold the binding, so it survives
 %% either node failing — at no extra round-trip.
 %%
-%% Forwards still in flight when leadership changes are rejected (`no`); the caller
-%% retries against the new leader.
+%% Forwards still in flight when leadership changes are re-driven to the new leader by
+%% kind: a registration is re-sent, an unregister becomes a pid-guarded retract, and a
+%% `set_metadata` (a replace, not safe to re-send) answers `{error, no_leader}`.
 %%
 %% A **consistent read** (`whereis_name_consistent`) on a follower forwards the same
 %% way: the follower casts `{whereis_req, Name, From}` to the leader and replies
@@ -186,13 +189,13 @@
 %%   - gap/resync: `request_resync` can fire on a deposed-but-uninformed leader
 %%     (the spec's RecvBcastGap has no leaderView guard), so a gapped state
 %%     would lie about the role.
-%%   - leader reachability: `route_register`/`route_unregister` stash when the
-%%     KNOWN leader is unreachable, which is a property of the link, not of
-%%     this member's role — the reason the pending_registers/pending_unregs
-%%     stashes were kept over gen_statem's `postpone` (that, and the CP
-%%     contract: an unreachable-leader unregister answers `ok` NOW and keeps
-%%     the intent, where postpone would defer the reply; and stash entries also
-%%     originate internally from batch-salvage paths, which are not events).
+%%   - leader reachability: `route_register`/`route_unregister` hold an intent
+%%     when the KNOWN leader is unreachable, which is a property of the link,
+%%     not of this member's role — the reason intents were kept over
+%%     gen_statem's `postpone` (that, and the CP contract: an
+%%     unreachable-leader unregister answers `ok` NOW and keeps the intent,
+%%     where postpone would defer the reply; and intents also originate
+%%     internally from batch-salvage paths, which are not events).
 %%   - the commit pipeline (`committing`): ops must accumulate during an
 %%     in-flight commit, never be postponed.
 %%
@@ -481,25 +484,6 @@
     | {retract, LogicalName :: term(), Pid :: pid()}
     | {down, LogicalName :: term(), Ref :: reference()}.
 
-%% A follower's in-flight forwarded call, keyed in `pending_forwards` by the `Ref` the
-%% leader echoes in its reply.  One map holds all three kinds so there is a single home
-%% for "calls I forwarded and am awaiting a verdict on", and a single resolution when
-%% leadership moves.  The kinds still differ in how they resolve — a register applies
-%% (or gap-defers) the optimistic row on `yes`; a set_meta just answers; an unregister
-%% is re-driven rather than rejected on a leadership change (see reject_forwards /
-%% redrive_unregs):
-%%   - {register, Name, Pid, Meta, From}: awaiting {register_reply}; on `yes` the row is
-%%                              written (making this member the second holder) and From
-%%                              answered — version-guarded, see handle_register_reply.
-%%   - {set_meta, From}:        awaiting {set_meta_reply}; From gets the leader's result.
-%%   - {unregister, Name, Pid, From}: awaiting {unregister_reply}; From gets `ok`.  Pid is
-%%                              the released pid (or `undefined` if unbound locally) so a
-%%                              re-drive can pid-guard the retract.
--type pending_forward() ::
-    {register, term(), pid(), meta(), gen_server:from()}
-    | {set_meta, gen_server:from()}
-    | {unregister, term(), pid() | undefined, gen_server:from()}.
-
 -record(state, {
     member_id :: dgen_registry_elector:member_id(),
     %% The elector has no registered name (see dgen_registry's "Process identity"
@@ -553,40 +537,11 @@
     %% is deliberately no reverse map — each monitor carries `{tag, {down, Name}}`
     %% (erlang:monitor/3), so its DOWN arrives already naming the binding.
     name_to_ref :: #{term() => reference()},
-    %% Follower-only: calls forwarded to the leader and awaiting their reply, keyed by
-    %% the Ref the leader echoes back (`register` / `set_meta` / `unregister` kinds —
-    %% see the pending_forward() type).  One map for all three, so there is a single
-    %% place forwarded-call state lives and a single resolution when leadership moves:
-    %% register and set_meta are rejected so their callers retry (reject_forwards);
-    %% unregister is instead re-driven, since its intent is idempotent and must not be
-    %% lost (redrive_unregs).
-    pending_forwards = #{} :: #{reference() => pending_forward()},
-    %% Follower-only: forwarded registrations whose `yes` reply arrived while this
-    %% member's replica was **gapped** (the batch's {names_batch} broadcast was
-    %% refused pending a resync, so applied_version is behind the reply's commit
-    %% version).  Acking `yes` at that point would make the "second holder"
-    %% invisible to the freshest-wins handoff gather (§5.5/§5.7) — a leader crash
-    %% before the resync landed could then silently drop an acked binding.  The ack
-    %% is deferred as {Version, From} and released by flush_deferred/1 once
-    %% applied_version reaches Version (the resync snapshot both delivers the
-    %% binding and advances the version, making the second holder version-visible).
-    %% Rejected (`no`) on a leadership change, like the register forwards it came from.
-    deferred_yes = [] :: [{non_neg_integer(), gen_server:from()}],
-    %% Unregisters accepted while no leader was reachable (answered `ok` under the
-    %% CP contract — the commit must wait), kept as {Name, ReleasedPid} until
-    %% redrive_unregs/1 can hand them to a leader as pid-guarded retracts.  (Distinct
-    %% from an `unregister` entry in `pending_forwards`, which was successfully
-    %% forwarded and is awaiting a reply; these never reached a leader at all.)
-    pending_unregs = [] :: [{term(), pid()}],
-    %% Registrations received while there was **no reachable leader** (none elected
-    %% yet, or the elected one is unreachable).  Rather than answer a false `no` — which
-    %% OTP's via machinery reads as `already_started` — the register is *blocked*: its
-    %% caller is stashed here as {EnqueuedAtMs, Name, Pid, Meta, From} and re-driven
-    %% (redrive_registers/1) the moment a leader is established, so it succeeds if the
-    %% leader appears within the caller's `register_timeout` and otherwise the caller's
-    %% own call times out (§3 / §5.2).  Pruned by wall-clock age on the periodic pass so
-    %% the stash cannot grow unbounded while no leader ever appears (a partition).
-    pending_registers = [] :: [{integer(), term(), pid(), meta(), gen_server:from()}],
+    %% Client requests this member accepted but cannot decide itself (it does not
+    %% lead): registrations, unregisters and metadata writes, each awaiting a leader,
+    %% a forwarded reply, or (a gap-deferred `yes`) our replica catching up.  See
+    %% dgen_registry_intents for the phases and the re-drive rules.
+    intents = dgen_registry_intents:new() :: dgen_registry_intents:t(),
     %% Leader-only: direct (local-origin) registrations that have committed but are
     %% awaiting follower replica confirmation before being acked `yes` (the two-holder
     %% invariant, §5.5/§8).  BatchRef => {Direct, TimerRef, Needed, Acked}, where
@@ -757,10 +712,6 @@ init(#{name := Name, tenant := Tenant, tuid := Tuid} = Args) ->
             members = #{},
             monitors = #{},
             name_to_ref = #{},
-            pending_forwards = #{},
-            deferred_yes = [],
-            pending_unregs = [],
-            pending_registers = [],
             pending_acks = #{},
             join_token = make_ref(),
             peer_tokens = #{},
@@ -803,8 +754,9 @@ init(#{name := Name, tenant := Tenant, tuid := Tuid} = Args) ->
 %% or any added later — can forget half of it.  Entering `leader` seeds the
 %% subscription matches and arms the deferred monitor sweep (assume_leadership);
 %% leaving `leader` demonitors every registered pid (relinquish_leadership).
-%% What deliberately does NOT live here: reject_forwards fires on any change of
-%% leader IDENTITY, including follower→follower, which is not a state edge; and
+%% What deliberately does NOT live here: redrive_intents fires on every leadership
+%% event, including follower→follower and a same-leader snapshot, which are not
+%% state edges; and
 %% fail_pending_acks stays with do_leader_changed's lost-leadership branch —
 %% a re-assumed leader's stale pending acks are already fenced by their
 %% BatchRef, and resolving them early would change behavior, not just shape.
@@ -908,8 +860,14 @@ handle_event(cast, {resync_req, _FollowerId} = Msg, leader, Data) ->
     next(Data1, []);
 handle_event(cast, {resync_req, _FollowerId}, _AnyState, Data) ->
     {keep_state, Data};
+%% A forwarded registration reaching a member mid-assume is postponed until the assume
+%% resolves: it is about to lead (the forwarder already believes it does), so it
+%% commits the registration then; superseded by a snapshot, it stays silent, like any
+%% non-leader, and the forwarder re-drives against the leader that snapshot names.
+handle_event(cast, {register_req, _Ref, _FollowerId, _Name, _Pid, _Meta}, assuming, Data) ->
+    {keep_state, Data, [postpone]};
 %% A forwarded unregister: the leader commits it; a non-leader stays silent (the
-%% follower keeps the removal stashed and re-drives it at the next leader).
+%% follower keeps the removal as an intent and re-drives it at the next leader).
 handle_event(cast, {unregister_req, _Ref, _FollowerId, _Name} = Msg, leader, Data) ->
     {noreply, Data1} = handle_cast(Msg, Data),
     next(Data1, []);
@@ -1027,23 +985,9 @@ handle_call(
 %% leader answers via a {set_meta_reply} cast routed back through this member, so the
 %% leader's {names_batch} broadcast (FIFO, ahead of the reply) has updated our row
 %% before we answer the caller — read-after-write on this node's snapshot read.
-handle_call(
-    {set_metadata, LogicalName, Index, Data},
-    From,
-    State = #state{leader = Leader, member_id = Self, pending_forwards = PF}
-) when Leader =/= undefined, Leader =/= Self ->
-    %% Same unreachable-leader fast-fail as the register forward above.
-    case member_reachable(Leader) of
-        true ->
-            Ref = make_ref(),
-            cast_to_member(Leader, {set_meta_req, Ref, Self, LogicalName, Index, Data}),
-            {noreply, State#state{pending_forwards = PF#{Ref => {set_meta, From}}}};
-        false ->
-            {reply, {error, no_leader}, State}
-    end;
-%% No leader yet.
-handle_call({set_metadata, _LogicalName, _Index, _Data}, _From, State) ->
-    {reply, {error, no_leader}, State};
+%% With no reachable leader the caller is answered `{error, no_leader}` at once.
+handle_call({set_metadata, LogicalName, Index, Data}, From, State) ->
+    {noreply, submit_intent({set_meta, LogicalName, Index, Data}, From, State)};
 %% ---- Consistent metadata read (leader only) --------------------------------
 
 handle_call(
@@ -1266,10 +1210,11 @@ handle_cast(
         false ->
             {noreply, enqueue_op({add, LogicalName, Pid, Meta, {forward, FollowerId, Ref}}, State)}
     end;
-%% Not the leader (race: the follower's leader belief was stale) — reject so the
-%% follower's caller retries against the current leader.
-handle_cast({register_req, Ref, FollowerId, _LogicalName, _Pid, _Meta}, State) ->
-    cast_to_member(FollowerId, {register_reply, Ref, no}),
+%% Not the leader (the follower's leader belief is stale; our own assume window
+%% postpones instead, in handle_event/4).  Stay silent rather than answer `no` —
+%% that would be a non-adjudicated refusal (§3).  The follower keeps the
+%% registration as an intent and re-drives it when it learns of the real leader.
+handle_cast({register_req, _Ref, _FollowerId, _LogicalName, _Pid, _Meta}, State) ->
     {noreply, State};
 %% Leader: an unregister forwarded by a follower.  Same shape as the direct
 %% unregister call: capture our (authoritative) bound pid, optimistic delete, and
@@ -1287,15 +1232,8 @@ handle_cast(
 %% Follower: the leader committed a forwarded unregister — answer the caller `ok`.
 %% FIFO puts this behind the batch's {names_batch} broadcast, so this member's
 %% row state reflects the removal by the time the caller sees the reply.
-handle_cast({unregister_reply, Ref}, State = #state{pending_forwards = PF}) ->
-    case maps:take(Ref, PF) of
-        {{unregister, _Name, _ReleasedPid, From}, PF1} ->
-            gen_server:reply(From, ok),
-            {noreply, State#state{pending_forwards = PF1}};
-        _ ->
-            %% Unknown Ref — already answered (e.g. re-driven on a leadership change).
-            {noreply, State}
-    end;
+handle_cast({unregister_reply, Ref}, State) ->
+    {noreply, intent_reply(Ref, unregister, State)};
 %% Leader: a set_metadata forwarded by a follower.  Park it as a set_meta op whose
 %% origin is the forwarding member, answered via {set_meta_reply} once committed.
 handle_cast(
@@ -1311,15 +1249,8 @@ handle_cast({set_meta_req, Ref, FollowerId, _LogicalName, _Index, _Data}, State)
 %% Follower: the leader's answer to a forwarded set_metadata.  By now the matching
 %% {names_batch} broadcast (FIFO ahead of this) has updated our row, so answering the
 %% caller here preserves read-after-write for a subsequent local get_metadata.
-handle_cast({set_meta_reply, Ref, Result}, State = #state{pending_forwards = PF}) ->
-    case maps:take(Ref, PF) of
-        {{set_meta, From}, PF1} ->
-            gen_server:reply(From, Result),
-            {noreply, State#state{pending_forwards = PF1}};
-        _ ->
-            %% Unknown Ref — already answered (e.g. rejected on a leadership change).
-            {noreply, State}
-    end;
+handle_cast({set_meta_reply, Ref, Result}, State) ->
+    {noreply, intent_reply(Ref, {set_meta, Result}, State)};
 %% Leader: a consistent metadata read forwarded by a follower.  Reply to the original
 %% caller's `From` directly from the authoritative row — fenced, like every
 %% consistent read (see reply_fenced).
@@ -1369,14 +1300,14 @@ handle_cast({whereis_req, _LogicalName, From}, State) ->
 %% answered against a replica whose extra row freshest-wins reconstruction would
 %% ignore — the fix for the silent-loss window a single leader crash could open.
 handle_cast({register_reply, Ref, Result, Version}, State) ->
-    {noreply, handle_register_reply(Ref, Result, Version, State)};
+    {noreply, intent_reply(Ref, {register, Result, Version}, State)};
 %% Legacy 3-tuple reply (a pre-version leader during a rolling upgrade): no version
 %% to guard on — apply the old immediate behaviour.  Marked `legacy` rather than
 %% version 0, because "0 is at-or-behind everything" put it on the same branch as a
-%% guarded reply, and those two must now do different things (see
-%% handle_register_reply/4).
+%% guarded reply, and those two must do different things (see
+%% dgen_registry_intents:on_reply/4).
 handle_cast({register_reply, Ref, Result}, State) ->
-    {noreply, handle_register_reply(Ref, Result, legacy, State)};
+    {noreply, intent_reply(Ref, {register, Result, legacy}, State)};
 %% Follower: the leader asks us to confirm we hold a batch's bindings.  This cast
 %% arrives (FIFO) after the batch's {names_batch} cast, so normally we have
 %% applied them and hold the bindings — ack back to the leader.  The ack is
@@ -1431,7 +1362,7 @@ handle_cast({names_batch, Ops, Epoch, PrevV, Version, LeaderId}, State = #state{
     State1 =
         case dgen_registry_replica:offer_batch(Epoch, PrevV, Version, Ops, R) of
             {applied, R1} ->
-                flush_deferred(record_released(Ops, cancel_resync(State#state{replica = R1})));
+                intents_advanced(record_released(Ops, cancel_resync(State#state{replica = R1})));
             gap ->
                 request_resync(LeaderId, State);
             _StaleEpochOrDuplicate ->
@@ -1469,11 +1400,11 @@ handle_cast({retract_req, LogicalName, Pid}, State = #state{leader = Leader}) wh
     {noreply, State};
 handle_cast({retract_req, LogicalName, Pid}, State) ->
     %% No leader right now — most likely this member is mid-handoff (the assume
-    %% window, where leader is transiently `undefined`).  Stash the pid-guarded clear
-    %% in `pending_unregs` rather than dropping it, so the assume continuation
-    %% (redrive_unregs) re-drives it once a leader is established — otherwise a
+    %% window, where leader is transiently `undefined`).  Hold the pid-guarded clear
+    %% as an (already answered) unregister intent rather than dropping it, so the
+    %% assume continuation re-drives it once a leader is established — otherwise a
     %% re-driven unregister that lands during a handoff would be silently lost.
-    {noreply, stash_pending_unreg(LogicalName, Pid, State)};
+    {noreply, submit_intent({unregister, LogicalName, Pid}, answered, State)};
 %% Leadership transition snapshot sent by the new leader to all followers.
 %% Applies the leader transition, the record update (pid + metadata per name), and
 %% extra member monitors atomically within a single cast — no other message can
@@ -1508,15 +1439,11 @@ handle_cast(
             State4 = merge_peer_tokens(Tokens, State3),
             %% Handle any buffered ops under the new leadership view: reject them
             %% if we are now a follower, or commit them if we remain leader.  The
-            %% snapshot advanced applied_version, so release any forwarded-`yes`
-            %% acks that were deferred on a gap (flush_deferred; a leadership
-            %% change already rejected them in do_leader_changed), and re-drive any
-            %% stashed unregisters and blocked registrations against the now-known
-            %% leader (redrive_unregs / redrive_registers).
+            %% snapshot advanced our version, so release any gap-deferred `yes` acks
+            %% it covers, then re-drive every unresolved intent against the
+            %% now-known leader.
             {noreply,
-                maybe_start_commit(
-                    redrive_registers(redrive_unregs(flush_deferred(mark_synced(State4))))
-                )};
+                maybe_start_commit(redrive_intents(moved, intents_advanced(mark_synced(State4))))};
         stale ->
             {noreply, State}
     end;
@@ -1699,7 +1626,7 @@ handle_info({'DOWN', Ref, process, _Pid, _Reason}, State) ->
             spawn_member_down(Elector, DeadMemberId, Cached),
             {noreply, remove_member(DeadMemberId, State)}
     end;
-handle_info({nodeup, _Node}, State = #state{elector = Elector, member_id = Self, leader = Leader}) ->
+handle_info({nodeup, _Node}, State = #state{elector = Elector, member_id = Self}) ->
     %% Re-announce to the elector — this member may have been removed from the
     %% member set while the node was unreachable (partition).  A fresh token is
     %% generated so any stale {member_down, Self, OldToken} already in the queue
@@ -1709,28 +1636,21 @@ handle_info({nodeup, _Node}, State = #state{elector = Elector, member_id = Self,
     NewToken = make_ref(),
     dgen_server:cast(Elector, {join, Self, NewToken, not State#state.synced}),
     %% A nodeup is a partition heal: if the leader we already know is now reachable
-    %% again, re-drive any unregisters retained while it was unreachable *immediately*,
-    %% rather than waiting for the re-onboarding snapshot that also triggers
-    %% redrive_unregs/1.  This covers both ways an unregister survives a partition — a
-    %% removal *stashed* because the leader was already seen unreachable (`pending_unregs`)
-    %% and one *forwarded into the dying link* before the disconnect propagated
-    %% (`pending_forwards`) — so the Non-goal-5 guarantee ("an explicit unregister is
-    %% never silently lost") does not hinge on the snapshot arriving.  Pid-guarded and
-    %% stash-clearing, so it composes harmlessly with the snapshot path.
-    %%
-    %% Guarded on the leader being reachable (or us): redrive_unregs/1 forwards and clears
-    %% the stash unconditionally (safe on the snapshot path, where the snapshot's sender
-    %% is by definition reachable), so calling it here while the leader is still
-    %% unreachable would drop the retract into a dropped cast *and* clear the stash —
-    %% losing it.  A different node's nodeup with our leader still unreachable is left for
-    %% the snapshot / a later heal.
+    %% again, re-drive our unresolved intents *immediately*, rather than waiting for
+    %% the re-onboarding snapshot that also re-drives them.  This covers every way an
+    %% unregister survives a partition — one held because the leader was already seen
+    %% unreachable, and one *forwarded into the dying link* before the disconnect
+    %% propagated — so the Non-goal-5 guarantee ("an explicit unregister is never
+    %% silently lost") does not hinge on the snapshot arriving; and it re-sends any
+    %% registration whose forward the dying link may have swallowed.  Re-driving is
+    %% idempotent, so it composes harmlessly with the snapshot path.  Guarded on the
+    %% leader being reachable (or us): another node's nodeup while our leader is still
+    %% unreachable is left for the snapshot / a later heal.
     State1 = State#state{join_token = NewToken},
-    LeaderReachable =
-        Leader =:= Self orelse (Leader =/= undefined andalso member_reachable(Leader)),
     {noreply,
-        case LeaderReachable of
-            true -> redrive_unregs(State1);
-            false -> State1
+        case intent_route(State1) of
+            none -> State1;
+            _Reachable -> redrive_intents(all, State1)
         end};
 %% Continuation of the continuing-leader fast path for a rejoining (non-fresh)
 %% member: its replica snapshot arrived from the gather helper.  Adjudicate it
@@ -1855,16 +1775,12 @@ handle_info(
         end,
         OtherIds
     ),
-    %% We are the leader now: reject any registrations we forwarded as a follower (the
-    %% old leader will never answer them), re-drive stashed unregisters and blocked
-    %% registrations into our own commit buffer, then commit anything buffered while we
-    %% assumed.  The gather made us synced; any outstanding resync is moot.
-    {noreply,
-        maybe_start_commit(
-            redrive_registers(
-                redrive_unregs(reject_forwards(mark_synced(cancel_resync(State4))))
-            )
-        )};
+    %% We are the leader now: re-drive every unresolved intent — registrations we
+    %% forwarded as a follower (the old leader may never answer them), held
+    %% unregisters, blocked registrations — into our own commit buffer, then commit
+    %% anything buffered while we assumed.  The gather made us synced; any
+    %% outstanding resync is moot.
+    {noreply, maybe_start_commit(redrive_intents(moved, mark_synced(cancel_resync(State4))))};
 %% Periodic maintenance: expire stale entries from the conflict-detection trail
 %% (§5.6) and the per-name kill-budget timestamps, then re-arm.  Trail pruning is
 %% suspended while any current member is disconnected: a disconnected member misses
@@ -1901,9 +1817,9 @@ handle_info(
         fun(_Name, Tss) -> Tss =/= [] end,
         maps:map(fun(_Name, Tss) -> [Ts || Ts <- Tss, Ts >= Now - Window] end, KB)
     ),
-    %% Also drop stashed registrations whose callers have timed out (bounds
-    %% pending_registers while no leader appears — see the field doc).
-    {noreply, prune_pending_registers(State#state{recently_released = Rel1, kill_budget = KB1})};
+    %% Also drop intents whose callers have timed out (bounds them while no leader
+    %% appears — see prune_intents/1).
+    {noreply, prune_intents(State#state{recently_released = Rel1, kill_budget = KB1})};
 %% The resync request we sent went unanswered (dropped cast, deposed target) —
 %% clear the guard so the next gap-observing broadcast (or the leader's replication
 %% heartbeat, which is one) requests again.
@@ -1992,14 +1908,16 @@ handle_info({requeue_ops, Ops}, State = #state{leader = Leader}) when Leader =/=
     {noreply, State};
 handle_info({requeue_ops, Ops}, State) ->
     %% No leader right now (likely mid-handoff — the assume window, leader =
-    %% undefined).  Stash the pid-guarded clears in `pending_unregs` so the assume
+    %% undefined).  Hold the pid-guarded clears as unregister intents so the assume
     %% continuation (or the next snapshot) re-drives them, rather than dropping them
     %% and leaving a divergence until an unrelated handoff.  Downs are dropped — the
     %% new leader monitors those pids itself.
     Stashed = lists:foldl(
         fun
-            ({remove, Name, Pid, _Origin}, S) when is_pid(Pid) -> stash_pending_unreg(Name, Pid, S);
-            ({retract, Name, Pid}, S) -> stash_pending_unreg(Name, Pid, S);
+            ({remove, Name, Pid, _Origin}, S) when is_pid(Pid) ->
+                submit_intent({unregister, Name, Pid}, answered, S);
+            ({retract, Name, Pid}, S) ->
+                submit_intent({unregister, Name, Pid}, answered, S);
             (_, S) -> S
         end,
         State,
@@ -2038,14 +1956,9 @@ code_change(_OldVsn, StatemState, State, _Extra) ->
 %% Internal helpers
 %% ---------------------------------------------------------------------------
 
-do_leader_changed(NewLeader, OldLeader, Self, State0) ->
-    %% On any leadership change, reject registrations forwarded to the old leader —
-    %% its {register_reply} will never arrive; callers retry against the new leader.
-    State =
-        case NewLeader =/= OldLeader of
-            true -> reject_forwards(State0);
-            false -> State0
-        end,
+do_leader_changed(NewLeader, OldLeader, Self, State) ->
+    %% Intents forwarded to the old leader are not resolved here: every caller follows
+    %% this with redrive_intents/2, which re-routes them to whoever leads now.
     %% The role-edge halves — relinquish on leaving `leader`, assume on entering
     %% it — run in the state enter calls, off this function's returned Data.
     if
@@ -2485,43 +2398,20 @@ reject_new_when_degraded(_Name, _State) ->
 %% one immediate `no` here is the `reject_when_degraded` prevention mode (§5.6), an
 %% explicit opt-in.  Crucially, **no leader (or an unreachable one) does not answer
 %% `no`** — that would be a false `already_started` to OTP.  Instead the caller is
-%% *blocked*: the registration is stashed to await a leader (redrive_registers/1), so
-%% it succeeds if one appears within the caller's `register_timeout` and otherwise the
-%% caller's own call times out.  Returns the new state; the reply is either already
-%% sent (immediate `no`) or deferred.
+%% *blocked*: the registration becomes an intent that waits for a leader
+%% (redrive_intents/2), so it succeeds if one appears within the caller's
+%% `register_timeout` and otherwise the caller's own call times out.  Returns the new
+%% state; the reply is either already sent (immediate `no`) or deferred.
 route_register(Name, Pid, Meta, From, State = #state{leader = Leader, member_id = Self}) ->
     if
         Leader =:= Self ->
-            %% Leader: park in the group-commit buffer, answered on commit — unless the
-            %% degraded-prevention mode refuses it outright.
-            case reject_new_when_degraded(Name, State) of
-                true ->
-                    gen_server:reply(From, no),
-                    State;
-                false ->
-                    enqueue_op({add, Name, Pid, Meta, {local, From}}, State)
-            end;
-        Leader =:= undefined ->
-            %% No leader elected yet (startup, or a brief handoff window) — block.
-            stash_pending_register(Name, Pid, Meta, From, State);
+            enqueue_register(Name, Pid, Meta, From, State);
         true ->
-            %% A different member leads.  Forward if reachable (the caller blocks on the
-            %% eventual {register_reply}); if unreachable (partition), block and stash
-            %% rather than forward into a dropped cast — the removal-style re-drive picks
-            %% it up when a leader is reachable again.
-            case member_reachable(Leader) of
-                true ->
-                    Ref = make_ref(),
-                    cast_to_member(Leader, {register_req, Ref, Self, Name, Pid, Meta}),
-                    State#state{
-                        pending_forwards =
-                            (State#state.pending_forwards)#{
-                                Ref => {register, Name, Pid, Meta, From}
-                            }
-                    };
-                false ->
-                    stash_pending_register(Name, Pid, Meta, From, State)
-            end
+            %% Another member leads, or none is reachable (startup, a handoff window,
+            %% a partition): the register becomes an intent.  It is forwarded if the
+            %% leader is reachable (the caller blocks on the eventual
+            %% {register_reply}), or held until a leader is — never answered `no`.
+            submit_intent({register, Name, Pid, Meta}, From, State)
     end.
 
 %% Route an unregister (or unsubscribe — the reserved subscription name) to wherever it
@@ -2533,9 +2423,9 @@ route_register(Name, Pid, Meta, From, State = #state{leader = Leader, member_id 
 %%     buffer with the caller as origin — answered `ok` on commit.  A batch that fails
 %%     salvages its removes, so `ok` means "accepted and re-driven", never "dropped".
 %%   - Follower, reachable leader: delete the local row and forward as a *tracked*
-%%     request stashed under Ref (a dropped forward or deposed leader is recovered by
-%%     redrive_unregs/1 — a pid-guarded retract to the then-current leader).
-%%   - Follower, unreachable leader / no leader: answer `ok` now and stash the intent;
+%%     intent under Ref (a dropped forward or deposed leader is recovered by
+%%     redrive_intents/2 — a pid-guarded retract to the then-current leader).
+%%   - Follower, unreachable leader / no leader: answer `ok` now and hold the intent;
 %%     it is re-driven once a leader is reachable (CP — the commit waits, the intent is
 %%     never lost).
 route_unregister(
@@ -2550,64 +2440,92 @@ route_unregister(
                     {remove, LogicalName, ReleasedPid, {unreg, From}},
                     row_delete(State, LogicalName)
                 )};
-        Leader =/= undefined ->
-            State1 = row_delete(State, LogicalName),
-            case member_reachable(Leader) of
-                true ->
-                    Ref = make_ref(),
-                    cast_to_member(Leader, {unregister_req, Ref, Self, LogicalName}),
-                    {noreply, State1#state{
-                        pending_forwards = (State1#state.pending_forwards)#{
-                            Ref => {unregister, LogicalName, ReleasedPid, From}
-                        }
-                    }};
-                false ->
-                    {reply, ok, stash_pending_unreg(LogicalName, ReleasedPid, State1)}
-            end;
         true ->
-            {reply, ok,
-                stash_pending_unreg(LogicalName, ReleasedPid, row_delete(State, LogicalName))}
+            State1 = row_delete(State, LogicalName),
+            {noreply, submit_intent({unregister, LogicalName, ReleasedPid}, From, State1)}
     end.
 
-%% Stash a registration that could not be routed (no reachable leader), tagged with
-%% the wall-clock ms it arrived so the periodic prune can drop it once its caller has
-%% (about) timed out.
-stash_pending_register(Name, Pid, Meta, From, State = #state{pending_registers = PR}) ->
-    Now = erlang:system_time(millisecond),
-    State#state{pending_registers = [{Now, Name, Pid, Meta, From} | PR]}.
+%% Leader: park a registration in the group-commit buffer, answered on commit —
+%% unless the degraded-prevention mode refuses it outright.
+enqueue_register(Name, Pid, Meta, From, State) ->
+    case reject_new_when_degraded(Name, State) of
+        true ->
+            gen_server:reply(From, no),
+            State;
+        false ->
+            enqueue_op({add, Name, Pid, Meta, {local, From}}, State)
+    end.
 
-%% Re-drive every stashed registration now that a leader may be known — called on the
-%% leadership-establishing events (assuming leadership, applying a leader's snapshot).
-%% Each entry is re-routed: it commits (we are leader), forwards (a follower with a
-%% reachable leader), or re-stashes (still no reachable leader).  An entry whose caller
-%% has already timed out (older than `register_timeout`) is dropped without a reply.
-redrive_registers(State = #state{pending_registers = []}) ->
-    State;
-redrive_registers(State = #state{pending_registers = PR, config = Config}) ->
-    TTL = dgen_config:register_timeout(Config),
-    Now = erlang:system_time(millisecond),
-    %% Clear first; route_register re-stashes any that still cannot proceed.  Oldest
-    %% first (the list is newest-first) for rough FIFO fairness among waiters.
-    lists:foldl(
-        fun({At, Name, Pid, Meta, From}, S) ->
-            case Now - At >= TTL of
-                true -> S;
-                false -> route_register(Name, Pid, Meta, From, S)
-            end
-        end,
-        State#state{pending_registers = []},
-        lists:reverse(PR)
-    ).
+%% ---------------------------------------------------------------------------
+%% Intents — requests this member cannot decide itself (dgen_registry_intents)
+%% ---------------------------------------------------------------------------
 
-%% Drop stashed registrations whose callers have (about) timed out — the periodic
-%% bound on `pending_registers` so a prolonged no-leader window (a partition) cannot
-%% grow it without limit.  No reply is sent (the caller has moved on).
-prune_pending_registers(State = #state{pending_registers = []}) ->
-    State;
-prune_pending_registers(State = #state{pending_registers = PR, config = Config}) ->
-    TTL = dgen_config:register_timeout(Config),
+%% Where an intent can go right now.
+intent_route(#state{leader = Self, member_id = Self}) ->
+    self;
+intent_route(#state{leader = undefined}) ->
+    none;
+intent_route(#state{leader = Leader}) ->
+    case member_reachable(Leader) of
+        true -> {remote, Leader};
+        false -> none
+    end.
+
+submit_intent(Kind, From, State = #state{intents = I}) ->
     Now = erlang:system_time(millisecond),
-    State#state{pending_registers = [E || {At, _, _, _, _} = E <- PR, Now - At < TTL]}.
+    apply_intents(dgen_registry_intents:submit(Kind, From, Now, intent_route(State), I), State).
+
+intent_reply(Ref, Reply, State = #state{intents = I}) ->
+    apply_intents(dgen_registry_intents:on_reply(Ref, Reply, applied_version(State), I), State).
+
+%% Our replica advanced: release the gap-deferred `yes` acks it now covers.
+intents_advanced(State = #state{intents = I}) ->
+    apply_intents(dgen_registry_intents:on_version(applied_version(State), I), State).
+
+%% A leader may have been established (a snapshot, assuming leadership, a node coming
+%% back): re-drive every unresolved intent against it.  `Scope` is `moved` for a new
+%% leadership view and `all` for a restored link (see dgen_registry_intents:redrive/5).
+redrive_intents(Scope, State = #state{intents = I, config = Config}) ->
+    Now = erlang:system_time(millisecond),
+    TTL = dgen_config:register_timeout(Config),
+    Route = intent_route(State),
+    apply_intents(dgen_registry_intents:redrive(Route, Scope, Now, TTL, I), State).
+
+%% Drop intents whose callers have timed out — the periodic bound that keeps a
+%% prolonged no-leader window (a partition) from growing the map without limit.
+prune_intents(State = #state{intents = I, config = Config}) ->
+    Now = erlang:system_time(millisecond),
+    TTL = dgen_config:register_timeout(Config),
+    State#state{intents = dgen_registry_intents:prune(Now, TTL, I)}.
+
+apply_intents({Intents, Effects}, State) ->
+    lists:foldl(fun intent_effect/2, State#state{intents = Intents}, Effects).
+
+intent_effect({reply, From, Value}, State) ->
+    gen_server:reply(From, Value),
+    State;
+intent_effect({forward, Leader, Ref, Kind}, State = #state{member_id = Self}) ->
+    cast_to_member(Leader, forward_msg(Ref, Self, Kind)),
+    State;
+intent_effect({retract, Leader, Name, Pid}, State) ->
+    forward_retract(Leader, Name, Pid),
+    State;
+intent_effect({enqueue, {register, Name, Pid, Meta}, From}, State) ->
+    enqueue_register(Name, Pid, Meta, From, State);
+intent_effect({enqueue, {unregister, Name, Pid}, answered}, State) ->
+    enqueue_op({retract, Name, Pid}, State);
+intent_effect({resync, Leader}, State) ->
+    request_resync(Leader, State);
+intent_effect({insert_row, Name, Pid, {Index, Data}}, State) ->
+    row_insert(State, Name, Pid, Index, Data).
+
+%% The wire request a forwarded intent travels as.
+forward_msg(Ref, Self, {register, Name, Pid, Meta}) ->
+    {register_req, Ref, Self, Name, Pid, Meta};
+forward_msg(Ref, Self, {unregister, Name, _ReleasedPid}) ->
+    {unregister_req, Ref, Self, Name};
+forward_msg(Ref, Self, {set_meta, Name, Index, Data}) ->
+    {set_meta_req, Ref, Self, Name, Index, Data}.
 
 %% Append a write op to the pending queue (FIFO), then try to start a commit.  If
 %% one is already in flight, the op just accumulates and rides the next batch
@@ -3059,170 +2977,6 @@ deliver_committed_reply({forward, MemberId, Ref}, Result, Version) ->
     cast_to_member(MemberId, {register_reply, Ref, Result, Version});
 deliver_committed_reply(Origin, Result, _Version) ->
     deliver_reply(Origin, Result).
-
-%% Follower: the leader these were forwarded to is no longer current.  Reject the
-%% register and set_metadata forwards so their callers retry against the new leader
-%% (registrations `no`, including the gap-deferred `yes` acks whose resync will never
-%% arrive from the deposed leader; set_metadata `{error, no_leader}`).  Unregister
-%% forwards are **kept** — their intent is idempotent and must not be lost, so
-%% redrive_unregs re-drives them to the new leader rather than failing the caller.
-reject_forwards(State = #state{pending_forwards = PF, deferred_yes = Deferred}) ->
-    Kept = maps:fold(
-        fun
-            (_Ref, {register, _Name, _Pid, _Meta, From}, Acc) ->
-                gen_server:reply(From, no),
-                Acc;
-            (_Ref, {set_meta, From}, Acc) ->
-                gen_server:reply(From, {error, no_leader}),
-                Acc;
-            (Ref, {unregister, _, _, _} = Unreg, Acc) ->
-                Acc#{Ref => Unreg}
-        end,
-        #{},
-        PF
-    ),
-    lists:foreach(fun({_Version, From}) -> gen_server:reply(From, no) end, Deferred),
-    State#state{pending_forwards = Kept, deferred_yes = []}.
-
-%% Resolve the leader's answer to a forwarded registration (see the
-%% {register_reply, _, _, _} handler doc).  `yes` at-or-behind our applied version:
-%% the FIFO-ordered broadcast already applied the binding, so just answer — the
-%% normal path.  `yes` ahead of it: our replica is gapped (the broadcast was refused
-%% pending a resync), so defer the ack until applied_version reaches the batch's
-%% version — answering now would create a second holder the freshest-wins gather
-%% cannot see (§5.5/§5.7).  The gap-refused broadcast already requested the resync;
-%% re-request here as a belt-and-braces (request_resync no-ops while one is
-%% outstanding).
-%%
-%% **The at-or-behind branch must not write the row.**  It used to `row_insert` the
-%% binding, on the reasoning that the insert is idempotent over a broadcast that has
-%% already applied it.  It is not: a group commit may bind *and clear* one name — a
-%% register and an unregister of it landing in the same batch — and the broadcast
-%% carries both ops in order, so the replica correctly ends up without the binding.
-%% Re-inserting it here resurrects exactly what the batch removed, and the version
-%% guard makes that fire precisely when the batch has been applied.  The member is
-%% then holding a binding no other member has, at the same applied_version as all of
-%% them, which is the one divergence gap detection cannot see (§4.5) and the one the
-%% freshest-wins gather may fan out (§5.7).
-%%
-%% Passing the guard means the replica has applied this batch (or a snapshot at or
-%% past its version), and that content is authoritative — including a later op in the
-%% same batch.  `flush_deferred/1` already answers on exactly that reasoning, and this
-%% branch is now consistent with it.  Found by `eta_run` on an unfaulted 3-member
-%% cluster; see the regression test in dgen_registry_sim_test.exs.
-handle_register_reply(Ref, Result, Version, State = #state{pending_forwards = PF}) ->
-    case maps:take(Ref, PF) of
-        {{register, LogicalName, Pid, {Index, Data}, From}, PF1} ->
-            State1 = State#state{pending_forwards = PF1},
-            Applied = applied_version(State1),
-            case Result of
-                yes when Version =:= legacy ->
-                    %% A pre-version leader (rolling upgrade): there is no version to
-                    %% guard on, and its per-name broadcasts are a wire format this
-                    %% member no longer applies, so this insert is the only thing that
-                    %% would bind the row.  Left exactly as it was.
-                    gen_server:reply(From, yes),
-                    row_insert(State1, LogicalName, Pid, Index, Data);
-                yes when Version =< Applied ->
-                    gen_server:reply(From, yes),
-                    State1;
-                yes ->
-                    State2 =
-                        case State1#state.leader of
-                            undefined -> State1;
-                            Leader -> request_resync(Leader, State1)
-                        end,
-                    State2#state{
-                        deferred_yes = [{Version, From} | State2#state.deferred_yes]
-                    };
-                no ->
-                    gen_server:reply(From, no),
-                    State1
-            end;
-        _ ->
-            %% Unknown Ref — already answered (e.g. rejected on a leadership change).
-            State
-    end.
-
-%% Release gap-deferred forwarded-`yes` acks whose batch version the replica has now
-%% genuinely applied (the resync snapshot, or a contiguous broadcast run, advanced
-%% applied_version past them).  The binding itself is guaranteed present: reaching
-%% the version contiguously means the batch's own broadcast was applied, and a
-%% snapshot at-or-past it carries the committed binding.
-flush_deferred(State = #state{deferred_yes = []}) ->
-    State;
-flush_deferred(State = #state{deferred_yes = Deferred}) ->
-    Applied = applied_version(State),
-    {Due, Rest} = lists:partition(fun({Version, _From}) -> Version =< Applied end, Deferred),
-    lists:foreach(fun({_Version, From}) -> gen_server:reply(From, yes) end, Due),
-    State#state{deferred_yes = Rest}.
-
-%% Stash an unregister accepted while no leader was reachable (nothing to retract if
-%% the name was locally unbound — matching the old nets-to-nothing semantics); it is
-%% re-driven by redrive_unregs/1 once a leader is known.
-stash_pending_unreg(_Name, undefined, State) ->
-    State;
-stash_pending_unreg(Name, Pid, State = #state{pending_unregs = Pending}) ->
-    State#state{pending_unregs = [{Name, Pid} | Pending]}.
-
-%% Re-drive every stashed unregister — the follower-side counterpart of the leader's
-%% salvage_failed_plan: forwarded removals whose reply never came (dropped cast,
-%% deposed leader) and removals accepted while no leader was reachable are handed to
-%% the current leader as **pid-guarded retracts** (or enqueued directly if this
-%% member is now the leader itself), and any still-waiting caller is answered `ok`.
-%% Pid-guarding makes the re-drive idempotent and reissue-safe: a name since
-%% re-registered to a different pid is never clobbered, and a removal the old leader
-%% did commit after all nets to nothing.  Called on every snapshot apply and on
-%% assuming leadership — the events that establish who the leader is.
-redrive_unregs(State = #state{pending_forwards = PF, pending_unregs = Pending}) ->
-    {Unregs, RestPF} = take_unreg_forwards(PF),
-    case Unregs =:= [] andalso Pending =:= [] of
-        true ->
-            State;
-        false ->
-            redrive_unregs(State, Unregs, RestPF)
-    end.
-
-%% No leader to hand these to yet — leave everything stashed (RestPF/Pending
-%% untouched) for the next snapshot/leadership event.
-redrive_unregs(State = #state{leader = undefined}, _Unregs, _RestPF) ->
-    State;
-redrive_unregs(State = #state{leader = Leader, member_id = Self}, Unregs, RestPF) ->
-    Entries =
-        Unregs ++ [{Name, Pid, undefined} || {Name, Pid} <- State#state.pending_unregs],
-    State1 = State#state{pending_forwards = RestPF, pending_unregs = []},
-    lists:foldl(
-        fun({Name, Pid, From}, S) ->
-            From =/= undefined andalso gen_server:reply(From, ok),
-            case is_pid(Pid) of
-                false ->
-                    %% Nothing was bound locally at call time — nothing to retract.
-                    S;
-                true when Leader =:= Self ->
-                    enqueue_op({retract, Name, Pid}, S);
-                true ->
-                    forward_retract(Leader, Name, Pid),
-                    S
-            end
-        end,
-        State1,
-        Entries
-    ).
-
-%% Split `pending_forwards` into its unregister entries (as {Name, Pid, From} for the
-%% re-drive) and the remaining register/set_meta forwards (kept in flight — a
-%% snapshot refresh that did not change leadership must not disturb them).
-take_unreg_forwards(PF) ->
-    maps:fold(
-        fun
-            (_Ref, {unregister, Name, Pid, From}, {Acc, Rest}) ->
-                {[{Name, Pid, From} | Acc], Rest};
-            (Ref, Other, {Acc, Rest}) ->
-                {Acc, Rest#{Ref => Other}}
-        end,
-        {[], #{}},
-        PF
-    ).
 
 %% Dequeue exactly N ops from the front of the queue (oldest first), returning
 %% {OpsInOrder, RestQueue}.  The caller guarantees N =< the queue's length

@@ -1408,4 +1408,111 @@ defmodule DGen.RegistryTest do
       assert :undefined = :dgen_registry.elector_pid(:no_such_registry_at_all)
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # Intents across a leadership change (dgen_registry_intents)
+  #
+  # A registration forwarded to a leader that is deposed before answering is
+  # re-driven to the new leader, never answered `no`: `no` is reserved for an
+  # adjudicated refusal (§3). The leaders here are test processes registered
+  # under fake member names on this node, so the test sees exactly what the
+  # member forwards; snapshots naming them demote the real member to a follower.
+  # ---------------------------------------------------------------------------
+
+  describe "a forwarded registration across a leadership change" do
+    defp fake_leader do
+      name = :"fake_leader_#{:erlang.unique_integer([:positive])}"
+      Process.register(self(), name)
+      {node(), name}
+    end
+
+    defp follow(member, leader, epoch, version) do
+      GenServer.cast(member, {:apply_names_snapshot, %{}, leader, [], %{}, epoch, version})
+      :sys.get_state(member)
+    end
+
+    defp await_forward(timeout \\ 1_000) do
+      receive do
+        {:"$gen_cast", {:register_req, ref, _from, name, pid, _meta}} -> {ref, name, pid}
+      after
+        timeout -> flunk("no register_req was forwarded")
+      end
+    end
+
+    test "is re-sent to the new leader, and its caller gets that leader's verdict", %{
+      reg: reg
+    } do
+      member = :dgen_registry.member_name(reg)
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+
+      epoch = :dgen_registry.get_epoch(reg)
+      v = applied_version(member)
+
+      # Demote the member to a follower of leader 1 (this test process).
+      l1 = fake_leader()
+      follow(member, l1, epoch + 1, v)
+
+      caller = Task.async(fn -> :dgen_registry.register_name({reg, :moved}, pid) end)
+      {ref1, :moved, ^pid} = await_forward()
+
+      # Leader 1 is deposed before it answers. The member re-drives the forward to
+      # leader 2 (same test process, new name), under a fresh reference.
+      Process.unregister(elem(l1, 1))
+      l2 = fake_leader()
+      follow(member, l2, epoch + 2, v)
+      {ref2, :moved, ^pid} = await_forward()
+      assert ref2 != ref1
+
+      # The caller is still waiting: nothing answered it `no`.
+      assert Task.yield(caller, 100) == nil
+
+      # Leader 1's late `no` finds no one to answer; leader 2's `yes` decides it.
+      GenServer.cast(member, {:register_reply, ref1, :no, v})
+      GenServer.cast(member, {:register_reply, ref2, :yes, v})
+      assert :yes == Task.await(caller)
+    end
+
+    test "is not re-sent on a snapshot from the leader it already reached", %{reg: reg} do
+      member = :dgen_registry.member_name(reg)
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+
+      epoch = :dgen_registry.get_epoch(reg)
+      v = applied_version(member)
+      l1 = fake_leader()
+      follow(member, l1, epoch + 1, v)
+
+      caller = Task.async(fn -> :dgen_registry.register_name({reg, :reached}, pid) end)
+      {ref1, :reached, ^pid} = await_forward()
+
+      # A resync snapshot from the same leader: the forward was delivered, so a second
+      # copy would only be a second commit — racing, e.g., a concurrent unregister.
+      follow(member, l1, epoch + 1, v)
+      refute_receive {:"$gen_cast", {:register_req, _, _, _, _, _}}, 100
+
+      GenServer.cast(member, {:register_reply, ref1, :yes, v})
+      assert :yes == Task.await(caller)
+    end
+
+    test "a member that does not lead stays silent rather than answer `no`", %{reg: reg} do
+      member = :dgen_registry.member_name(reg)
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+
+      # Demote the member to a follower of some other (idle) leader.
+      other = :"other_leader_#{:erlang.unique_integer([:positive])}"
+      Process.register(pid, other)
+      follow(member, {node(), other}, :dgen_registry.get_epoch(reg) + 1, applied_version(member))
+
+      # A follower forwards a registration to it, believing it leads.
+      follower = fake_leader()
+      ref = make_ref()
+      GenServer.cast(member, {:register_req, ref, follower, :name, pid, {%{}, :undefined}})
+      :sys.get_state(member)
+
+      refute_receive {:"$gen_cast", {:register_reply, ^ref, _}}, 200
+      refute_receive {:"$gen_cast", {:register_reply, ^ref, _, _}}
+    end
+  end
 end

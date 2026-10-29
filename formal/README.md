@@ -35,8 +35,8 @@ One module, `DgenRegistryReplication.tla`, at the abstraction level of the
 - **Resync** — a gapped follower requests a snapshot from its stream's
   sender.
 - **Forwarded registrations, version-guarded acks** — a follower answers its
-  caller only once its replica has applied the batch (`deferred_yes` when
-  gapped).
+  caller only once its replica has applied the batch (an intent in
+  `awaiting_version` when gapped).
 - **Direct registrations, replicate-before-ack** — the leader waits for a
   follower to confirm before answering `yes` (with a configurable
   degrade-open timeout).
@@ -233,7 +233,7 @@ dead in every reachable state rather than someone's way of hoping it was.
 | `RegisterDirect` + `RecvSync`/`RecvAck` | leader-local `route_register` → `pending_acks` / `{replicate_sync}` / `{replicate_ack}` |
 | `DegradeTimeout` | `handle_info({replicate_timeout, _})` with `strict_replication = false` |
 | `RecvBcastApply/Drop/Gap` | `dgen_registry_replica:offer_batch/5` → `applied` / `stale_epoch`+`duplicate` / `gap` (one `{names_batch, …}` per commit version); the member's `{names_batch}` handler reacts to the verdict |
-| `RecvReply` | `handle_register_reply/4` incl. `deferred_yes`; flushes are the `{names_batch}` handler's `applied` branch → `flush_deferred/1` |
+| `RecvReply` | `dgen_registry_intents:on_reply/4` incl. the `awaiting_version` phase; flushes are `dgen_registry_intents:on_version/2`, called from the `{names_batch}` handler's `applied` branch and on an accepted snapshot. On a leadership change the code re-drives a deferred ack as a fresh forward (`redrive/5`) where the spec drops it — a fresh `RegisterForward` in spec terms |
 | `RecvSnap` (incl. the `SafeAssumeSnap` version-monotonic guard) | `dgen_registry_replica:offer_snapshot/4` (the `Epoch >= CurrentEpoch andalso V >= Applied` guard), called from `handle_cast({apply_names_snapshot, ...})` |
 | `ServeResync` / `resyncReq` | `{resync_req}` handler / `request_resync/2` |
 | `Crash` | member/node death; the ETS replica dies with the process |
