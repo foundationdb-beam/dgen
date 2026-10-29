@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.4.3 (TBD)
+
+### Bug fixes
+
+- When a follower forwards a registration and the leader changes at the same
+  time, the registration is now re-driven to the new leader rather than answered
+  with `no`.
+- A buffered unregister is no longer lost when the leader changes mid-commit.
+- A partition heal no longer stalls the leader on conflict-detection liveness
+  probes; they run off its loop.
+- `whereis_name/1` and `get_metadata/1` no longer briefly read a bound name as
+  `undefined` while a member re-baselines its replica (a resync or handoff).
+
+### Enhancements
+
+- `dgen_registery_member`'s internal implementation is refactored into
+  `dgen_registry_replica`, `dgen_registry_intents`, `dgen_registry_pipeline`,
+  and `dgen_registry_conflicts`.
+
 ## v0.4.2 (2026-10-04)
 
 ### Enahancements

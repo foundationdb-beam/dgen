@@ -33,6 +33,8 @@ CONSTANTS
                         \* durable version key; FALSE = the pre-fix stale gather
     SafeAssumeSnap,     \* TRUE = snapshot apply is version-monotonic; FALSE = the
                         \* pre-fix epoch-only guard (a stale snapshot can rewind)
+    DegradedAssume,     \* TRUE = the gather may also give up waiting for the durable
+                        \* version key (the code's deadline) and assume degraded
     NoPid, NoMember     \* model values
 
 ASSUME NoPid \notin Pids
@@ -56,17 +58,22 @@ VARIABLES
     epoch,       \* [Members -> Nat]: last epoch learned (set by snapshots/assume)
     leaderView,  \* [Members -> Members \cup {NoMember}]: believed leader;
                  \* leaderView[m] = m  <=>  m believes it is the leader
-    deferred,    \* [Members -> SUBSET (Names \X Pids \X Nat)]: deferred_yes
+    deferred,    \* [Members -> SUBSET (Names \X Pids \X Nat)]: intents awaiting_version
     pendingAcks, \* [Members -> SUBSET (Names \X Pids \X Nat)]: leader-side
                  \* direct registrations awaiting a replicate_ack
     resyncReq,   \* [Members -> Members \cup {NoMember}]: outstanding resync
                  \* target (the gapped stream's sender), NoMember = none
+    \* ---- ghost: what each member's last assume knew ----
+    degraded,    \* [Members -> BOOLEAN]: the code's `degraded` flag, defined as
+                 \* "gathered max version < durable version key" (§5.6)
+    complete,    \* [Members -> BOOLEAN]: the reconstruction it adopted was the
+                 \* true committed map, histMap[dbVersion]
     \* ---- the network ----
     chan         \* [Members -> [Members -> Seq(Msg)]]: per-ordered-pair FIFO
 
 vars == <<dbLeader, dbEpoch, dbVersion, histMap, acked, crashes,
           alive, rep, appliedVer, epoch, leaderView,
-          deferred, pendingAcks, resyncReq, chan>>
+          deferred, pendingAcks, resyncReq, chan, degraded, complete>>
 
 (***************************************************************************)
 (* Basic definitions                                                       *)
@@ -115,6 +122,8 @@ Init ==
     /\ pendingAcks = [m \in Members |-> {}]
     /\ resyncReq = [m \in Members |-> NoMember]
     /\ chan = [s \in Members |-> [r \in Members |-> <<>>]]
+    /\ degraded = [m \in Members |-> FALSE]
+    /\ complete = [m \in Members |-> TRUE]
 
 (***************************************************************************)
 (* Elections and handoff                                                   *)
@@ -137,9 +146,11 @@ Elect(m) ==
 \* Modeled atomically; the gather reaches every live member (see module
 \* header).  Freshest-wins: adopt the max-applied_version replica (version
 \* tie => identical content, which PrefixConsistency asserts).  Deferred
-\* acks are rejected and pending direct acks resolved-as-rejected, matching
-\* do_leader_changed/reject_forwards; then snapshots fan out to every other
-\* live member from this process (FIFO with later broadcasts).
+\* acks are dropped and pending direct acks resolved-as-rejected; then snapshots
+\* fan out to every other live member from this process (FIFO with later
+\* broadcasts).  (The code re-drives a dropped deferred ack as a fresh forward —
+\* dgen_registry_intents:redrive/5 — which is just another RegisterForward here,
+\* so dropping it is the sound abstraction for the safety properties.)
 \* THE FIX, first half (SafeAssumeGather): the assuming leader must not reconstruct
 \* from a gather that is behind the durable version key.  `maxV` is the freshest
 \* applied_version any live member reports; `dbVersion` is the committed frontier
@@ -152,15 +163,21 @@ Elect(m) ==
 \* race (see formal/README.md).  In the real code this is the new leader comparing
 \* its gathered MaxVersion against the durable version key and retrying/waiting the
 \* gather until caught up (bounded, then assume-degraded — the availability
-\* tradeoff, out of this safety model's scope, analogous to DegradeOpen).
+\* tradeoff, analogous to DegradeOpen).  With DegradedAssume that deadline is
+\* modeled too: the assume may proceed behind the version key at any point.  It
+\* then records the code's `degraded` flag (maxV < dbVersion) and, as ghost
+\* state, whether the adopted map really was the committed one — which
+\* DegradedFlagSound checks the flag against.
 AssumeGather(m) ==
     /\ alive[m]
     /\ dbLeader = m
     /\ epoch[m] < dbEpoch
     /\ LET maxV == MaxOf({appliedVer[x] : x \in Live})
-       IN /\ (SafeAssumeGather => maxV >= dbVersion)
+       IN /\ (SafeAssumeGather => (maxV >= dbVersion \/ DegradedAssume))
+          /\ degraded' = [degraded EXCEPT ![m] = (maxV < dbVersion)]
           /\ \E src \in Live :
             /\ appliedVer[src] = maxV
+            /\ complete' = [complete EXCEPT ![m] = (rep[src] = histMap[dbVersion])]
             /\ rep' = [rep EXCEPT ![m] = rep[src]]
             /\ appliedVer' = [appliedVer EXCEPT ![m] = maxV]
             /\ LET snap == [type |-> "snap", rep |-> rep[src],
@@ -246,18 +263,18 @@ RegisterDirect(l, n, p) ==
                    leaderView, deferred, resyncReq>>
 
 (***************************************************************************)
-(* Broadcast delivery — mirrors apply_bcast/6 case for case                *)
+(* Broadcast delivery — mirrors dgen_registry_replica:offer_batch/5       *)
 (***************************************************************************)
 
 \* Contiguous (prev = applied): apply the row, advance applied_version
-\* (bump_applied), flush any deferred acks the advance releases
+\* (offer_batch's `applied`), flush any deferred acks the advance releases
 \* (flush_deferred), cancel an outstanding resync.  Matches the shipped
-\* apply_bcast/6 case for case: since a batch ships as ONE message per commit
+\* offer_batch/5 case for case: since a batch ships as ONE message per commit
 \* version, `PrevV =:= Applied` is the only apply clause — a re-delivered
 \* duplicate falls to the `V =< Applied` drop below, exactly as in the code
 \* (the old `m.ver = appliedVer[f]` apply disjunct modeled the pre-fix
-\* multi-message batches and was dead in every config; see formal/README.md,
-\* "A closed abstraction gap").
+\* multi-message batches and was dead in every config; see the sim README,
+\* finding 1).
 RecvBcastApply(s, f) ==
     /\ alive[f]
     /\ HeadIs(s, f, "bcast")
@@ -340,7 +357,7 @@ HeartbeatBcast(l) ==
                    alive, rep, appliedVer, epoch, leaderView, deferred,
                    pendingAcks, resyncReq>>
 
-\* Receipt mirrors apply_bcast/6 on an empty batch with PrevV = Version:
+\* Receipt mirrors offer_batch/5 on an empty batch with PrevV = Version:
 \* caught-up (ver = applied) takes the apply clause, which applies no rows and
 \* re-bumps to the same version — observably just cancel_resync (flush_deferred
 \* releases nothing: every deferred ack at or below applied was flushed when
@@ -369,7 +386,7 @@ RecvHeartbeat(s, f) ==
 \* on a leadership change (an unknown-Ref reply is ignored).  Otherwise:
 \* applied >= ver  -> ack now (the broadcast/snapshot already delivered the
 \*                    row; the follower is a version-visible second holder);
-\* gapped + guard  -> defer (deferred_yes), released by flush_deferred;
+\* gapped + guard  -> defer (awaiting_version), released by on_version;
 \* gapped, no guard-> the pre-guard bug: optimistic row write + immediate
 \*                    ack.  The row exists but at a version the freshest-wins
 \*                    gather ignores — the silent-loss window.
@@ -466,8 +483,8 @@ DegradeTimeout(l) ==
 \* frontier >= any follower's applied_version), and a legitimate resync only ever
 \* moves a gapped follower FORWARD, so the guard rejects only genuinely stale
 \* snapshots.  In the real code this is the `Version >= CurrentVersion` conjunct
-\* beside `Epoch >= CurrentEpoch` in handle_cast({apply_names_snapshot, ...})
-\* (dgen_registry_member.erl) — shipped.
+\* beside `Epoch >= CurrentEpoch` in dgen_registry_replica:offer_snapshot/4
+\* (dgen_registry_replica.erl) — shipped.
 RecvSnap(s, f) ==
     /\ alive[f]
     /\ HeadIs(s, f, "snap")
@@ -550,9 +567,10 @@ DropMsg(s, r) ==
 (* Next / Spec                                                             *)
 (***************************************************************************)
 
-Next ==
+\* Every action but AssumeGather leaves the assume-time ghost state alone.
+Step ==
     \/ \E m \in Members :
-         \/ Elect(m) \/ AssumeGather(m) \/ Crash(m) \/ DegradeTimeout(m)
+         \/ Elect(m) \/ Crash(m) \/ DegradeTimeout(m)
          \/ HeartbeatBcast(m)
     \/ \E l \in Members, n \in Names, p \in Pids :
          \/ RegisterDirect(l, n, p)
@@ -562,6 +580,10 @@ Next ==
          \/ RecvHeartbeat(s, r)
          \/ RecvReply(s, r) \/ RecvSync(s, r) \/ RecvAck(s, r)
          \/ RecvSnap(s, r) \/ ServeResync(s, r) \/ DropMsg(s, r)
+
+Next ==
+    \/ \E m \in Members : AssumeGather(m)
+    \/ Step /\ UNCHANGED <<degraded, complete>>
 
 Spec == Init /\ [][Next]_vars
 
@@ -584,6 +606,8 @@ TypeOK ==
     /\ resyncReq \in [Members -> Members \cup {NoMember}]
     /\ acked \subseteq Regs
     /\ crashes \in 0..MaxCrashes
+    /\ degraded \in [Members -> BOOLEAN]
+    /\ complete \in [Members -> BOOLEAN]
     /\ \A s \in Members : \A r \in Members :
          \A i \in 1..Len(chan[s][r]) : chan[s][r][i] \in Msg
 
@@ -611,6 +635,21 @@ Holders(a) ==
 
 DurableAcked ==
     \A a \in acked : Cardinality(Holders(a)) >= 1 + MaxCrashes - crashes
+
+\* The `degraded` flag is sound (§5.6): an assume that did NOT flag itself
+\* degraded — its gathered max version reached the durable version key — adopted
+\* exactly the committed map, so no committed binding is missing from it.  This
+\* is what lets `reject_when_degraded` key on versions instead of on which members
+\* answered the gather: by PrefixConsistency the freshest replica at the key IS
+\* the committed map.  (The converse is not claimed: a degraded assume may still
+\* happen to hold everything.)
+DegradedFlagSound ==
+    \A m \in Members : ~degraded[m] => complete[m]
+
+\* NOT an invariant — the reachability canary for DegradedFlagSound, which a model
+\* that never assumes degraded would satisfy vacuously.  Asserted as an
+\* INVARIANT by the DegradedReachable config, which MUST FAIL.
+NoDegradedAssume == \A m \in Members : ~degraded[m]
 
 \* Fencing sanity: two members may both believe they lead only under
 \* different epochs (§5.1's monotonic fencing token).

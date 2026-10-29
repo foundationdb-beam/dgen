@@ -20,13 +20,12 @@ in theory, be substituted, but for now FDB is the only implemented backend.
 - **`dgen_server`** — the `gen_server` programming model (same callbacks, same
   return shapes), backed by durable state and a durable message queue instead
   of process memory. Any number of processes, on any number of nodes, can
-  consume from the same server concurrently. See the
-  [dgen_server design doc](docs/design/dgen_server_design.md).
+  consume from the same server concurrently, and via strict serializability
+  of FoundationDB, `gen_server` semantics are preserved.
 - **`dgen_registry`** — an OTP-compatible process registry: give a running
   process a logical name and find or message it by name from anywhere in the
   cluster, via the standard `{via, dgen_registry, {RegistryName, LogicalName}}`
-  contract. See the
-  [dgen_registry design doc](docs/design/dgen_registry_design.md).
+  contract.
 
 Both are built on the same idea: push state and coordination into a
 strongly-consistent backend, so the OTP programming model you already know
@@ -74,17 +73,15 @@ end
   configuration.
 - [formal/README.md](formal/README.md) — the TLA+ model of `dgen_registry`'s
   replication protocol.
-- [`eta`](https://hexdocs.pm/eta) — `dgen_registry` is partally
-  tested with Deterministic Simulation Testing, to assist in verification
-  of the actual implementation of the TLA+ model, including its invariants.
-  The framework for driving the simulation was extracted to a separate
-  library for general use.
+- [test/support/sim/README.md](test/support/sim/README.md) — deterministic
+  simulation testing of `dgen_registry` against the same invariants, driven by
+  [`eta`](https://hexdocs.pm/eta).
 - API reference and getting-started guides: <https://hexdocs.pm/dgen>.
 - [CHANGELOG.md](CHANGELOG.md) — release notes.
 
 ## AI full disclosure
 
- - This software is developed with strong assistance from LLMs and with humans 
+ - This software is developed with strong assistance from LLMs and with humans
    leading the ideas, testing, and debugging. We say this openly because it shaped
    how the project was built. If you are not happy with AI-developed code, this
    software is not for you. This disclosure was adopted from [antirez/ds4](https://github.com/antirez/ds4).

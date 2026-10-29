@@ -692,141 +692,9 @@ defmodule DGen.RegistryTest do
   end
 
   # ---------------------------------------------------------------------------
-  # §5.6 conflict-detection predicate (pure, unit-tested in isolation)
-  #
-  # The full end-to-end scenario that produces a genuine conflict needs a
-  # multi-node, leadership-orchestrated setup (a member holds a divergent live
-  # binding that a leadership-change gather exposes); that lives in the cluster
-  # suite ("conflict resolution by termination" in dgen_registry_cluster_test.exs).
-  # Here we pin the safety-critical predicate itself: which gathered states count
-  # as a conflict, and — crucially — which do not (so we never false-kill a live
-  # process).
-  # ---------------------------------------------------------------------------
-
-  describe "detect_conflicts/3" do
-    # The detector takes RECORDS maps (`%{name => {pid, index, data}}`) and
-    # compares entries against the authority in place — the shape change that made
-    # the all-agree handoff allocation-free. `rec/1` builds the record wrapper;
-    # the semantics pinned below are unchanged from the pid-map era.
-    defp rec(pid), do: {pid, %{}, nil}
-
-    test "two different live pids for one name is a conflict" do
-      p1 = spawn_live()
-      p2 = spawn_live()
-
-      assert [{:n, ^p1, [^p2]}] =
-               :dgen_registry_member.detect_conflicts(
-                 %{n: rec(p1)},
-                 [%{n: rec(p1)}, %{n: rec(p2)}],
-                 %{}
-               )
-    end
-
-    test "a recently-released name/pid pair is suppressed (lag, not conflict)" do
-      p1 = spawn_live()
-      p2 = spawn_live()
-      # Trail entries are keyed {name, pid} (§5.6).
-      released = %{{:n, p2} => System.system_time(:millisecond)}
-
-      assert [] =
-               :dgen_registry_member.detect_conflicts(
-                 %{n: rec(p1)},
-                 [%{n: rec(p1)}, %{n: rec(p2)}],
-                 released
-               )
-    end
-
-    test "a release under one name does not mask a conflict on another name" do
-      p1 = spawn_live()
-      p2 = spawn_live()
-      # p2 was explicitly released from :other — that must not suppress the
-      # genuine divergence on :n, which p2 also (still) claims.
-      released = %{{:other, p2} => System.system_time(:millisecond)}
-
-      assert [{:n, ^p1, [^p2]}] =
-               :dgen_registry_member.detect_conflicts(
-                 %{n: rec(p1)},
-                 [%{n: rec(p1)}, %{n: rec(p2)}],
-                 released
-               )
-    end
-
-    test "a legacy bare-pid trail entry (rolling upgrade) still suppresses" do
-      p1 = spawn_live()
-      p2 = spawn_live()
-      # A pre-upgrade member's gathered trail keys by pid alone; the detector
-      # honours that coarser shape until the mixed entries age out.
-      released = %{p2 => System.system_time(:millisecond)}
-
-      assert [] =
-               :dgen_registry_member.detect_conflicts(
-                 %{n: rec(p1)},
-                 [%{n: rec(p1)}, %{n: rec(p2)}],
-                 released
-               )
-    end
-
-    test "a dead divergent pid is not a conflict" do
-      p1 = spawn_live()
-      p2 = spawn(fn -> :ok end)
-      Process.exit(p2, :kill)
-      eventually(fn -> not Process.alive?(p2) end)
-
-      assert [] =
-               :dgen_registry_member.detect_conflicts(
-                 %{n: rec(p1)},
-                 [%{n: rec(p1)}, %{n: rec(p2)}],
-                 %{}
-               )
-    end
-
-    test "a dead authority is not a conflict (nothing to defend)" do
-      p1 = spawn(fn -> :ok end)
-      Process.exit(p1, :kill)
-      eventually(fn -> not Process.alive?(p1) end)
-      p2 = spawn_live()
-
-      assert [] =
-               :dgen_registry_member.detect_conflicts(
-                 %{n: rec(p1)},
-                 [%{n: rec(p1)}, %{n: rec(p2)}],
-                 %{}
-               )
-    end
-
-    test "agreement across all maps is not a conflict" do
-      p1 = spawn_live()
-
-      assert [] =
-               :dgen_registry_member.detect_conflicts(
-                 %{n: rec(p1)},
-                 [%{n: rec(p1)}, %{n: rec(p1)}],
-                 %{}
-               )
-    end
-
-    test "agreement with different metadata is still agreement (pids decide)" do
-      p1 = spawn_live()
-
-      assert [] =
-               :dgen_registry_member.detect_conflicts(
-                 %{n: {p1, %{v: 1}, nil}},
-                 [%{n: {p1, %{v: 2}, :other}}],
-                 %{}
-               )
-    end
-
-    test "a name with no authority (absent from the freshest map) is not a conflict" do
-      p1 = spawn_live()
-
-      assert [] = :dgen_registry_member.detect_conflicts(%{}, [%{n: rec(p1)}], %{})
-    end
-  end
-
-  # ---------------------------------------------------------------------------
   # Snapshot codec (pure, unit-tested in isolation)
   #
-  # encode_table/1 folds the ETS table straight into a pair list inside the blob
+  # encode/1 folds the replica's ETS table straight into a pair list inside the blob
   # (no records-map materialization); decode_records/1 must normalize every wire
   # shape — this build's list-in-binary and map-in-binary, plus both pre-binary
   # legacy forms — to the one map callers use. A shape the decoder silently
@@ -834,22 +702,25 @@ defmodule DGen.RegistryTest do
   # the tolerance is pinned here rather than trusted.
   # ---------------------------------------------------------------------------
 
-  describe "snapshot codec (encode_table/1, decode_records/1)" do
-    test "a table round-trips through encode_table to the same records map" do
-      tab = :ets.new(:codec_bench, [:set, :public])
+  describe "snapshot codec (dgen_registry_replica encode/1, decode_records/1)" do
+    test "a replica round-trips through encode to the same records map" do
       p1 = spawn_live()
       p2 = spawn_live()
-      :ets.insert(tab, [{:a, p1, %{v: 1}, nil}, {:b, p2, %{}, "data"}])
+
+      replica =
+        :dgen_registry_replica.new(:codec_bench)
+        |> :dgen_registry_replica.insert(:a, p1, %{v: 1}, nil)
+        |> :dgen_registry_replica.insert(:b, p2, %{}, "data")
 
       assert %{a: {^p1, %{v: 1}, nil}, b: {^p2, %{}, "data"}} =
-               :dgen_registry_member.decode_records(:dgen_registry_member.encode_table(tab))
+               :dgen_registry_replica.decode_records(:dgen_registry_replica.encode(replica))
     end
 
-    test "an empty table encodes to an empty map" do
-      tab = :ets.new(:codec_empty, [:set, :public])
+    test "an empty replica encodes to an empty map" do
+      replica = :dgen_registry_replica.new(:codec_empty)
 
       assert %{} ==
-               :dgen_registry_member.decode_records(:dgen_registry_member.encode_table(tab))
+               :dgen_registry_replica.decode_records(:dgen_registry_replica.encode(replica))
     end
 
     test "a map-in-binary blob (the fan-out encoder) decodes to the same map" do
@@ -857,7 +728,9 @@ defmodule DGen.RegistryTest do
       records = %{a: {p1, %{}, nil}}
 
       assert ^records =
-               :dgen_registry_member.decode_records(:dgen_registry_member.encode_records(records))
+               :dgen_registry_replica.decode_records(
+                 :dgen_registry_replica.encode_records(records)
+               )
     end
 
     test "legacy wire shapes still normalize (rolling upgrade)" do
@@ -865,15 +738,15 @@ defmodule DGen.RegistryTest do
 
       # Pre-binary-era apply_names_snapshot: an on-heap [{name, record}] list.
       assert %{a: {^p1, %{}, nil}} =
-               :dgen_registry_member.decode_records([{:a, {p1, %{}, nil}}])
+               :dgen_registry_replica.decode_records([{:a, {p1, %{}, nil}}])
 
       # Pre-binary-era get_names_snapshot: a bare records map.
       assert %{a: {^p1, %{}, nil}} =
-               :dgen_registry_member.decode_records(%{a: {p1, %{}, nil}})
+               :dgen_registry_replica.decode_records(%{a: {p1, %{}, nil}})
 
       # Pre-list-era binary: a map inside the blob (what an old node still sends).
       assert %{a: {^p1, %{}, nil}} =
-               :dgen_registry_member.decode_records(
+               :dgen_registry_replica.decode_records(
                  :erlang.term_to_binary(%{a: {p1, %{}, nil}}, [:compressed])
                )
     end
@@ -1311,7 +1184,7 @@ defmodule DGen.RegistryTest do
   # old assume/resync snapshot delivered late, after the member applied a newer
   # broadcast) would overwrite the replica *backward* and silently drop an already
   # -acked binding. The fix requires the snapshot's version to be >= the member's
-  # applied version. See formal/README.md "Discovered finding and the fix".
+  # applied version. See formal/README.md (the HandoffRace configs) and design §5.7.
   # ---------------------------------------------------------------------------
 
   describe "apply_names_snapshot version-monotonicity (handoff-gather race)" do
@@ -1401,6 +1274,304 @@ defmodule DGen.RegistryTest do
 
     test "elector_pid/1 returns undefined for a registry that was never started" do
       assert :undefined = :dgen_registry.elector_pid(:no_such_registry_at_all)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Intents across a leadership change (dgen_registry_intents)
+  #
+  # A registration forwarded to a leader that is deposed before answering is
+  # re-driven to the new leader, never answered `no`: `no` is reserved for an
+  # adjudicated refusal (§3). The leaders here are test processes registered
+  # under fake member names on this node, so the test sees exactly what the
+  # member forwards; snapshots naming them demote the real member to a follower.
+  # ---------------------------------------------------------------------------
+
+  describe "a forwarded registration across a leadership change" do
+    defp fake_leader do
+      name = :"fake_leader_#{:erlang.unique_integer([:positive])}"
+      Process.register(self(), name)
+      {node(), name}
+    end
+
+    defp follow(member, leader, epoch, version) do
+      GenServer.cast(member, {:apply_names_snapshot, %{}, leader, [], %{}, epoch, version})
+      :sys.get_state(member)
+    end
+
+    defp await_forward(timeout \\ 1_000) do
+      receive do
+        {:"$gen_cast", {:register_req, ref, _from, name, pid, _meta}} -> {ref, name, pid}
+      after
+        timeout -> flunk("no register_req was forwarded")
+      end
+    end
+
+    test "is re-sent to the new leader, and its caller gets that leader's verdict", %{
+      reg: reg
+    } do
+      member = :dgen_registry.member_name(reg)
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+
+      epoch = :dgen_registry.get_epoch(reg)
+      v = applied_version(member)
+
+      # Demote the member to a follower of leader 1 (this test process).
+      l1 = fake_leader()
+      follow(member, l1, epoch + 1, v)
+
+      caller = Task.async(fn -> :dgen_registry.register_name({reg, :moved}, pid) end)
+      {ref1, :moved, ^pid} = await_forward()
+
+      # Leader 1 is deposed before it answers. The member re-drives the forward to
+      # leader 2 (same test process, new name), under a fresh reference.
+      Process.unregister(elem(l1, 1))
+      l2 = fake_leader()
+      follow(member, l2, epoch + 2, v)
+      {ref2, :moved, ^pid} = await_forward()
+      assert ref2 != ref1
+
+      # The caller is still waiting: nothing answered it `no`.
+      assert Task.yield(caller, 100) == nil
+
+      # Leader 1's late `no` finds no one to answer; leader 2's `yes` decides it.
+      GenServer.cast(member, {:register_reply, ref1, :no, v})
+      GenServer.cast(member, {:register_reply, ref2, :yes, v})
+      assert :yes == Task.await(caller)
+    end
+
+    test "is not re-sent on a snapshot from the leader it already reached", %{reg: reg} do
+      member = :dgen_registry.member_name(reg)
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+
+      epoch = :dgen_registry.get_epoch(reg)
+      v = applied_version(member)
+      l1 = fake_leader()
+      follow(member, l1, epoch + 1, v)
+
+      caller = Task.async(fn -> :dgen_registry.register_name({reg, :reached}, pid) end)
+      {ref1, :reached, ^pid} = await_forward()
+
+      # A resync snapshot from the same leader: the forward was delivered, so a second
+      # copy would only be a second commit — racing, e.g., a concurrent unregister.
+      follow(member, l1, epoch + 1, v)
+      refute_receive {:"$gen_cast", {:register_req, _, _, _, _, _}}, 100
+
+      GenServer.cast(member, {:register_reply, ref1, :yes, v})
+      assert :yes == Task.await(caller)
+    end
+
+    test "a member that does not lead stays silent rather than answer `no`", %{reg: reg} do
+      member = :dgen_registry.member_name(reg)
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+
+      # Demote the member to a follower of some other (idle) leader.
+      other = :"other_leader_#{:erlang.unique_integer([:positive])}"
+      Process.register(pid, other)
+      follow(member, {node(), other}, :dgen_registry.get_epoch(reg) + 1, applied_version(member))
+
+      # A follower forwards a registration to it, believing it leads.
+      follower = fake_leader()
+      ref = make_ref()
+      GenServer.cast(member, {:register_req, ref, follower, :name, pid, {%{}, :undefined}})
+      :sys.get_state(member)
+
+      refute_receive {:"$gen_cast", {:register_reply, ^ref, _}}, 200
+      refute_receive {:"$gen_cast", {:register_reply, ^ref, _, _}}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Leader exits: an op the leader buffered but can no longer commit
+  #
+  # A leader that is re-elected without ever hearing it was deposed (the
+  # minority side of a partition) takes the genuine assume path, and its
+  # `leader` is `undefined` for the assume window. If an in-flight commit
+  # reports back inside that window, the buffered ops behind it are flushed with
+  # no leader to send them to. A buffered unregister must not be dropped there:
+  # its caller was answered `ok`, and its durable clear is owed (Non-goal 5).
+  # Nor may the registration whose commit was in flight be answered `no`: it is
+  # retried, and re-sent to whoever leads (dgen_registry_pipeline:surrender/2).
+  #
+  # The window is driven by hand: the member is suspended while a register (to
+  # put a commit in flight), an unregister (to sit buffered behind it) and an
+  # assume for a newer epoch are queued, then resumed. The elector is suspended
+  # too, so the assume's off-loop gather waits out its subscription pull
+  # (?SUBS_PULL_TIMEOUT), which holds the window open. A test process then plays
+  # the leader that actually won, by sending a snapshot naming it.
+  # ---------------------------------------------------------------------------
+
+  describe "a buffered op the leader can no longer commit" do
+    test "ops caught in the assume window reach the next leader, not `no` or nowhere", %{
+      reg: reg
+    } do
+      member = :dgen_registry.member_name(reg)
+      self_id = {node(), member}
+      epoch = :dgen_registry.get_epoch(reg)
+
+      held = spawn(fn -> Process.sleep(:infinity) end)
+      in_flight = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Enum.each([held, in_flight], &Process.exit(&1, :kill)) end)
+
+      :yes = :dgen_registry.register_name({reg, :held}, held)
+      v = applied_version(member)
+
+      # A suspension is counted per suspender, so it is undone here, not in on_exit.
+      elector = :dgen_registry.elector_pid(reg)
+      :erlang.suspend_process(elector)
+
+      try do
+        drive_assume_window(reg, member, self_id, epoch, held, in_flight, v)
+      after
+        :erlang.resume_process(elector)
+      end
+    end
+
+    defp drive_assume_window(reg, member, self_id, epoch, held, in_flight, v) do
+      :sys.suspend(member)
+      register = Task.async(fn -> :dgen_registry.register_name({reg, :in_flight}, in_flight) end)
+      Process.sleep(50)
+      unregister = Task.async(fn -> :dgen_registry.unregister_name({reg, :held}) end)
+      Process.sleep(50)
+
+      assume =
+        Task.async(fn ->
+          :gen_statem.call(
+            member,
+            {:elector_assume_and_distribute, self_id, [self_id], %{}, [], epoch + 1}
+          )
+        end)
+
+      Process.sleep(50)
+      :sys.resume(member)
+
+      assert :ok == Task.await(assume)
+      # The flush answers the buffered unregister's caller: proof it ran in the window.
+      assert :ok == Task.await(unregister)
+
+      # Non-vacuity: the member is still mid-assume.
+      {statem_state, _data} = :sys.get_state(member)
+      assert statem_state == :assuming
+
+      # Another member won the election; its snapshot still holds the binding.
+      winner = :"winner_#{:erlang.unique_integer([:positive])}"
+      Process.register(self(), winner)
+
+      GenServer.cast(
+        member,
+        {:apply_names_snapshot, %{held: {held, %{}, :undefined}}, {node(), winner}, [], %{},
+         epoch + 2, v}
+      )
+
+      assert_receive {:"$gen_cast", {:retract_req, :held, ^held}},
+                     1_000,
+                     "the buffered unregister's pid-guarded clear never reached the new " <>
+                       "leader — it was dropped when the buffer was flushed with no leader"
+
+      # The register whose commit was in flight (it landed under the old epoch, so it
+      # failed) is retried, finds this member deposed, and becomes an intent re-sent
+      # to the winner — its caller gets the winner's verdict, not a `no`.
+      assert_receive {:"$gen_cast", {:register_req, ref, _from, :in_flight, ^in_flight, _meta}},
+                     3_000,
+                     "the in-flight registration was not re-sent to the new leader"
+
+      assert Task.yield(register, 0) == nil, "the in-flight registration was answered early"
+      GenServer.cast(member, {:register_reply, ref, :yes, v})
+      assert :yes == Task.await(register)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # reject_when_degraded keys on versions (§5.6, §8)
+  #
+  # A leader is degraded exactly when its handoff reconstruction stopped short of
+  # the durable version key: every replica is a prefix of the committed stream, so
+  # one at the key holds every committed binding (the TLA+ model's
+  # DegradedFlagSound). Which members answered the gather does not matter.
+  #
+  # Each test demotes the member to a follower of a fake leader (a snapshot at the
+  # current epoch, so the durable fence still names this member), then hands it
+  # leadership back through a genuine assume whose gather it controls.
+  # ---------------------------------------------------------------------------
+
+  describe "reject_when_degraded" do
+    setup %{tenant: tenant} do
+      reg = :"degr_#{:erlang.unique_integer([:positive])}"
+      {:ok, sup} = :dgen_registry.start_link(reg, tenant, %{reject_when_degraded: true})
+      assert :ok == :dgen_registry.await_ready(reg, 5_000)
+      on_exit(fn -> stop_registry(sup) end)
+
+      member = :dgen_registry.member_name(reg)
+      self_id = {node(), member}
+      epoch = :dgen_registry.get_epoch(reg)
+      v = applied_version(member)
+
+      fake = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(fake, :kill) end)
+      fake_name = :"degr_fake_#{:erlang.unique_integer([:positive])}"
+      Process.register(fake, fake_name)
+      GenServer.cast(member, {:apply_names_snapshot, %{}, {node(), fake_name}, [], %{}, epoch, v})
+      {:follower, _} = :sys.get_state(member)
+
+      %{reg: reg, member: member, self_id: self_id, epoch: epoch}
+    end
+
+    defp reassume(member, self_id, all_ids, epoch) do
+      :ok =
+        :gen_statem.call(
+          member,
+          {:elector_assume_and_distribute, self_id, all_ids, %{}, [], epoch}
+        )
+
+      assert eventually(fn -> match?({:leader, _}, :sys.get_state(member)) end, 5_000)
+    end
+
+    test "a member that did not answer but held nothing extra does not degrade it", %{
+      reg: reg,
+      member: member,
+      self_id: self_id,
+      epoch: epoch
+    } do
+      # A previously-synced member that never answers the gather — a scale-down, or
+      # one that was simply behind. The reachability rule this replaced counted it.
+      ghost = {:ghost@nowhere, member}
+      reassume(member, self_id, [self_id, ghost], epoch)
+
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+      assert :yes == :dgen_registry.register_name({reg, :new_name}, pid)
+    end
+
+    test "a reconstruction behind the durable version key degrades it", %{
+      reg: reg,
+      member: member,
+      self_id: self_id,
+      epoch: epoch,
+      tenant: tenant
+    } do
+      # A commit this member never applied — the only holders of whatever it
+      # carried are gone. Every member that could answer, answers.
+      tuid = {"dgen_registry.", Atom.to_string(reg)}
+      ref = make_ref()
+
+      {:ok, _} =
+        :dgen_registry_names.start_commit(tenant, tuid, self_id, %{
+          owner: self(),
+          ref: ref,
+          epoch: epoch
+        })
+
+      assert_receive {:dgen_transaction, ^ref, {:committed, _}}, 5_000
+
+      # The gather retries toward the key until ?GATHER_TIMEOUT, then assumes degraded.
+      reassume(member, self_id, [self_id], epoch)
+
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+      assert :no == :dgen_registry.register_name({reg, :new_name}, pid)
     end
   end
 end

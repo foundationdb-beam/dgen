@@ -3,40 +3,12 @@
 
 -define(DOCATTRS, ?OTP_RELEASE >= 27).
 
-%% The transform, for a module that is mostly a supervisor and an API surface.
-%%
-%% What matters is *where this code runs*.  `register_name/2`, `unregister_name/1`,
-%% `whereis_name/1`, `query/2` and the rest execute in the **caller's** process, and
-%% under simulation the caller is a process the scheduler owns.  So every
-%% `gen_server:call/2,3` here has to be the one `eta_net` provides rather than
-%% OTP's -- not for the fault injection, but for the clock and the schedule.
-%%
-%% Left untransformed, such a call goes into `gen:do_call/4`, which is OTP code no
-%% transform reaches, and takes two real-time dependencies with it: a
-%% `receive ... after Timeout` on the wall clock, and a real `erlang:monitor` whose
-%% `DOWN` the VM delivers when it likes rather than when the schedule says.  Both
-%% put a scheduled process's progress outside the schedule, and neither shows up in
-%% `eta_run:audit/1` -- the run simply stops being a function of its seed.  Found
-%% exactly that way: clients parked in `gen:do_call/4` at the step where two runs
-%% of one seed first disagreed.
+%% The API runs in the caller's process, so under simulation its gen_server calls must be
+%% eta_net's: OTP's gen:do_call/4 waits on the wall clock and a real monitor.
 -include("../include/dgen_eta.hrl").
 
-%% Supervisor flags that exist only to keep this tree schedulable under simulation.
-%%
-%% The simulation declares these supervisors to `eta_sched` — it has to, because
-%% `elector_pid/1` below asks a supervisor for its children, so every
-%% `get_leader/1`, `get_epoch/1` and `get_members/1` is a call into one. A process
-%% the scheduler owns must have no real timers, and on OTP 28 a supervisor does:
-%% `hibernate_after` arrived with a 1000ms default, implemented as a `gen_server`
-%% timeout, and `supervisor` is OTP code no parse transform reaches. So every
-%% supervisor armed a wall-clock timer that dropped a message into a scheduled
-%% process's mailbox whenever real time said so. It moved with machine load — six
-%% simulation suites running at once made it fail about one run in three, while
-%% one at a time looked clean — and it was the last thing keeping `mix dst` from
-%% being a function of its seed.
-%%
-%% Guarded twice over, so a release build is byte-for-byte what it was: `DST` is
-%% set only by the test profile, and the key does not exist before OTP 28.
+%% Test-only (DST, OTP >= 28): turn off supervisor `hibernate_after`, a wall-clock timer
+%% that breaks seed determinism (elector_pid/1 calls into the supervisor).
 -ifdef(DST).
 -if(?OTP_RELEASE >= 28).
 -define(SUP_SIM_FLAGS, #{hibernate_after => infinity}).
@@ -202,17 +174,10 @@ stakeholders are database entities. See §4.9 of the design doc.
 %% Per-registry tuning options passed to `start_link/3`.
 -type registry_opts() :: #{atom() => term()}.
 
-%% A query over registrations' indexed metadata, used by the presence subscriptions
-%% (`subscribe/4`).  Extensible by design — only the AND-equal form exists today:
-%% `{all, #{attr() => value()}}` matches a registration whose `index` map contains
-%% *all* of the given exact equalities (the same semantics as `query/2`).  A bare
-%% constraints map is accepted anywhere a query is and is treated as `{all, Map}`.
-%% Future query kinds (ranges, disjunction, …) slot in as new tagged variants without
-%% changing existing call sites.
+%% A metadata query (`subscribe/4`): AND-equal `{all, Map}`, or a bare Map meaning that.
 -type query() :: {'all', #{term() => term()}} | #{term() => term()}.
 
-%% A presence change delivered to a subscription's notify targets: a name entered
-%% (`joined`) or left (`left`) the watch query's result set.  See `subscribe/4`.
+%% A name entered (`joined`) or left (`left`) a watch query's result set.
 -type presence_event() :: {joined | left, Name :: term(), Pid :: pid()}.
 
 %% ---------------------------------------------------------------------------
@@ -332,15 +297,11 @@ unregister_name({RegistryName, LogicalName}) ->
         gen_statem:call(
             member_name(RegistryName),
             {unregister, LogicalName},
-            %% Same caller-side bound as the other leader-routed writes — see
-            %% set_metadata/2.
+            %% Same caller-side bound as set_metadata/2.
             dgen_config:register_timeout(#{})
         )
     catch
-        %% noproc: the registry is stopped/absent — nothing to unregister, `ok` is
-        %% truthful.  timeout: the removal is already stashed on the member and will
-        %% be re-driven; the public contract stays `ok` (the via machinery ignores
-        %% the return value, and unlike register there is no wrong verdict to mask).
+        %% noproc: nothing to unregister; timeout: the member re-drives it. `ok` either way.
         exit:_ -> ok
     end.
 
@@ -362,8 +323,7 @@ whereis_name({RegistryName, LogicalName}) ->
         [{_Name, Pid, _Index, _Data} | _] -> Pid;
         [] -> undefined
     catch
-        %% The table does not exist yet (member starting / restarting after a
-        %% crash) — treat as not-registered rather than crashing the caller.
+        %% No table yet (member (re)starting): not registered.
         error:badarg -> undefined
     end.
 
@@ -388,11 +348,7 @@ send(Name, Msg) ->
 %% ---------------------------------------------------------------------------
 %% Registration metadata
 %% ---------------------------------------------------------------------------
-%% Metadata is attached to a registration (keyed by name) and lives exactly as long as
-%% the registration does — it is removed automatically when the process exits or is
-%% unregistered. A `MetaSpec` is `#{index => #{attr() => value()}, data => term()}`
-%% (both optional): `index` is the queryable metadata, `data` an opaque payload returned
-%% verbatim. See §4.7 of the design doc.
+%% Metadata lives exactly as long as its registration (§4.7).
 
 -if(?DOCATTRS).
 -doc """
@@ -438,10 +394,7 @@ set_metadata({RegistryName, LogicalName}, MetaSpec) ->
         gen_statem:call(
             member_name(RegistryName),
             {set_metadata, LogicalName, Index, Data},
-            %% Bounded by the same caller-side knob as register_name/2,3 rather than
-            %% `gen_server:call/2`'s hidden 5s default: this is a leader-routed write
-            %% on the same pipeline, so an operator who tunes how long a write may
-            %% block should not find one of them ignoring the setting.
+            %% register_name/2,3's knob, not call/2's hidden 5s: same write pipeline.
             dgen_config:register_timeout(#{})
         )
     catch
@@ -634,10 +587,7 @@ subscriptions(RegistryName) ->
         dgen_server:priority_call(Pid, get_subscriptions)
     end).
 
-%% Route a durable subscription write to the elector as a fire-and-forget cast (handled
-%% by dgen_registry_elector:handle_cast_tx/3 — enqueued durably and committed in the
-%% consume transaction).  A missing registry is a usage error and exits, mirroring the
-%% register path; a cast to a live elector that then dies is a harmless no-op.
+%% Fire-and-forget; the elector commits it durably. A missing registry exits.
 elector_cast(RegistryName, Msg) ->
     case elector_pid(RegistryName) of
         undefined -> exit({noproc, {?MODULE, elector, RegistryName}});
@@ -679,14 +629,11 @@ delete(Name, Tenant) ->
     end),
     ok.
 
-%% Normalise a public query into the internal tagged form: a bare constraints map is
-%% read as `{all, Map}` (AND-equal); an already-tagged query passes through.
+%% A bare constraints map means `{all, Map}`.
 -spec normalize_query(query()) -> {'all', map()}.
 normalize_query({all, C} = Q) when is_map(C) -> Q;
 normalize_query(C) when is_map(C) -> {all, C}.
 
-%% Parse a public MetaSpec (`#{index => …, data => …}`, both optional) into the internal
-%% `{Index, Data}` pair, defaulting to the empty metadata.
 -spec meta_of(map()) -> {map(), term()}.
 meta_of(MetaSpec) ->
     {maps:get(index, MetaSpec, #{}), maps:get(data, MetaSpec, undefined)}.
@@ -753,8 +700,7 @@ ready(Name) ->
         Ready when is_boolean(Ready) -> Ready;
         _ -> false
     catch
-        %% Member starting/restarting (noproc), or busy past the probe bound
-        %% (timeout) — not ready yet.
+        %% noproc (starting) or timeout (busy): not ready yet.
         exit:_ -> false
     end.
 
@@ -813,16 +759,8 @@ await_ready(Name, Timeout) ->
     Deadline = dgen_utils:real_monotonic_ms() + Timeout,
     await_ready_loop(Name, Deadline).
 
-%% The poll sleeps and reads the clock through `dgen_utils`, which the eta
-%% transform does not touch, and that is load-bearing: this module carries the
-%% transform (see the include at the top), so a bare `timer:sleep/1` here becomes
-%% `eta_time:sleep/1` — and under `eta_run` this loop runs in the *driver* while
-%% the cluster starts, the one process whose transformed sleep arms a virtual
-%% deadline nothing will ever reach (`eta_time:sleep/1`'s own boundary rule).
-%% Observed as the whole run wedging in `await_ready_loop` whenever a member was
-%% not ready on the very first poll.  Readiness polling is a wall-clock concern:
-%% it runs before the schedule owns the system (or on a real node, where there is
-%% no schedule at all), exactly like the harness's own `await_quiescent/2`.
+%% Sleeps and reads the clock via dgen_utils, untouched by the eta transform: under
+%% eta_run this loop runs in the driver, where a transformed sleep would never wake.
 await_ready_loop(Name, Deadline) ->
     case ready(Name) of
         true ->
@@ -844,11 +782,7 @@ await_ready_loop(Name, Deadline) ->
 get_members(Name) ->
     with_elector(Name, [], fun(Pid) -> dgen_server:priority_call(Pid, get_members) end).
 
-%% Resolve the elector via `elector_pid/1` and apply `Fun` to it, or return `Default`
-%% if the member (and so the elector) cannot currently be found — the registry may not
-%% have started yet, or may be mid-restart. Keeps get_leader/get_epoch/get_members
-%% bypassing the member's mailbox entirely, as before (§8): only an elector lookup is
-%% added, not a member round-trip.
+%% Bypasses the member's mailbox (§8); `Default` if the elector is not found.
 with_elector(Name, Default, Fun) ->
     case elector_pid(Name) of
         undefined -> Default;
@@ -921,12 +855,7 @@ elector_pid(Name) ->
             end
     end.
 
-%% Reads Pid's `$ancestors` process-dictionary entry: the list of supervisor/starter
-%% identifiers `proc_lib` records for a process at spawn time, immediate parent
-%% first. There is no public `proc_lib` accessor for this (it is conventionally read
-%% straight out of the dictionary — the same technique tools like `recon` use); each
-%% entry is a pid, or a registered name if that ancestor had one, either of which
-%% `supervisor:which_children/1` accepts directly.
+%% `$ancestors` (no public proc_lib accessor): pids or names, as which_children/1 takes.
 -spec ancestors_of(pid()) -> [pid() | atom()].
 ancestors_of(Pid) ->
     case erlang:process_info(Pid, dictionary) of
@@ -939,22 +868,9 @@ ancestors_of(Pid) ->
 %% ---------------------------------------------------------------------------
 
 init({Name, Tenant, Opts}) ->
-    %% Elector must start first: the member discovers it (via this supervisor,
-    %% see dgen_registry_member's `discover_elector` handle_continue) and casts
-    %% `{join, MemberId}` to it right after. A large consume_k is chosen because the
-    %% in-transaction work is very small, and we want to keep a single node as the
-    %% sole consumer as much as possible, to avoid leadership churn. consume_k > 1
-    %% also disables dgen_server inlining, so every elector call rides the batched
-    %% consume loop rather than being served ad hoc on the receiving node — keeping
-    %% the consumer (hence the leader) stable.
-    %%
-    %% The elector is deliberately unnamed (`dgen_server:start_link/3`, no `Reg`):
-    %% it has no registered name at all, local or otherwise. The member finds it by
-    %% pid via this supervisor instead — see the "Process identity" moduledoc note.
-    %% `Name` is this member's identity; `Keyspace` is the durable prefix every
-    %% member of the registry coordinates through.  They are the same atom in the
-    %% ordinary one-member-per-node case; `keyspace` splits them so several members
-    %% of one registry can share a VM (see start_link/3's docs).
+    %% Elector first (unnamed; the member discovers it via this supervisor). A large
+    %% consume_k (> 1 also disables inlining) keeps one stable consumer, hence leader.
+    %% `Keyspace` differs from `Name` only when members of one registry share a VM.
     Keyspace = maps:get(keyspace, Opts, Name),
     ElectorSpec = #{
         id => elector,
@@ -970,11 +886,7 @@ init({Name, Tenant, Opts}) ->
         modules => [dgen_server, dgen_registry_elector]
     },
 
-    %% Tuid matches the elector's (both derive it from dgen_registry_elector:tuid/1)
-    %% so the member can compute the leader key and the per-registry version key
-    %% directly, against the same keyspace the elector's fence writes.  Derived from
-    %% `Keyspace`, not `Name`: every member of a registry must fence against the same
-    %% leader key even when their identities differ.
+    %% From `Keyspace`, as the elector's: all members fence on the same leader key.
     Tuid = dgen_registry_elector:tuid(Keyspace),
     MemberSpec = #{
         id => member,
@@ -994,14 +906,7 @@ init({Name, Tenant, Opts}) ->
         modules => [dgen_registry_member]
     },
 
-    %% The connector keeps Erlang distribution in step with the DB-backed membership
-    %% (the proactive mesh, the backstop reap, the leader-liveness probe) — the
-    %% node-level connectivity plumbing, split out of the member so each has one job.
-    %% It is unnamed and holds only the elector pid; it is started **after** the member
-    %% so it can discover the elector by walking from the (already-registered) member,
-    %% exactly as the member does. `Opts` is threaded through so the connector can
-    %% resolve its `connectivity` mode (§8) — `provided_externally` turns off the
-    %% proactive mesh. See dgen_registry_connector.
+    %% Started after the member, from which it discovers the elector.
     ConnectorSpec = #{
         id => connector,
         start =>
@@ -1015,13 +920,7 @@ init({Name, Tenant, Opts}) ->
         modules => [dgen_registry_connector]
     },
 
-    %% one_for_all: the elector, member, and connector are one unit — the member and
-    %% connector each hold a pid reference to the elector, discovered once at startup
-    %% (see the moduledoc's "Process identity" note). If any crashes, restart all
-    %% together so neither runs with a stale elector reference; there is no
-    %% cross-restart pid-staleness case to handle at the application level.  Order
-    %% matters: elector first (both others discover it), then member (registers its
-    %% name), then connector (walks from the member to the elector).
+    %% one_for_all: the others hold the elector's pid, so never run with a stale one.
     {ok,
         {maps:merge(#{strategy => one_for_all, intensity => 5, period => 10}, ?SUP_SIM_FLAGS), [
             ElectorSpec, MemberSpec, ConnectorSpec
