@@ -132,6 +132,21 @@ defmodule DGen.RegistryReplicaTest do
     end
   end
 
+  describe "adopt/4 — a wholesale re-baseline" do
+    test "replaces the content in place: kept names updated, absent names removed", %{
+      p1: p1,
+      p2: p2
+    } do
+      r = replica(1, 10, %{a: {p1, %{k: 1}, nil}, b: {p1, %{}, nil}})
+
+      r = Replica.adopt(2, 20, %{a: {p2, %{k: 2}, nil}, c: {p2, %{}, nil}}, r)
+      assert pids(r) == %{a: p2, c: p2}
+      assert [] = Replica.query(r, {:all, %{k: 1}})
+      assert [%{name: :a}] = Replica.query(r, {:all, %{k: 2}})
+      assert {Replica.epoch(r), Replica.version(r)} == {2, 20}
+    end
+  end
+
   describe "commit/5 — the leader's own batch" do
     test "applies only the delta's names and advances the version", %{p1: p1, p2: p2} do
       r = replica(1, 10, %{a: {p1, %{}, nil}, b: {p2, %{}, nil}})

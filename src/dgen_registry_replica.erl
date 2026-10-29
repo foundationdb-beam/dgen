@@ -192,12 +192,29 @@ offer_snapshot(Epoch, V, Records, R = #replica{epoch = CurEpoch, version = Appli
 %% Re-baseline unconditionally: a newly assuming leader adopts the reconstruction its
 %% handoff gather produced (already fenced against the durable version key), and an
 %% accepted snapshot lands here too.
+%%
+%% The table is read lock-free by other processes while this runs, so it is replaced
+%% in place, never emptied: the new rows are written first (overwriting), then only
+%% the names the new content lacks are deleted.  A concurrent `whereis_name/1` sees
+%% each name's old row or its new one, never a gap — clearing first used to show a
+%% bound name as `undefined` for the length of the re-baseline, on every resync and
+%% handoff.
 -spec adopt(non_neg_integer(), non_neg_integer(), records(), t()) -> t().
 adopt(Epoch, V, Records, R = #replica{tab = Tab}) ->
-    ets:delete_all_objects(Tab),
     ets:insert(
         Tab, [{Name, Pid, Index, Data} || {Name, {Pid, Index, Data}} <- maps:to_list(Records)]
     ),
+    Absent = ets:foldl(
+        fun({Name, _Pid, _Index, _Data}, Acc) ->
+            case is_map_key(Name, Records) of
+                true -> Acc;
+                false -> [Name | Acc]
+            end
+        end,
+        [],
+        Tab
+    ),
+    lists:foreach(fun(Name) -> ets:delete(Tab, Name) end, Absent),
     R#replica{index = index_rebuild(Records), version = V, epoch = Epoch}.
 
 %% Apply the leader's own committed batch at commit version `V`: its durable delta
