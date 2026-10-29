@@ -90,10 +90,11 @@ that machinery keeps changing.
 | `LeaderEpochUnique` | two members may both believe they lead only under different epochs | §4.2, §5.1 |
 | `UniqueBinding` | at most one pid is ever acked `yes` per name | Guarantee 1 |
 | `DurableAcked` | every acked registration has enough version-visible holders to survive `MaxCrashes` | Guarantee 4, §5.5 |
+| `DegradedFlagSound` | an assume that did not flag itself `degraded` (gathered max version reached the durable version key) adopted exactly the committed map | §5.6, §8 `reject_when_degraded` |
 
-All five hold exhaustively in the main config (`DgenRegistryReplication.cfg`,
-`MaxChanLen = 2`, ~10.7M distinct states, ~2.5 min on 10 cores) and in the
-heartbeat config (`DgenRegistryReplicationHeartbeat.cfg`, `MaxVersion = 2`
+All six hold exhaustively in the main config (`DgenRegistryReplication.cfg`,
+`MaxChanLen = 2`, ~10.7M distinct states, ~2.5 min on 10 cores); the first five
+in the heartbeat config (`DgenRegistryReplicationHeartbeat.cfg`, `MaxVersion = 2`
 with `Heartbeat = TRUE`, ~17.2M distinct states, ~5 min).
 
 Two configs qualify what a green main run means:
@@ -111,9 +112,24 @@ Two configs qualify what a green main run means:
   config checks the other four invariants under `DegradeOpen = TRUE`: the
   default mode keeps prefix consistency, uniqueness and epoch fencing, and
   gives up exactly two-holder durability (verified: ~21.9M distinct states,
-  no violation). "All five hold" above is a claim about the fail-closed
+  no violation). "All six hold" above is a claim about the fail-closed
   setting only — but "does degrade-open also break uniqueness?" now has a
   machine-checked answer: within these bounds, no.
+
+Two more check the `degraded` flag where it matters — past the gather's deadline:
+
+- **`DgenRegistryReplicationDegradedAssume.cfg`** (expected PASS) sets
+  `DegradedAssume = TRUE`: an assume may give up waiting for the durable
+  version key at any point and proceed degraded, as the code does after
+  `?GATHER_TIMEOUT`. `DegradedFlagSound` holds (~10.9M distinct states): the
+  flag, defined on versions alone, never misses an incomplete reconstruction.
+  `UniqueBinding` and `DurableAcked` are deliberately not asserted — a
+  degraded assume can lose a binding; that is what the flag reports.
+  Mutating the flag to never be set makes `DegradedFlagSound` fail, so the
+  invariant has teeth.
+- **`DgenRegistryReplicationDegradedReachable.cfg`** (expected FAIL) is its
+  vacuity canary: it asserts `NoDegradedAssume`, and TLC's counterexample
+  (depth 9) proves degraded assumes are actually reached.
 
 ## How to run locally
 
@@ -264,8 +280,10 @@ formal/
   DgenRegistryReplicationNoGuard.cfg                mutation (pre-deferred_yes) — must fail
   DgenRegistryReplicationDegradeOpen.cfg            mutation (degrade-open loses DurableAcked) — must fail
   DgenRegistryReplicationAckReachable.cfg           vacuity canary (NoAcks) — must fail
+  DgenRegistryReplicationDegradedAssume.cfg         the gather's deadline modeled: DegradedFlagSound — must pass
+  DgenRegistryReplicationDegradedReachable.cfg      its vacuity canary (NoDegradedAssume) — must fail
   vendor/tla2tools-v1.8.0.jar                       the checked-in TLC (see "How to run locally")
   check.sh                                          runner, local + CI (per-run metadir; concurrency-safe)
   README.md                                         this file
-.github/workflows/formal.yml                        CI workflow (all ten configs + the DST jobs)
+.github/workflows/formal.yml                        CI workflow (all twelve configs + the DST jobs)
 ```

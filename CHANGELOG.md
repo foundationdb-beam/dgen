@@ -14,6 +14,13 @@
 - A registration is no longer answered `no` when its leader's commit fails or the
   leader is deposed before answering it; it is retried, or re-sent to the next
   leader.
+- `reject_when_degraded` now refuses exactly when a handoff may be missing a
+  committed binding (its reconstruction stopped short of the durable version
+  key), checked by a new TLA+ invariant. Previously a member that merely did not
+  answer the handoff gather tripped it (a scale-down), while a binding whose only
+  holders had crashed did not.
+- A partition heal no longer stalls the leader on conflict-detection liveness
+  probes; they run off its loop.
 - `whereis_name/1` and `get_metadata/1` no longer briefly read a bound name as
   `undefined` while a member re-baselines its replica (a resync or handoff).
 

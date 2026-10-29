@@ -548,9 +548,9 @@
     %% kills to `conflict_kill_budget` per name per window so a regenerating conflict
     %% escalates to an operator instead of looping.
     kill_budget = #{} :: #{term() => [integer()]},
-    %% Leader-only: `true` when this leader's most recent handoff gather was
-    %% incomplete (a committed member did not respond — unreachable), so it may be
-    %% missing that member's bindings.  Under `reject_when_degraded` the leader then
+    %% Leader-only: `true` when this leader's most recent handoff reconstruction
+    %% stopped short of the durable version key, so it may be missing a committed
+    %% binding (see degraded/5).  Under `reject_when_degraded` the leader then
     %% refuses to register a name it does not already hold (a potential re-issue,
     %% §5.6).  Recomputed on every handoff; default off otherwise.
     degraded = false :: boolean(),
@@ -1587,17 +1587,12 @@ handle_info(
 %% followers.
 handle_info(
     {assume_gathered, {MemberId, AllIds, Tokens, FreshIds, Epoch, Ref}, SelfRecords,
-        FreshestRecords, MaxVersion, PeerResults, Subs, Alive},
+        FreshestRecords, {MaxVersion, Frontier}, PeerResults, Subs, Alive},
     State = #state{member_id = Self, assume_ref = Ref}
 ) ->
     OtherIds = lists:delete(Self, AllIds),
     PeerRecordMaps = [Recs || {Recs, _V, _Rel} <- maps:values(PeerResults)],
-    %% Incomplete gather (a committed, non-fresh member did not respond → unreachable):
-    %% we may be missing its bindings, so the leader is `degraded` (§5.6).  A member the
-    %% elector marked *fresh* (never synced) holds nothing, so its absence is not a
-    %% degrade — a healthy scale-up does not flag one.
-    Unreachable = OtherIds -- maps:keys(PeerResults),
-    Degraded = lists:any(fun(Id) -> not lists:member(Id, FreshIds) end, Unreachable),
+    Degraded = degraded(MaxVersion, Frontier, OtherIds, FreshIds, PeerResults),
     %% Merge every reachable member's released-pid trail into our own (§5.6): the trail
     %% distinguishes "legitimately unregistered, reported by a lagging member" from a
     %% genuine divergence, and must survive leadership changes.
@@ -1979,7 +1974,7 @@ spawn_assume_gather(Ctx, SelfRecords, SelfVersion, OtherIds, Elector, Owner, Ten
         %% Fall back to a self-only reconstruction if the gather ever throws, so the
         %% continuation still fires and the member is never stranded leaderless (it
         %% assumes with its own replica, degraded — a later handoff reconciles).
-        {FreshestRecords, MaxVersion, PeerResults} =
+        {FreshestRecords, MaxVersion, PeerResults, Frontier} =
             gather_caught_up(SelfRecords, SelfVersion, OtherIds, Tenant, Tuid),
         Subs = fetch_subscriptions(Elector),
         Peers = maps:values(PeerResults),
@@ -1987,8 +1982,8 @@ spawn_assume_gather(Ctx, SelfRecords, SelfVersion, OtherIds, Elector, Owner, Ten
         Witnesses = [SelfRecords | [Recs || {Recs, _V, _Rel} <- Peers]],
         Alive = probe_alive(conflict_pids(FreshestRecords, Witnesses, Merged)),
         Owner !
-            {assume_gathered, Ctx, SelfRecords, FreshestRecords, MaxVersion, PeerResults, Subs,
-                Alive}
+            {assume_gathered, Ctx, SelfRecords, FreshestRecords, {MaxVersion, Frontier},
+                PeerResults, Subs, Alive}
     end),
     ok.
 
@@ -2014,8 +2009,7 @@ gather_caught_up(SelfRecords, SelfVersion, OtherIds, Tenant, Tuid) ->
     gather_caught_up(SelfRecords, SelfVersion, OtherIds, Tenant, Tuid, Deadline).
 
 gather_caught_up(SelfRecords, SelfVersion, OtherIds, Tenant, Tuid, Deadline) ->
-    Result =
-        {_FreshestRecords, MaxVersion, _PeerResults} =
+    {FreshestRecords, MaxVersion, PeerResults} =
         try
             gather_maps(SelfRecords, SelfVersion, OtherIds)
         catch
@@ -2023,22 +2017,44 @@ gather_caught_up(SelfRecords, SelfVersion, OtherIds, Tenant, Tuid, Deadline) ->
         end,
     %% Best-effort read of the committed frontier — normalised to the same scale as a
     %% member's applied_version (read_committed_frontier strips the versionstamp's batch
-    %% bytes).  A backend hiccup (or a test double without a real tenant) falls back to 0,
-    %% which disables the fence rather than wedging the handoff — the pre-fix behaviour,
-    %% never worse.
-    DurableVersion =
+    %% bytes).  A backend hiccup (or a test double without a real tenant) leaves it
+    %% `unknown`, which disables the fence rather than wedging the handoff — the pre-fix
+    %% behaviour, never worse.  The frontier is returned with the reconstruction: the
+    %% continuation's `degraded` flag is defined on it.
+    Frontier =
         try
             dgen_registry_names:read_committed_frontier(Tenant, Tuid)
         catch
-            _:_ -> 0
+            _:_ -> unknown
         end,
-    case MaxVersion >= DurableVersion orelse erlang:monotonic_time(millisecond) >= Deadline of
+    case
+        Frontier =:= unknown orelse MaxVersion >= Frontier orelse
+            erlang:monotonic_time(millisecond) >= Deadline
+    of
         true ->
-            Result;
+            {FreshestRecords, MaxVersion, PeerResults, Frontier};
         false ->
             timer:sleep(?ASSUME_CATCHUP_INTERVAL),
             gather_caught_up(SelfRecords, SelfVersion, OtherIds, Tenant, Tuid, Deadline)
     end.
+
+%% Could this reconstruction be missing a committed binding (§5.6)?  Exactly when it
+%% stopped short of the durable version key: every replica is a prefix of the
+%% leader's stream, so the freshest one at the key IS the committed map, and one
+%% below it lacks whatever was committed past it.  Checked by the TLA+ model's
+%% DegradedFlagSound (formal/DgenRegistryReplication.tla).  Which members answered
+%% does not matter: a member that did not answer but was behind held nothing extra
+%% (a scale-down is not degraded), and one that did answer cannot hide a version.
+%%
+%% With the key unreadable (a backend hiccup) the version test has nothing to compare
+%% against, so it falls back to the reachability test it replaced: degraded if a
+%% member that could hold bindings — any not marked fresh (never synced) by the
+%% elector — did not answer the gather.
+degraded(MaxVersion, Frontier, _OtherIds, _FreshIds, _PeerResults) when is_integer(Frontier) ->
+    MaxVersion < Frontier;
+degraded(_MaxVersion, unknown, OtherIds, FreshIds, PeerResults) ->
+    Unreachable = OtherIds -- maps:keys(PeerResults),
+    lists:any(fun(Id) -> not lists:member(Id, FreshIds) end, Unreachable).
 
 %% Read the durable subscription set from the (co-located) elector — best-effort, under a
 %% short bound so a momentarily-busy elector cannot stall the gather helper: on timeout
@@ -2333,10 +2349,11 @@ member_names({Node, Name}) ->
             end
     end.
 
-%% §5.6 prevention: while the leader is degraded (its last handoff gather was
-%% incomplete, so a committed member is unreachable) and `reject_when_degraded` is
-%% enabled, refuse to register a name the leader does not already hold — it could be
-%% the unreachable member's binding, and registering it would be a re-issue.  A name
+%% §5.6 prevention: while the leader is degraded (its last handoff reconstruction
+%% stopped short of the durable version key) and `reject_when_degraded` is enabled,
+%% refuse to register a name the leader does not already hold — it could be a
+%% committed binding the reconstruction is missing, and registering it would be a
+%% re-issue.  A name
 %% already in the map flows to the normal dup path.  Default off (reactive posture).
 reject_new_when_degraded(Name, #state{degraded = true, replica = R, config = Config}) ->
     dgen_config:reject_when_degraded(Config) andalso not dgen_registry_replica:exists(R, Name);

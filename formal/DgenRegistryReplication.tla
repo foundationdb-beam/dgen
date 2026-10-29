@@ -33,6 +33,8 @@ CONSTANTS
                         \* durable version key; FALSE = the pre-fix stale gather
     SafeAssumeSnap,     \* TRUE = snapshot apply is version-monotonic; FALSE = the
                         \* pre-fix epoch-only guard (a stale snapshot can rewind)
+    DegradedAssume,     \* TRUE = the gather may also give up waiting for the durable
+                        \* version key (the code's deadline) and assume degraded
     NoPid, NoMember     \* model values
 
 ASSUME NoPid \notin Pids
@@ -61,12 +63,17 @@ VARIABLES
                  \* direct registrations awaiting a replicate_ack
     resyncReq,   \* [Members -> Members \cup {NoMember}]: outstanding resync
                  \* target (the gapped stream's sender), NoMember = none
+    \* ---- ghost: what each member's last assume knew ----
+    degraded,    \* [Members -> BOOLEAN]: the code's `degraded` flag, defined as
+                 \* "gathered max version < durable version key" (§5.6)
+    complete,    \* [Members -> BOOLEAN]: the reconstruction it adopted was the
+                 \* true committed map, histMap[dbVersion]
     \* ---- the network ----
     chan         \* [Members -> [Members -> Seq(Msg)]]: per-ordered-pair FIFO
 
 vars == <<dbLeader, dbEpoch, dbVersion, histMap, acked, crashes,
           alive, rep, appliedVer, epoch, leaderView,
-          deferred, pendingAcks, resyncReq, chan>>
+          deferred, pendingAcks, resyncReq, chan, degraded, complete>>
 
 (***************************************************************************)
 (* Basic definitions                                                       *)
@@ -115,6 +122,8 @@ Init ==
     /\ pendingAcks = [m \in Members |-> {}]
     /\ resyncReq = [m \in Members |-> NoMember]
     /\ chan = [s \in Members |-> [r \in Members |-> <<>>]]
+    /\ degraded = [m \in Members |-> FALSE]
+    /\ complete = [m \in Members |-> TRUE]
 
 (***************************************************************************)
 (* Elections and handoff                                                   *)
@@ -154,15 +163,21 @@ Elect(m) ==
 \* race (see formal/README.md).  In the real code this is the new leader comparing
 \* its gathered MaxVersion against the durable version key and retrying/waiting the
 \* gather until caught up (bounded, then assume-degraded — the availability
-\* tradeoff, out of this safety model's scope, analogous to DegradeOpen).
+\* tradeoff, analogous to DegradeOpen).  With DegradedAssume that deadline is
+\* modeled too: the assume may proceed behind the version key at any point.  It
+\* then records the code's `degraded` flag (maxV < dbVersion) and, as ghost
+\* state, whether the adopted map really was the committed one — which
+\* DegradedFlagSound checks the flag against.
 AssumeGather(m) ==
     /\ alive[m]
     /\ dbLeader = m
     /\ epoch[m] < dbEpoch
     /\ LET maxV == MaxOf({appliedVer[x] : x \in Live})
-       IN /\ (SafeAssumeGather => maxV >= dbVersion)
+       IN /\ (SafeAssumeGather => (maxV >= dbVersion \/ DegradedAssume))
+          /\ degraded' = [degraded EXCEPT ![m] = (maxV < dbVersion)]
           /\ \E src \in Live :
             /\ appliedVer[src] = maxV
+            /\ complete' = [complete EXCEPT ![m] = (rep[src] = histMap[dbVersion])]
             /\ rep' = [rep EXCEPT ![m] = rep[src]]
             /\ appliedVer' = [appliedVer EXCEPT ![m] = maxV]
             /\ LET snap == [type |-> "snap", rep |-> rep[src],
@@ -552,9 +567,10 @@ DropMsg(s, r) ==
 (* Next / Spec                                                             *)
 (***************************************************************************)
 
-Next ==
+\* Every action but AssumeGather leaves the assume-time ghost state alone.
+Step ==
     \/ \E m \in Members :
-         \/ Elect(m) \/ AssumeGather(m) \/ Crash(m) \/ DegradeTimeout(m)
+         \/ Elect(m) \/ Crash(m) \/ DegradeTimeout(m)
          \/ HeartbeatBcast(m)
     \/ \E l \in Members, n \in Names, p \in Pids :
          \/ RegisterDirect(l, n, p)
@@ -564,6 +580,10 @@ Next ==
          \/ RecvHeartbeat(s, r)
          \/ RecvReply(s, r) \/ RecvSync(s, r) \/ RecvAck(s, r)
          \/ RecvSnap(s, r) \/ ServeResync(s, r) \/ DropMsg(s, r)
+
+Next ==
+    \/ \E m \in Members : AssumeGather(m)
+    \/ Step /\ UNCHANGED <<degraded, complete>>
 
 Spec == Init /\ [][Next]_vars
 
@@ -586,6 +606,8 @@ TypeOK ==
     /\ resyncReq \in [Members -> Members \cup {NoMember}]
     /\ acked \subseteq Regs
     /\ crashes \in 0..MaxCrashes
+    /\ degraded \in [Members -> BOOLEAN]
+    /\ complete \in [Members -> BOOLEAN]
     /\ \A s \in Members : \A r \in Members :
          \A i \in 1..Len(chan[s][r]) : chan[s][r][i] \in Msg
 
@@ -613,6 +635,21 @@ Holders(a) ==
 
 DurableAcked ==
     \A a \in acked : Cardinality(Holders(a)) >= 1 + MaxCrashes - crashes
+
+\* The `degraded` flag is sound (§5.6): an assume that did NOT flag itself
+\* degraded — its gathered max version reached the durable version key — adopted
+\* exactly the committed map, so no committed binding is missing from it.  This
+\* is what lets `reject_when_degraded` key on versions instead of on which members
+\* answered the gather: by PrefixConsistency the freshest replica at the key IS
+\* the committed map.  (The converse is not claimed: a degraded assume may still
+\* happen to hold everything.)
+DegradedFlagSound ==
+    \A m \in Members : ~degraded[m] => complete[m]
+
+\* NOT an invariant — the reachability canary for DegradedFlagSound, which a model
+\* that never assumes degraded would satisfy vacuously.  Asserted as an
+\* INVARIANT by the DegradedReachable config, which MUST FAIL.
+NoDegradedAssume == \A m \in Members : ~degraded[m]
 
 \* Fencing sanity: two members may both believe they lead only under
 \* different epochs (§5.1's monotonic fencing token).

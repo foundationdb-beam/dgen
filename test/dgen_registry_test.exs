@@ -1643,4 +1643,95 @@ defmodule DGen.RegistryTest do
       assert :yes == Task.await(register)
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # reject_when_degraded keys on versions (§5.6, §8)
+  #
+  # A leader is degraded exactly when its handoff reconstruction stopped short of
+  # the durable version key: every replica is a prefix of the committed stream, so
+  # one at the key holds every committed binding (the TLA+ model's
+  # DegradedFlagSound). Which members answered the gather does not matter.
+  #
+  # Each test demotes the member to a follower of a fake leader (a snapshot at the
+  # current epoch, so the durable fence still names this member), then hands it
+  # leadership back through a genuine assume whose gather it controls.
+  # ---------------------------------------------------------------------------
+
+  describe "reject_when_degraded" do
+    setup %{tenant: tenant} do
+      reg = :"degr_#{:erlang.unique_integer([:positive])}"
+      {:ok, sup} = :dgen_registry.start_link(reg, tenant, %{reject_when_degraded: true})
+      assert :ok == :dgen_registry.await_ready(reg, 5_000)
+      on_exit(fn -> stop_registry(sup) end)
+
+      member = :dgen_registry.member_name(reg)
+      self_id = {node(), member}
+      epoch = :dgen_registry.get_epoch(reg)
+      v = applied_version(member)
+
+      fake = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(fake, :kill) end)
+      fake_name = :"degr_fake_#{:erlang.unique_integer([:positive])}"
+      Process.register(fake, fake_name)
+      GenServer.cast(member, {:apply_names_snapshot, %{}, {node(), fake_name}, [], %{}, epoch, v})
+      {:follower, _} = :sys.get_state(member)
+
+      %{reg: reg, member: member, self_id: self_id, epoch: epoch}
+    end
+
+    defp reassume(member, self_id, all_ids, epoch) do
+      :ok =
+        :gen_statem.call(
+          member,
+          {:elector_assume_and_distribute, self_id, all_ids, %{}, [], epoch}
+        )
+
+      assert eventually(fn -> match?({:leader, _}, :sys.get_state(member)) end, 5_000)
+    end
+
+    test "a member that did not answer but held nothing extra does not degrade it", %{
+      reg: reg,
+      member: member,
+      self_id: self_id,
+      epoch: epoch
+    } do
+      # A previously-synced member that never answers the gather — a scale-down, or
+      # one that was simply behind. The reachability rule this replaced counted it.
+      ghost = {:ghost@nowhere, member}
+      reassume(member, self_id, [self_id, ghost], epoch)
+
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+      assert :yes == :dgen_registry.register_name({reg, :new_name}, pid)
+    end
+
+    test "a reconstruction behind the durable version key degrades it", %{
+      reg: reg,
+      member: member,
+      self_id: self_id,
+      epoch: epoch,
+      tenant: tenant
+    } do
+      # A commit this member never applied — the only holders of whatever it
+      # carried are gone. Every member that could answer, answers.
+      tuid = {"dgen_registry.", Atom.to_string(reg)}
+      ref = make_ref()
+
+      {:ok, _} =
+        :dgen_registry_names.start_commit(tenant, tuid, self_id, %{
+          owner: self(),
+          ref: ref,
+          epoch: epoch
+        })
+
+      assert_receive {:dgen_transaction, ^ref, {:committed, _}}, 5_000
+
+      # The gather retries toward the key until ?GATHER_TIMEOUT, then assumes degraded.
+      reassume(member, self_id, [self_id], epoch)
+
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+      assert :no == :dgen_registry.register_name({reg, :new_name}, pid)
+    end
+  end
 end
