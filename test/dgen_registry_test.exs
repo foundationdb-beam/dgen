@@ -821,6 +821,34 @@ defmodule DGen.RegistryTest do
 
       assert [] = :dgen_registry_member.detect_conflicts(%{}, [%{n: rec(p1)}], %{})
     end
+
+    # The leader adjudicates on its own loop, so liveness is probed ahead of time in
+    # the gather helpers (conflict_pids/3 says which pids) and handed in as data
+    # (detect_conflicts/4). No probe — no RPC — runs during adjudication.
+    test "conflict_pids/3 names exactly the pids adjudication would probe" do
+      [p1, p2, p3, p4] = for _ <- 1..4, do: spawn_live()
+
+      fresh = %{n: rec(p1), agreed: rec(p3)}
+      witnesses = [%{n: rec(p2), agreed: rec(p3), trailed: rec(p4)}]
+      released = %{{:trailed, p4} => System.system_time(:millisecond)}
+
+      assert Enum.sort([p1, p2]) ==
+               :dgen_registry_member.conflict_pids(fresh, witnesses, released)
+    end
+
+    test "detect_conflicts/4 decides on the liveness it is given, not by probing" do
+      p1 = spawn_live()
+      p2 = spawn_live()
+      fresh = %{n: rec(p1)}
+      witnesses = [%{n: rec(p2)}]
+
+      assert [{:n, ^p1, [^p2]}] =
+               :dgen_registry_member.detect_conflicts(fresh, witnesses, %{}, fn _ -> true end)
+
+      # Both are alive, but the evidence says the divergent one is not: no conflict.
+      assert [] =
+               :dgen_registry_member.detect_conflicts(fresh, witnesses, %{}, &(&1 == p1))
+    end
   end
 
   # ---------------------------------------------------------------------------

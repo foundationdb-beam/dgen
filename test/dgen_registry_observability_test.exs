@@ -109,6 +109,17 @@ defmodule DGen.RegistryObservabilityTest do
              end),
              "no new leader was elected"
 
+      # The elector names the new leader before that member has finished assuming
+      # (the handoff gather runs off its loop), and the published view and
+      # status/1 are two reads at two instants. Wait for the handoff to settle,
+      # then require agreement.
+      assert eventually(fn ->
+               Enum.all?(Cluster.alive(c), fn name ->
+                 match?(%{leader: leader} when leader != :undefined, Cluster.status(name))
+               end)
+             end),
+             "the handoff never settled"
+
       assert_all_agree!(c, "after a leadership change")
 
       {_node, new_leader} = Cluster.leader(c)

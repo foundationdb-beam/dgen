@@ -413,8 +413,9 @@
     terminate/3,
     code_change/4
 ]).
-%% Exported for unit testing the §5.6 conflict-detection predicate in isolation.
--export([detect_conflicts/3]).
+%% Exported for unit testing the §5.6 conflict-detection predicate in isolation, and
+%% the off-loop liveness split it is run with (conflict_pids/3 → detect_conflicts/4).
+-export([detect_conflicts/3, detect_conflicts/4, conflict_pids/3]).
 %% Exported for unit testing the group-commit batch planner in isolation — in
 %% particular, the batch-local overlay (`seed_lookup/3`, the `removed` marker) that lets
 %% a later op in the same batch see an earlier op's not-yet-committed decision without a
@@ -719,14 +720,14 @@ handle_event(
 %% mismatch is visible.
 handle_event(
     info,
-    {assume_gathered, {_, _, _, _, _, Ref}, _, _, _, _, _} = Msg,
+    {assume_gathered, {_, _, _, _, _, Ref}, _, _, _, _, _, _} = Msg,
     assuming,
     Data = #state{assume_ref = Ref}
 ) ->
     {noreply, Data1} = handle_info(Msg, Data),
     next(Data1, []);
 handle_event(
-    info, {assume_gathered, _Ctx, _Self, _Freshest, _MaxV, _Peers, _Subs}, _AnyState, Data
+    info, {assume_gathered, _Ctx, _Self, _Freshest, _MaxV, _Peers, _Subs, _Alive}, _AnyState, Data
 ) ->
     {keep_state, Data};
 %% The joiner-gather continuation is leader work in the current term; the
@@ -1074,7 +1075,7 @@ assume_fast_path(MemberId, AllIds, Tokens, FreshIds, Epoch, State = #state{membe
         true ->
             {reply, ok, onboard_joiner(MemberId, AllIds, Tokens, State1)};
         false ->
-            spawn_joiner_gather(MemberId, AllIds, Tokens, Epoch, self()),
+            spawn_joiner_gather(MemberId, AllIds, Tokens, Epoch, State1),
             {reply, ok, State1}
     end.
 
@@ -1103,7 +1104,8 @@ assume_genuine(MemberId, AllIds, Tokens, FreshIds, Epoch, State = #state{member_
         State#state.elector,
         self(),
         State#state.tenant,
-        State#state.tuid
+        State#state.tuid,
+        State#state.recently_released
     ),
     %% Clear the leader for the window: we are mid-handoff with no stable leader, so
     %% writes block (no reachable leader) and are re-driven by the continuation — rather
@@ -1552,19 +1554,15 @@ handle_info(
 ) when is_map_key(MemberId, Members) ->
     State1 =
         case Result of
-            {ok, {Records, _Version, Released}} ->
-                MergedReleased = maps:merge_with(
-                    fun(_K, A, B) -> max(A, B) end,
-                    State#state.recently_released,
-                    Released
-                ),
+            {ok, {Records, _Version, Released}, Alive} ->
+                MergedReleased = merge_trails(State#state.recently_released, [Released]),
                 %% One materialization of our own replica (the authority) instead of
                 %% one plus two pid projections — detect_conflicts compares records
                 %% maps in place now.  The resolved map is discarded either way: the
                 %% leader's table is authoritative here, and a conflict resolution
                 %% only kills/alarms (the joiner is re-baselined by the snapshot).
                 OwnRecords = dgen_registry_replica:records(State#state.replica),
-                Conflicts = detect_conflicts(OwnRecords, [Records], MergedReleased),
+                Conflicts = detect_conflicts(OwnRecords, [Records], MergedReleased, probed(Alive)),
                 {_Records, S1} = resolve_conflicts(
                     Conflicts, OwnRecords, State#state{recently_released = MergedReleased}
                 ),
@@ -1589,7 +1587,7 @@ handle_info(
 %% followers.
 handle_info(
     {assume_gathered, {MemberId, AllIds, Tokens, FreshIds, Epoch, Ref}, SelfRecords,
-        FreshestRecords, MaxVersion, PeerResults, Subs},
+        FreshestRecords, MaxVersion, PeerResults, Subs, Alive},
     State = #state{member_id = Self, assume_ref = Ref}
 ) ->
     OtherIds = lists:delete(Self, AllIds),
@@ -1603,10 +1601,8 @@ handle_info(
     %% Merge every reachable member's released-pid trail into our own (§5.6): the trail
     %% distinguishes "legitimately unregistered, reported by a lagging member" from a
     %% genuine divergence, and must survive leadership changes.
-    MergedReleased = lists:foldl(
-        fun({_Recs, _V, Rel}, Acc) -> maps:merge_with(fun(_P, A, B) -> max(A, B) end, Acc, Rel) end,
-        State#state.recently_released,
-        maps:values(PeerResults)
+    MergedReleased = merge_trails(
+        State#state.recently_released, [Rel || {_Recs, _V, Rel} <- maps:values(PeerResults)]
     ),
     %% Resolve genuine uniqueness conflicts the gather exposes (§5.6) — kill-both +
     %% alarm + bounded budget; conflicted names are dropped (the fan-out propagates the
@@ -1621,7 +1617,8 @@ handle_info(
         detect_conflicts(
             FreshestRecords,
             [SelfRecords | PeerRecordMaps],
-            MergedReleased
+            MergedReleased,
+            probed(Alive)
         ),
         FreshestRecords,
         State#state{recently_released = MergedReleased}
@@ -1929,9 +1926,32 @@ onboard_joiner(MemberId, AllIds, Tokens, State = #state{member_id = Self, replic
 %% back as {joiner_gathered, …} for the fast-path §5.6 adjudication.  AllIds/Tokens
 %% ride along so the continuation onboards with exactly the member list the elector
 %% committed for this join event.
-spawn_joiner_gather(MemberId, AllIds, Tokens, Epoch, Owner) ->
+%%
+%% The liveness of every pid a conflict could involve is probed here too, for the
+%% same reason the snapshot is fetched here: a probe of a remote pid is an RPC
+%% (?ALIVE_PROBE_TIMEOUT each), and the continuation runs on the leader's loop.  Our
+%% own table is read from this helper (it is `protected`: readable by any process).
+spawn_joiner_gather(MemberId, AllIds, Tokens, Epoch, State) ->
+    #state{replica = Replica, recently_released = OwnTrail} = State,
+    Owner = self(),
     _ = spawn(fun() ->
-        Owner ! {joiner_gathered, MemberId, AllIds, Tokens, Epoch, member_names(MemberId)}
+        Result =
+            case member_names(MemberId) of
+                {ok, {Records, _Version, Released} = Snapshot} ->
+                    Trail = merge_trails(OwnTrail, [Released]),
+                    %% The table dies with the member; if it already has, there is
+                    %% no one to report to, so probe nothing rather than crash.
+                    Alive =
+                        try dgen_registry_replica:records(Replica) of
+                            Own -> probe_alive(conflict_pids(Own, [Records], Trail))
+                        catch
+                            error:badarg -> #{}
+                        end,
+                    {ok, Snapshot, Alive};
+                error ->
+                    error
+            end,
+        Owner ! {joiner_gathered, MemberId, AllIds, Tokens, Epoch, Result}
     end),
     ok.
 
@@ -1951,7 +1971,10 @@ spawn_joiner_gather(MemberId, AllIds, Tokens, Epoch, Owner) ->
 %% after the gather means any subscribe committed during the (up to ~?GATHER_TIMEOUT)
 %% gather is captured; a subscribe racing the final millisecond pushes a
 %% {presence_update} delta the now-established leader applies.
-spawn_assume_gather(Ctx, SelfRecords, SelfVersion, OtherIds, Elector, Owner, Tenant, Tuid) ->
+%%
+%% So are the conflict detector's liveness probes (§5.6), off the loop for the same
+%% reason as in spawn_joiner_gather/5: the continuation adjudicates with the results.
+spawn_assume_gather(Ctx, SelfRecords, SelfVersion, OtherIds, Elector, Owner, Tenant, Tuid, Trail) ->
     _ = spawn(fun() ->
         %% Fall back to a self-only reconstruction if the gather ever throws, so the
         %% continuation still fires and the member is never stranded leaderless (it
@@ -1959,7 +1982,13 @@ spawn_assume_gather(Ctx, SelfRecords, SelfVersion, OtherIds, Elector, Owner, Ten
         {FreshestRecords, MaxVersion, PeerResults} =
             gather_caught_up(SelfRecords, SelfVersion, OtherIds, Tenant, Tuid),
         Subs = fetch_subscriptions(Elector),
-        Owner ! {assume_gathered, Ctx, SelfRecords, FreshestRecords, MaxVersion, PeerResults, Subs}
+        Peers = maps:values(PeerResults),
+        Merged = merge_trails(Trail, [Rel || {_Recs, _V, Rel} <- Peers]),
+        Witnesses = [SelfRecords | [Recs || {Recs, _V, _Rel} <- Peers]],
+        Alive = probe_alive(conflict_pids(FreshestRecords, Witnesses, Merged)),
+        Owner !
+            {assume_gathered, Ctx, SelfRecords, FreshestRecords, MaxVersion, PeerResults, Subs,
+                Alive}
     end),
     ok.
 
@@ -2080,7 +2109,54 @@ collect_gather(Ref, Waiting, Deadline, Acc) ->
 %% the rare case.  An entry from the freshest map itself always agrees with its own
 %% authority, so including it in `RecordMaps` is harmless.
 detect_conflicts(FreshestRecords, RecordMaps, Released) ->
-    Candidates = lists:foldl(
+    detect_conflicts(FreshestRecords, RecordMaps, Released, fun is_pid_alive/1).
+
+%% As detect_conflicts/3, with liveness supplied by `Alive` rather than probed here —
+%% the form the member's loop uses, with probe_alive/1's results (see probed/1).
+detect_conflicts(FreshestRecords, RecordMaps, Released, Alive) ->
+    maps:fold(
+        fun(Name, PidSet, Acc) ->
+            Authority = authority(Name, FreshestRecords),
+            Others = [P || P <- maps:keys(PidSet), P =/= Authority],
+            case Others =:= [] orelse not (is_pid(Authority) andalso Alive(Authority)) of
+                true ->
+                    Acc;
+                false ->
+                    case [P || P <- Others, Alive(P)] of
+                        [] -> Acc;
+                        Divergent -> [{Name, Authority, Divergent} | Acc]
+                    end
+            end
+        end,
+        [],
+        candidates(FreshestRecords, RecordMaps, Released)
+    ).
+
+%% Every pid a conflict among these maps could turn on — each candidate name's
+%% authority and its divergent claimants — so their liveness can be probed ahead of
+%% adjudication, off the loop.
+conflict_pids(FreshestRecords, RecordMaps, Released) ->
+    lists:usort(
+        maps:fold(
+            fun(Name, PidSet, Acc) ->
+                [P || P <- [authority(Name, FreshestRecords) | maps:keys(PidSet)], is_pid(P)] ++
+                    Acc
+            end,
+            [],
+            candidates(FreshestRecords, RecordMaps, Released)
+        )
+    ).
+
+authority(Name, FreshestRecords) ->
+    case maps:get(Name, FreshestRecords, undefined) of
+        {Pid, _Index, _Data} -> Pid;
+        undefined -> undefined
+    end.
+
+%% Names some map binds to a pid other than the authority's, and not explicitly
+%% released from that name (the trail): `#{Name => #{Pid => true}}`.
+candidates(FreshestRecords, RecordMaps, Released) ->
+    lists:foldl(
         fun(Map, Acc0) ->
             maps:fold(
                 fun(Name, {Pid, _Index, _Data}, Acc) ->
@@ -2104,27 +2180,47 @@ detect_conflicts(FreshestRecords, RecordMaps, Released) ->
         end,
         #{},
         RecordMaps
+    ).
+
+%% Probe every pid's liveness in parallel, bounded overall by about one
+%% ?ALIVE_PROBE_TIMEOUT.  Runs in the gather helpers, never on the member's loop.
+probe_alive([]) ->
+    #{};
+probe_alive(Pids) ->
+    Ref = make_ref(),
+    Parent = self(),
+    lists:foreach(
+        fun(Pid) -> spawn(fun() -> Parent ! {Ref, Pid, is_pid_alive(Pid)} end) end, Pids
     ),
-    maps:fold(
-        fun(Name, PidSet, Acc) ->
-            Authority =
-                case maps:get(Name, FreshestRecords, undefined) of
-                    {APid, _Index, _Data} -> APid;
-                    undefined -> undefined
-                end,
-            Others = [P || P <- maps:keys(PidSet), P =/= Authority],
-            case Others =:= [] orelse not (is_pid(Authority) andalso is_pid_alive(Authority)) of
-                true ->
-                    Acc;
-                false ->
-                    case [P || P <- Others, is_pid_alive(P)] of
-                        [] -> Acc;
-                        Divergent -> [{Name, Authority, Divergent} | Acc]
-                    end
-            end
-        end,
-        [],
-        Candidates
+    Deadline = erlang:monotonic_time(millisecond) + ?ALIVE_PROBE_TIMEOUT + 500,
+    collect_alive(Ref, length(Pids), Deadline, #{}).
+
+collect_alive(_Ref, 0, _Deadline, Acc) ->
+    Acc;
+collect_alive(Ref, Waiting, Deadline, Acc) ->
+    Timeout = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    receive
+        {Ref, Pid, Alive} -> collect_alive(Ref, Waiting - 1, Deadline, Acc#{Pid => Alive})
+    after Timeout -> Acc
+    end.
+
+%% Liveness from probe_alive/1's results.  A pid it did not probe (the leader's own
+%% table changed between the helper's read and this continuation) is checked only if
+%% it is local, which needs no RPC; a remote one counts as not alive, so it is never
+%% killed on evidence we did not gather — the next gather re-checks it.
+probed(Alive) ->
+    fun(Pid) ->
+        case Alive of
+            #{Pid := A} -> A;
+            _ when node(Pid) =:= node() -> is_process_alive(Pid);
+            _ -> false
+        end
+    end.
+
+%% Merge release trails (§5.6), keeping each entry's latest release time.
+merge_trails(Trail, Others) ->
+    lists:foldl(
+        fun(T, Acc) -> maps:merge_with(fun(_K, A, B) -> max(A, B) end, Acc, T) end, Trail, Others
     ).
 
 %% Was this pid explicitly released *from this name* recently?  Trail keys are
