@@ -157,7 +157,7 @@
     %% The epoch in which a fenced commit last made this member re-announce itself
     %% (rejoin_once_fenced/1), so it does so at most once per epoch.
     fence_rejoined = undefined :: undefined | non_neg_integer(),
-    %% Token for our `{join, Self, Token}`; refreshed on nodeup so a stale
+    %% Token for our join; refreshed on nodeup so a stale
     %% `{member_down, Self, OldToken}` is discarded.
     join_token :: reference(),
     %% Peer join tokens, echoed in `{member_down, PeerId, Token}` so the elector can
@@ -376,7 +376,7 @@ handle_continue(
     Elector = dgen_registry:elector_pid(Name),
     true = is_pid(Elector),
     %% `fresh = true`: never synced, so this member cannot be hiding any bindings.
-    dgen_server:cast(Elector, {join, MemberId, Token, true}),
+    dgen_registry_elector:join(Elector, MemberId, Token, true),
     {noreply, State#state{elector = Elector}}.
 
 %% ---------------------------------------------------------------------------
@@ -862,7 +862,7 @@ handle_info({nodeup, _Node}, State = #state{elector = Elector, member_id = Self}
     %% We may have been removed during a partition: re-announce with a fresh token
     %% so a queued stale {member_down, Self, OldToken} is discarded.
     NewToken = make_ref(),
-    dgen_server:cast(Elector, {join, Self, NewToken, not State#state.synced}),
+    dgen_registry_elector:join(Elector, Self, NewToken, not State#state.synced),
     %% Partition heal: if our leader is reachable, re-drive intents now (idempotent)
     %% so a held or swallowed unregister is never lost (Non-goal 5), without waiting
     %% for the re-onboarding snapshot.
@@ -1004,7 +1004,7 @@ handle_info({durable_epoch, DurableEpoch}, State) when is_integer(DurableEpoch) 
         true ->
             #state{elector = Elector, member_id = Self, join_token = Token, synced = Synced} =
                 State,
-            dgen_server:cast(Elector, {join, Self, Token, not Synced});
+            dgen_registry_elector:join(Elector, Self, Token, not Synced);
         false ->
             ok
     end,
@@ -1201,7 +1201,7 @@ gather_caught_up(SelfRecords, SelfVersion, OtherIds, Tenant, Tuid, Deadline) ->
 %% Best-effort, short-bounded subscription pull from the elector; off-loop callers only.
 %% On timeout the empty set is reconciled by a later delta or handoff.
 fetch_subscriptions(Elector) when is_pid(Elector) ->
-    try dgen_server:priority_call(Elector, get_subscriptions, ?SUBS_PULL_TIMEOUT) of
+    try dgen_registry_elector:priority_get_subscriptions(Elector, ?SUBS_PULL_TIMEOUT) of
         Subs when is_map(Subs) -> Subs;
         _ -> #{}
     catch
@@ -2030,7 +2030,7 @@ cancel_resync(State = #state{resync_timer = Ref}) ->
 mark_synced(State = #state{synced = true}) ->
     State;
 mark_synced(State = #state{elector = Elector, member_id = Self, join_token = Token}) ->
-    dgen_server:cast(Elector, {join, Self, Token, false}),
+    dgen_registry_elector:join(Elector, Self, Token, false),
     State#state{synced = true}.
 
 %% Connected, so a cast will not be dropped?
@@ -2041,8 +2041,8 @@ member_reachable({Node, _Name}) ->
 %% helper so this loop never blocks on the elector (see the DOWN handler).
 spawn_member_down(Elector, MemberId, Cached) ->
     _ = spawn(fun() ->
-        Token = dgen_registry_elector:member_token(Elector, MemberId, Cached),
-        dgen_server:cast(Elector, {member_down, MemberId, Token})
+        Token = dgen_registry_elector:get_member_token(Elector, MemberId, Cached),
+        dgen_registry_elector:member_down(Elector, MemberId, Token)
     end),
     ok.
 
@@ -2098,7 +2098,7 @@ rejoin_once_fenced(State = #state{fence_rejoined = Epoch}) when Epoch =/= undefi
     end;
 rejoin_once_fenced(State) ->
     #state{elector = Elector, member_id = Self, join_token = Token, synced = Synced} = State,
-    dgen_server:cast(Elector, {join, Self, Token, not Synced}),
+    dgen_registry_elector:join(Elector, Self, Token, not Synced),
     State#state{fence_rejoined = epoch(State)}.
 
 %% Carry out dgen_registry_pipeline:surrender/2: replies, intents, delayed retries.

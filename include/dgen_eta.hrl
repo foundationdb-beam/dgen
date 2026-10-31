@@ -33,7 +33,17 @@
 %% fields published on every callback return. Inert unless a run is active.
 -include_lib("eta/include/eta.hrl").
 
+%% Test-only (DST, OTP >= 28): turn off supervisor `hibernate_after`, a wall-clock timer
+%% that breaks seed determinism (elector_pid/1 calls into the supervisor).
+-if(?OTP_RELEASE >= 28).
+-define(SUP_SIM_FLAGS, #{hibernate_after => infinity}).
 -else.
+-define(SUP_SIM_FLAGS, #{}).
+-endif.
+
+-else.
+
+-define(SUP_SIM_FLAGS, #{}).
 
 %% Release build. `Event` and `Label` are **not evaluated**, matching `eta.hrl`, so
 %% anything logged must be side-effect free and a variable used only inside one of

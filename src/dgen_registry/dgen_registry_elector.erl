@@ -4,7 +4,10 @@
 -define(DOCATTRS, ?OTP_RELEASE >= 27).
 
 -include("../../include/dgen_eta.hrl").
--define(SnapshotTimeout, 2000).
+
+% Actions (aka side effects) taken by the elector
+-define(ActionAssumeDistribute(MemberId), dgen_registry_elector_actions:assume_distribute(MemberId)).
+-define(ActionPresencePush(Msg), dgen_registry_elector_actions:presence_push(Msg)).
 
 -if(?DOCATTRS).
 -moduledoc false.
@@ -12,7 +15,7 @@
 
 %% `dgen_server` callback tracking registry membership and electing a leader.  State
 %% is durable and shared by every node of the registry; messages arrive via a durable
-%% FIFO queue.  `§N.N` = docs/design/dgen_registry_design.md.
+%% FIFO queue. See docs/design/dgen_registry_design.md.
 %%
 %% Leadership is sticky (kept while the incumbent is a member) to avoid thrashing.
 %% A membership change routes through the leader as a post-commit action, with no
@@ -27,31 +30,143 @@
 %% *This documentation is LLM-generated. See the AI disclosure in README.md.*
 
 -export([
-    init/1,
-    handle_cast_tx/3,
-    handle_call_tx/4,
+    join/4,
+    member_down/3,
+    get_members/1,
+
+    subscribe/4,
+    unsubscribe/2,
+    unsubscribe_all/1,
+
+    priority_get_members/1,
+    priority_get_leader/1,
+    priority_get_epoch/1,
+    priority_get_subscriptions/1,
+    priority_get_subscriptions/2,
+    get_member_token/3,
     leader_db_key/2,
     tuid/1,
-    member_token/3
+
+    init/1,
+    handle_cast_tx/3,
+    handle_call_tx/4
 ]).
 
 -export_type([member_id/0, member_info/0, registry_state/0]).
 
 -type member_id() :: {node(), atom()}.
-%% `fresh` = never synced any state; an unreachable fresh member holds no bindings, so
-%% it is excluded from the leader's `degraded` computation (§5.6).
 -type member_info() :: #{
-    joined_at := integer(), join_token := reference(), fresh => boolean()
+    % Each member joins with a token so that the system can differentiate messages when
+    % members go down. ABA-protection
+    join_token := reference(),
+
+    % `true` when the member has not yet synced any state. Used in state replication
+    fresh => boolean()
 }.
+
+% Stored in FDB. Any proposed changes to the state have implications on preexisting registries.
 -type registry_state() :: #{
+    % The registry name
     name := atom(),
+
+    % The list of members who have joined
     members := #{member_id() => member_info()},
+
+    % The authoritative leader. The `dgen_registry_elector` is solely responsible for choosing the leader.
     leader := member_id() | undefined,
+
+    % A monotonic integer for leadership changes. ABA protection.
     epoch := non_neg_integer(),
+
     %% Durable presence subscriptions (§4.9), `SubId => {Watch, Notify}`; survive a
     %% full cluster restart.  Source of truth; the leader is fed deltas.
     subscriptions => #{term() => {term(), term()}}
 }.
+
+%% ---------------------------------------------------------------------------
+%% API
+%% ---------------------------------------------------------------------------
+
+join(Elector, MemberId, Token, Fresh) ->
+    dgen_server:cast(Elector, {join, MemberId, Token, Fresh}).
+
+member_down(Elector, MemberId, Token) ->
+    dgen_server:cast(Elector, {member_down, MemberId, Token}).
+
+get_members(Elector) ->
+    dgen_server:call(Elector, get_members).
+
+subscribe(Elector, SubId, Watch, Notify) ->
+    dgen_server:cast(Elector, {subscribe, SubId, Watch, Notify}).
+
+unsubscribe(Elector, SubId) ->
+    dgen_server:cast(Elector, {unsubscribe, SubId}).
+
+unsubscribe_all(Elector) ->
+    dgen_server:cast(Elector, unsubscribe_all).
+
+priority_get_members(Elector) ->
+    dgen_server:priority_call(Elector, get_members).
+
+priority_get_leader(Elector) ->
+    dgen_server:priority_call(Elector, get_leader).
+
+priority_get_epoch(Elector) ->
+    dgen_server:priority_call(Elector, get_epoch).
+
+priority_get_subscriptions(Elector) ->
+    dgen_server:priority_call(Elector, get_subscriptions).
+
+priority_get_subscriptions(Elector, Timeout) ->
+    dgen_server:priority_call(Elector, get_subscriptions, Timeout).
+
+-if(?DOCATTRS).
+-doc """
+Client-side helper: read the token the elector holds for `MemberId` right now,
+falling back to `Default` if the member is unknown or the read fails.
+
+A priority read (bypasses the durable queue).  This is the fence for a
+`{member_down}`: reporting the elector's *current* token means a peer that has
+genuinely rejoined (advancing its token) is not clobbered by a stale DOWN, while a
+truly dead member is still reaped.  Pure — safe to call from an off-loop helper; the
+member's peer-DOWN path and the connector's reap both use it.
+""".
+-endif.
+-spec get_member_token(pid(), member_id(), Default) -> reference() | Default.
+get_member_token(Elector, MemberId, Default) ->
+    try dgen_server:priority_call(Elector, {get_member_token, MemberId}) of
+        T when is_reference(T) -> T;
+        _ -> Default
+    catch
+        _:_ -> Default
+    end.
+
+-if(?DOCATTRS).
+-doc """
+Returns the packed backend key for the leader value.
+
+Exported so callers can set up a backend watch without going through the
+elector process.
+""".
+-endif.
+-spec leader_db_key(dgen_backend:dir(), dgen_server:tuid()) -> dgen_backend:key().
+leader_db_key(Dir, Tuid) ->
+    B = dgen_config:backend(),
+    B:dir_pack(Dir, leader_key_tuple(Tuid)).
+
+-if(?DOCATTRS).
+-doc """
+The tenant-unique id (backend keyspace prefix) for registry `Name`.
+
+The single source of truth for the registry's backend key prefix: the elector, the
+member (its version-key commit and leader-key fence), and the top-level supervisor
+must all use the *same* tuid, so they derive it here rather than each rebuilding the
+literal.  Exported for that reason.
+""".
+-endif.
+-spec tuid(atom()) -> dgen_server:tuid().
+tuid(Name) ->
+    {<<"dgen_registry.">>, atom_to_binary(Name)}.
 
 %% ---------------------------------------------------------------------------
 %% dgen_server callbacks
@@ -72,6 +187,8 @@ registry share a VM (see that function's docs).
 -spec init(#{name := atom(), keyspace => atom()}) ->
     {ok, dgen_server:tuid(), registry_state()}.
 init(Args = #{name := Name}) ->
+    % Reminder: init/1 is always called, but the initial state is only relevant when there
+    % exists no state in FDB for this tuid.
     State = #{
         name => Name, members => #{}, leader => undefined, epoch => 0, subscriptions => #{}
     },
@@ -79,24 +196,9 @@ init(Args = #{name := Name}) ->
 
 -if(?DOCATTRS).
 -doc """
-The transaction-unit id (backend keyspace prefix) for registry `Name`.
-
-The single source of truth for the registry's backend key prefix: the elector, the
-member (its version-key commit and leader-key fence), and the top-level supervisor
-must all use the *same* tuid, so they derive it here rather than each rebuilding the
-literal.  Exported for that reason.
-""".
--endif.
--spec tuid(atom()) -> dgen_server:tuid().
-tuid(Name) ->
-    {<<"dgen_registry.">>, atom_to_binary(Name)}.
-
--if(?DOCATTRS).
--doc """
 Processes membership change messages within a backend transaction.
 
-Handles `{join, MemberId, Token, Fresh}` (a legacy 3-tuple `{join, MemberId,
-Token}` is accepted as `Fresh = false`) and `{member_down, MemberId, Token}`.
+Handles `{join, MemberId, Token, Fresh}` and `{member_down, MemberId, Token}`.
 Returns `{noreply, NewState, Actions}` when the handoff must be routed through the
 leader (every join; a leader-changing member_down), else plain
 `{noreply, NewState}`. The `Actions` run after the transaction commits — no
@@ -116,20 +218,15 @@ is processed after the subsequent `{join}` that heals the cluster.
 -spec handle_cast_tx(dgen_server:tx_ctx(), term(), registry_state()) ->
     dgen_server:noreply_ret().
 
-%% Rolling upgrade: legacy 3-tuple join, treated as non-fresh (conservative).
-handle_cast_tx(TxCtx, {join, MemberId, Token}, State) ->
-    handle_cast_tx(TxCtx, {join, MemberId, Token, false}, State);
 handle_cast_tx(TxCtx, {join, MemberId, Token, Fresh}, State) ->
     #{name := Name, members := Members, leader := OldLeader, epoch := OldEpoch} = State,
-    MemberInfo = #{
-        joined_at => erlang:system_time(millisecond), join_token => Token, fresh => Fresh
-    },
+    MemberInfo = #{join_token => Token, fresh => Fresh},
     NewMembers = Members#{MemberId => MemberInfo},
     {NewLeader, NewEpoch} = elect_leader(TxCtx, Name, NewMembers, OldLeader, OldEpoch),
     NewState = State#{members => NewMembers, leader => NewLeader, epoch => NewEpoch},
     %% Every join routes through the leader so the joiner gets the snapshot from the same
     %% sender as later name broadcasts (FIFO).
-    {noreply, NewState, [assume_distribute_action(MemberId)]};
+    {noreply, NewState, [?ActionAssumeDistribute(MemberId)]};
 handle_cast_tx(TxCtx, {member_down, MemberId, Token}, State) ->
     #{name := Name, members := Members, leader := OldLeader, epoch := OldEpoch} = State,
     case maps:get(MemberId, Members, undefined) of
@@ -142,68 +239,29 @@ handle_cast_tx(TxCtx, {member_down, MemberId, Token}, State) ->
             NewMembers = maps:remove(MemberId, Members),
             {NewLeader, NewEpoch} = elect_leader(TxCtx, Name, NewMembers, OldLeader, OldEpoch),
             NewState = State#{members => NewMembers, leader => NewLeader, epoch => NewEpoch},
-            case NewLeader =/= OldLeader of
+            case NewLeader =:= OldLeader of
                 true ->
-                    {noreply, NewState, [assume_distribute_action(undefined)]};
-                false ->
                     %% Survivors saw the death via their own monitors; no broadcast.
-                    {noreply, NewState}
+                    {noreply, NewState};
+                false ->
+                    {noreply, NewState, [?ActionAssumeDistribute(undefined)]}
             end
     end;
 %% Presence writes (§4.9) are casts for latency: `ok` means accepted, not committed.
 %% Idempotent upserts by application id, so a write lost before consume is recoverable.
 handle_cast_tx(_TxCtx, {subscribe, SubId, Watch, Notify}, State) ->
-    Subs = subscriptions_of(State),
+    Subs = get_subscriptions(State),
     NewState = State#{subscriptions => Subs#{SubId => {Watch, Notify}}},
-    {noreply, NewState, [presence_push_action({subscribe, SubId, Watch, Notify})]};
+    {noreply, NewState, [?ActionPresencePush({subscribe, SubId, Watch, Notify})]};
 handle_cast_tx(_TxCtx, {unsubscribe, SubId}, State) ->
-    Subs = subscriptions_of(State),
+    Subs = get_subscriptions(State),
     NewState = State#{subscriptions => maps:remove(SubId, Subs)},
-    {noreply, NewState, [presence_push_action({unsubscribe, SubId})]};
+    {noreply, NewState, [?ActionPresencePush({unsubscribe, SubId})]};
 handle_cast_tx(_TxCtx, unsubscribe_all, State) ->
-    {noreply, State#{subscriptions => #{}}, [presence_push_action(unsubscribe_all)]}.
+    {noreply, State#{subscriptions => #{}}, [?ActionPresencePush(unsubscribe_all)]}.
 
-%% Post-commit: an unreachable leader must not fail the action (the change is already
-%% committed; members self-correct on the next membership event).
-assume_distribute_action(TriggerMember) ->
-    fun(#{members := All, leader := Leader, epoch := Epoch}) ->
-        case Leader of
-            undefined ->
-                ok;
-            _ ->
-                try
-                    %% The leader pulls subscriptions from its co-located elector.
-                    call_to_member(
-                        Leader,
-                        {elector_assume_and_distribute, TriggerMember, maps:keys(All),
-                            member_tokens(All), fresh_ids(All), Epoch}
-                    )
-                catch
-                    exit:Reason ->
-                        depose_if_dead(Leader, Reason, All)
-                end
-        end
-    end.
-
-%% Rolling upgrade: durable state may predate `subscriptions`.
-subscriptions_of(State) ->
+get_subscriptions(State) ->
     maps:get(subscriptions, State, #{}).
-
-%% `noproc` means the leader's node answered but its registry is gone; leaving it as
-%% leader strands the cluster, so force a re-election (fenced with its current token).
-%% Not-connected is ambiguous and deliberately not deposed: disambiguating would open a
-%% distribution connection and defeat partition detection.  Timeouts = slow, left alone.
-depose_if_dead(Leader, Reason, All) ->
-    case is_noproc(Reason) andalso maps:get(Leader, All, undefined) of
-        #{join_token := Token} ->
-            dgen_server:cast(self(), {member_down, Leader, Token});
-        _ ->
-            ok
-    end.
-
-is_noproc(noproc) -> true;
-is_noproc({noproc, _}) -> true;
-is_noproc(_) -> false.
 
 %% ---------------------------------------------------------------------------
 %% handle_call_tx/4  (all elector calls)
@@ -236,44 +294,7 @@ handle_call_tx(_TxCtx, {get_member_token, MemberId}, _From, State) ->
         end,
     {reply, Token, State};
 handle_call_tx(_TxCtx, get_subscriptions, _From, State) ->
-    {reply, subscriptions_of(State), State}.
-
-%% Fire-and-forget; a dropped push is caught up by the reseed on the next handoff.
-presence_push_action(Update) ->
-    fun(#{leader := Leader, epoch := Epoch}) ->
-        case Leader of
-            undefined -> ok;
-            _ -> push_to_leader(Leader, {presence_update, Update, Epoch})
-        end
-    end.
-
-%% Same auto-reconnect guard as call_to_member/2.
-push_to_leader({Node, Name}, Msg) ->
-    case dgen_utils:node_reachable(Node) of
-        true -> gen_statem:cast({Name, Node}, Msg);
-        false -> ok
-    end.
-
--if(?DOCATTRS).
--doc """
-Client-side helper: read the token the elector holds for `MemberId` right now,
-falling back to `Default` if the member is unknown or the read fails.
-
-A priority read (bypasses the durable queue).  This is the fence for a
-`{member_down}`: reporting the elector's *current* token means a peer that has
-genuinely rejoined (advancing its token) is not clobbered by a stale DOWN, while a
-truly dead member is still reaped.  Pure — safe to call from an off-loop helper; the
-member's peer-DOWN path and the connector's reap both use it.
-""".
--endif.
--spec member_token(pid(), member_id(), Default) -> reference() | Default.
-member_token(Elector, MemberId, Default) ->
-    try dgen_server:priority_call(Elector, {get_member_token, MemberId}) of
-        T when is_reference(T) -> T;
-        _ -> Default
-    catch
-        _:_ -> Default
-    end.
+    {reply, get_subscriptions(State), State}.
 
 %% ---------------------------------------------------------------------------
 %% Internal helpers
@@ -311,33 +332,5 @@ elect_leader(#{td := {Tx, Dir}, tuid := Tuid}, Name, Members, OldLeader, OldEpoc
     B:set(Tx, B:dir_pack(Dir, leader_key_tuple(Tuid)), term_to_binary({Leader, Epoch})),
     {Leader, Epoch}.
 
--if(?DOCATTRS).
--doc """
-Returns the packed backend key for the leader value.
-
-Exported so callers can set up a backend watch without going through the
-elector process.
-""".
--endif.
--spec leader_db_key(dgen_backend:dir(), dgen_server:tuid()) -> dgen_backend:key().
-leader_db_key(Dir, Tuid) ->
-    B = dgen_config:backend(),
-    B:dir_pack(Dir, leader_key_tuple(Tuid)).
-
 leader_key_tuple(Tuid) ->
     dgen_key:extend(Tuid, <<"leader">>).
-
-member_tokens(Members) ->
-    maps:map(fun(_, #{join_token := T}) -> T end, Members).
-
-fresh_ids(Members) ->
-    [Id || {Id, Info} <- maps:to_list(Members), maps:get(fresh, Info, false)].
-
-call_to_member({Node, Name}, Msg) ->
-    %% Never let the call auto-reconnect a disconnected node: the resulting nodeup makes
-    %% the peer re-join with a new token, so its `{member_down}` is discarded as stale
-    %% and the partition goes undetected (§5.7).
-    case dgen_utils:node_reachable(Node) of
-        true -> gen_statem:call({Name, Node}, Msg, ?SnapshotTimeout);
-        false -> exit({nodedown, Node})
-    end.

@@ -31,7 +31,7 @@
     code_change/3
 ]).
 
-%% Backstop; startup and `nodeup` also trigger an immediate pass.
+%% Safety timer for meshing the network of nodes. Startup and `nodeup` also trigger an immediate pass.
 -define(MESH_INTERVAL, 10000).
 
 %% Don't reconnect a node right after its `nodedown`: let the departure settle as a
@@ -66,7 +66,10 @@
     recently_down = #{} :: #{node() => integer()},
     %% Never pruned; gates the leader probe.
     ever_connected = #{} :: #{node() => true},
-    %% provided_externally isolation warning: counter and one-shot latch.
+
+    %% no_leader_ticks and isolation_warned are a safety feature for when
+    %% provider_externally is configured. We track the number of ticks without
+    %% a connectivity leader, and a one-shot logger warning.
     no_leader_ticks = 0 :: non_neg_integer(),
     isolation_warned = false :: boolean()
 }).
@@ -89,8 +92,6 @@ start_link(Name, Args) ->
 init(#{name := Name} = Args) ->
     net_kernel:monitor_nodes(true),
     Mode = dgen_config:connectivity(maps:get(config, Args, #{})),
-    %% Can't resolve the elector here: the supervisor is blocked in start_child for this
-    %% process, so which_children would deadlock.
     {ok,
         #state{
             name = Name,
@@ -109,9 +110,9 @@ handle_continue(discover_elector, State = #state{name = Name, mode = Mode}) ->
         self_managed ->
             self() ! mesh_connect;
         provided_externally ->
-            arm(?EPOCH_CHECK_INTERVAL, epoch_check)
+            schedule_timer(?EPOCH_CHECK_INTERVAL, epoch_check)
     end,
-    arm(?LEADER_PROBE_GRACE, probe_leader),
+    schedule_timer(?LEADER_PROBE_GRACE, probe_leader),
     {noreply, State#state{elector = Elector}}.
 
 handle_call(_Request, _From, State) ->
@@ -136,7 +137,7 @@ handle_info({nodedown, Node}, State = #state{recently_down = RD}) ->
     schedule_reap(Node, ?REAP_ATTEMPTS),
     {noreply, State#state{recently_down = RD#{Node => erlang:system_time(millisecond)}}};
 handle_info(epoch_check, State = #state{elector = Elector, name = Name}) ->
-    arm(?EPOCH_CHECK_INTERVAL, epoch_check),
+    schedule_timer(?EPOCH_CHECK_INTERVAL, epoch_check),
     spawn_epoch_check(Elector, Name, self()),
     {noreply, State};
 handle_info({connectivity_leader, undefined}, State = #state{no_leader_ticks = N}) ->
@@ -165,11 +166,11 @@ handle_info({reap_down, Node, N}, State = #state{elector = Elector}) ->
     end,
     {noreply, State};
 handle_info(probe_leader, State = #state{elector = Elector, ever_connected = Ever}) ->
-    arm(?LEADER_PROBE_INTERVAL, probe_leader),
+    schedule_timer(?LEADER_PROBE_INTERVAL, probe_leader),
     spawn_probe_leader(Elector, node(), Ever),
     {noreply, State};
 handle_info(mesh_connect, State = #state{elector = Elector, name = Name}) ->
-    arm(?MESH_INTERVAL, mesh_connect),
+    schedule_timer(?MESH_INTERVAL, mesh_connect),
     Now = erlang:system_time(millisecond),
     RD = maps:filter(
         fun(_Node, Ts) -> Ts >= Now - ?MESH_DOWN_COOLDOWN end, State#state.recently_down
@@ -206,21 +207,21 @@ code_change(_OldVsn, State, _Extra) ->
 %% ---------------------------------------------------------------------------
 
 schedule_reap(Node, N) ->
-    arm(?REAP_INTERVAL, {reap_down, Node, N}),
+    schedule_timer(?REAP_INTERVAL, {reap_down, Node, N}),
     ok.
 
 %% Fenced with each member's current durable token so a genuine rejoin isn't clobbered.
 spawn_reap(Elector, Node) ->
-    _ = spawn(fun() ->
-        try dgen_server:priority_call(Elector, get_members) of
+    spawn_catch_all(fun() ->
+        case dgen_registry_elector:priority_get_members(Elector) of
             Members when is_list(Members) ->
                 lists:foreach(
                     fun
                         ({N, _} = MemberId) when N =:= Node ->
-                            Token = dgen_registry_elector:member_token(
+                            Token = dgen_registry_elector:get_member_token(
                                 Elector, MemberId, undefined
                             ),
-                            dgen_server:cast(Elector, {member_down, MemberId, Token});
+                            dgen_registry_elector:member_down(Elector, MemberId, Token);
                         (_) ->
                             ok
                     end,
@@ -228,15 +229,12 @@ spawn_reap(Elector, Node) ->
                 );
             _ ->
                 ok
-        catch
-            _:_ -> ok
         end
-    end),
-    ok.
+    end).
 
 spawn_probe_leader(Elector, SelfNode, EverConnected) ->
-    _ = spawn(fun() ->
-        try dgen_server:priority_call(Elector, get_leader) of
+    spawn_catch_all(fun() ->
+        case dgen_registry_elector:priority_get_leader(Elector) of
             {LeaderNode, _} when LeaderNode =/= SelfNode ->
                 case
                     lists:member(LeaderNode, nodes()) orelse
@@ -247,47 +245,40 @@ spawn_probe_leader(Elector, SelfNode, EverConnected) ->
                 end;
             _ ->
                 ok
-        catch
-            _:_ -> ok
         end
-    end),
-    ok.
+    end).
 
 %% Regular `call`, not `priority_call`: it rides the durable queue in order with
 %% membership changes, so a just-joined node is seen as soon as its join is processed.
 spawn_mesh_fetch(Elector, Connector, MemberName) ->
-    _ = spawn(fun() ->
+    spawn_catch_all(fun() ->
         nudge_durable_epoch(Elector, MemberName),
-        try dgen_server:call(Elector, get_members) of
+        case dgen_registry_elector:get_members(Elector) of
             Members when is_list(Members) ->
                 Connector ! {mesh_members, [Node || {Node, _Name} <- Members]};
             _ ->
                 ok
-        catch
-            _:_ -> ok
         end
-    end),
-    ok.
+    end).
 
 spawn_epoch_check(Elector, MemberName, Connector) ->
-    _ = spawn(fun() ->
+    spawn_catch_all(fun() ->
         nudge_durable_epoch(Elector, MemberName),
         Leader =
-            try dgen_server:priority_call(Elector, get_leader) of
+            try dgen_registry_elector:priority_get_leader(Elector) of
                 L -> L
             catch
                 %% Counts toward the isolation window.
                 _:_ -> undefined
             end,
         Connector ! {connectivity_leader, Leader}
-    end),
-    ok.
+    end).
 
 %% Missed-handoff backstop: if the committed epoch is ahead of the member's, it re-joins.
 %% The send must be inside `try` (not after `of`): sending to an unregistered name raises.
 nudge_durable_epoch(Elector, MemberName) ->
     try
-        case dgen_server:priority_call(Elector, get_epoch) of
+        case dgen_registry_elector:priority_get_epoch(Elector) of
             DurableEpoch when is_integer(DurableEpoch) ->
                 MemberName ! {durable_epoch, DurableEpoch},
                 ok;
@@ -310,10 +301,18 @@ warn_possible_isolation(Name, Ticks) ->
 
 %% Off-loop: the handshake can block on an unreachable node.
 spawn_mesh_connect(Targets) ->
-    _ = spawn(fun() -> lists:foreach(fun net_kernel:connect_node/1, Targets) end),
+    spawn_catch_all(fun() -> lists:foreach(fun net_kernel:connect_node/1, Targets) end).
+
+spawn_catch_all(Fun) ->
+    _ = spawn(fun() ->
+        try Fun()
+        catch _:_ ->
+            ok
+        end
+    end),
     ok.
 
 %% See `dgen_registry_member:arm/2`.
-arm(Delay, Msg) ->
+schedule_timer(Delay, Msg) ->
     _ = ?ETA_LOG({arm, Msg, Delay}),
     erlang:send_after(Delay, self(), Msg).
