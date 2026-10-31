@@ -312,7 +312,7 @@ spawn_catch_all(Fun) ->
     end),
     ok.
 
-%% See `dgen_registry_member:arm/2`.
+%% See `dgen_registry_member:schedule_timer/2`.
 schedule_timer(Delay, Msg) ->
     _ = ?ETA_LOG({arm, Msg, Delay}),
     erlang:send_after(Delay, self(), Msg).

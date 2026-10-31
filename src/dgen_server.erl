@@ -1333,7 +1333,7 @@ is_locked(Td, State) ->
 get_quid(Tuple) ->
     dgen_key:extend(Tuple, <<"q">>).
 
-%% Arm a timer, and say so. See `dgen_registry_member:arm/2`.
+%% Arm a timer, and say so. See `dgen_registry_member:schedule_timer/2`.
 arm(Delay, Msg) ->
     _ = ?ETA_LOG({arm, Msg, Delay}),
     erlang:send_after(Delay, self(), Msg).

@@ -95,7 +95,7 @@ spec's `DropMsg`. Injecting reordering would only produce false positives.
 
 **A lost message comes with a link signal.** In real distribution, messages are
 lost because a link failed, and the failure sends `nodedown`/`nodeup` to both
-ends. The registry relies on those signals: `handle_info({nodeup, _})` re-joins
+ends. The registry relies on those signals: the member's `{nodeup, _}` handler re-joins
 and re-drives stashed unregisters. So `Cluster.converge/2` heals through
 `eta_net:heal_partition/3` with a `nodeup` signal. A fault model that leaves out
 these signals produces failures that look like product bugs but aren't.

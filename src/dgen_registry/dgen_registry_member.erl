@@ -5,7 +5,7 @@
 
 -include("../../include/dgen_eta.hrl").
 -eta_observe(
-    {state, [
+    {data, [
         member_id,
         leader,
         replica,
@@ -116,6 +116,13 @@
     terminate/3,
     code_change/4
 ]).
+%% State functions, called from handle_event/4 (not by gen_statem directly).
+-export([
+    searching/3,
+    assuming/3,
+    leader/3,
+    follower/3
+]).
 %% Exported for unit tests of the batch planner.
 -export([plan_batch/4]).
 
@@ -125,7 +132,7 @@
 %% Application-supplied presence subscription id (§4.9).
 -type sub_id() :: term().
 
--record(state, {
+-record(data, {
     member_id :: dgen_registry_elector:member_id(),
     %% Discovered once after init; the `one_for_all` supervisor restarts us with the
     %% elector, so this pid is never stale.
@@ -207,13 +214,13 @@ init(#{name := Name, tenant := Tenant, tuid := Tuid} = Args) ->
     %% a synchronous `code_server` call inside whichever member emits first, which under
     %% `eta_run` simulation blocks on a process the scheduler does not own.
     _ = telemetry_available(),
-    arm(?PRUNE_INTERVAL, prune_released),
-    arm(?REPLICA_HEARTBEAT_INTERVAL, replica_heartbeat),
+    schedule_timer(?PRUNE_INTERVAL, prune_released),
+    schedule_timer(?REPLICA_HEARTBEAT_INTERVAL, replica_heartbeat),
     %% Announcing needs the elector's pid; `discover_elector` runs as an internal event
     %% because `supervisor:which_children/1` would deadlock while the supervisor still
     %% waits on this init/1.
     {ok, searching,
-        #state{
+        #data{
             member_id = MemberId,
             elector = undefined,
             tenant = Tenant,
@@ -230,504 +237,116 @@ init(#{name := Name, tenant := Tenant, tuid := Tuid} = Args) ->
         [{next_event, internal, discover_elector}]}.
 
 %% ---------------------------------------------------------------------------
-%% handle_event/4 — dispatch, and the derived state
+%% handle_event/4 — enter, events shared by every state, then the state functions
 %% ---------------------------------------------------------------------------
 
-%% -- state enter: the leadership lifecycle, in one place ---------------------
-
-%% The assume/relinquish pairing lives on the role edges so no transition path can
-%% forget half of it. Deliberately not here: redrive_intents (fires on non-edge
-%% leadership events too) and fail_pending_acks (stays in do_leader_changed; a
-%% re-assumed leader's stale acks are already fenced by BatchRef). A leader entering
-%% `assuming` relinquishes at assume start; a death in the gather window is caught by
-%% the next sweep's immediate `noproc` DOWN.
-handle_event(enter, OldState, leader, Data) when OldState =/= leader ->
-    {keep_state, assume_leadership(Data)};
-handle_event(enter, leader, NewState, Data) when NewState =/= leader ->
-    {keep_state, relinquish_leadership(Data)};
-handle_event(enter, _OldState, _NewState, Data) ->
-    {keep_state, Data};
-%% -- the assume lifecycle ---------------------------------------------------
-
-%% A continuing leader absorbs a join on the fast path; otherwise a genuine change.
-%% The epoch guard stays on Data: the `leader` state does not say which term.
-handle_event(
-    {call, From},
-    {elector_assume_and_distribute, MemberId, AllIds, Tokens, FreshIds, Epoch},
-    State,
-    Data = #state{synced = Synced}
-) ->
-    {reply, Reply, Data1} =
-        case
-            State =:= leader andalso Synced andalso MemberId =/= undefined andalso
-                epoch(Data) =:= Epoch
-        of
-            true -> assume_fast_path(MemberId, AllIds, Tokens, FreshIds, Epoch, Data);
-            false -> assume_genuine(MemberId, AllIds, Tokens, FreshIds, Epoch, Data)
-        end,
-    next(Data1, [{reply, From, Reply}]);
-%% The gather continuation applies only in `assuming` and only for the assume that
-%% armed it (the ref); otherwise it was superseded and is dropped.
-handle_event(
-    info,
-    {assume_gathered, {_, _, _, _, _, Ref}, _, _, _, _, _, _} = Msg,
-    assuming,
-    Data = #state{assume_ref = Ref}
-) ->
-    {noreply, Data1} = handle_info(Msg, Data),
-    next(Data1, []);
-handle_event(
-    info, {assume_gathered, _Ctx, _Self, _Freshest, _MaxV, _Peers, _Subs, _Alive}, _AnyState, Data
-) ->
-    {keep_state, Data};
-handle_event(
-    info,
-    {joiner_gathered, MemberId, _AllIds, _Tokens, Epoch, _Result} = Msg,
-    leader,
-    Data = #state{members = Members}
-) when is_map_key(MemberId, Members) ->
-    case epoch(Data) =:= Epoch of
-        true ->
-            {noreply, Data1} = handle_info(Msg, Data),
-            next(Data1, []);
-        false ->
-            {keep_state, Data}
-    end;
-handle_event(info, {joiner_gathered, _M, _A, _T, _E, _R}, _AnyState, Data) ->
-    {keep_state, Data};
-%% -- leader-only periodic work ---------------------------------------------
-
-%% Everyone keeps the timer running so a later election heartbeats immediately.
-handle_event(info, replica_heartbeat, leader, Data) ->
-    broadcast_heartbeat(Data),
-    arm(?REPLICA_HEARTBEAT_INTERVAL, replica_heartbeat),
-    {keep_state, Data};
-handle_event(info, replica_heartbeat, _AnyState, Data) ->
-    arm(?REPLICA_HEARTBEAT_INTERVAL, replica_heartbeat),
-    {keep_state, Data};
-%% Monitor sweep steps apply only in the term that armed them.
-handle_event(info, {monitor_sweep, Epoch, _Cont} = Msg, leader, Data) ->
-    case epoch(Data) =:= Epoch of
-        true ->
-            {noreply, Data1} = handle_info(Msg, Data),
-            next(Data1, []);
-        false ->
-            {keep_state, Data}
-    end;
-handle_event(info, {monitor_sweep, _Epoch, _Cont}, _AnyState, Data) ->
-    {keep_state, Data};
-%% -- leader-only protocol serves -------------------------------------------
-
-%% Only a member that believes it leads answers a resync request.
-handle_event(cast, {resync_req, _FollowerId} = Msg, leader, Data) ->
-    {noreply, Data1} = handle_cast(Msg, Data),
-    next(Data1, []);
-handle_event(cast, {resync_req, _FollowerId}, _AnyState, Data) ->
-    {keep_state, Data};
-%% A forwarded registration reaching a member mid-assume is postponed until the assume
-%% resolves; if superseded, it stays silent and the forwarder re-drives.
-handle_event(cast, {register_req, _Ref, _FollowerId, _Name, _Pid, _Meta}, assuming, Data) ->
-    {keep_state, Data, [postpone]};
-%% A non-leader stays silent; the follower re-drives the unregister intent.
-handle_event(cast, {unregister_req, _Ref, _FollowerId, _Name} = Msg, leader, Data) ->
-    {noreply, Data1} = handle_cast(Msg, Data),
-    next(Data1, []);
-handle_event(cast, {unregister_req, _Ref, _FollowerId, _Name}, _AnyState, Data) ->
-    {keep_state, Data};
-%% -- the generic shim -------------------------------------------------------
-
-handle_event({call, From}, Msg, _State, Data) ->
-    case handle_call(Msg, From, Data) of
-        {reply, Reply, Data1} -> next(Data1, [{reply, From, Reply}]);
-        {noreply, Data1} -> next(Data1, [])
-    end;
-handle_event(cast, Msg, _State, Data) ->
-    {noreply, Data1} = handle_cast(Msg, Data),
-    next(Data1, []);
-handle_event(info, Msg, _State, Data) ->
-    {noreply, Data1} = handle_info(Msg, Data),
-    next(Data1, []);
-handle_event(internal, Continue, _State, Data) ->
-    {noreply, Data1} = handle_continue(Continue, Data),
-    next(Data1, []).
-
-%% `assuming` wins: a mid-assume member clears its leader view on purpose.
-state_of(#state{assume_ref = Ref}) when Ref =/= undefined -> assuming;
-state_of(#state{leader = undefined}) -> searching;
-state_of(#state{leader = Self, member_id = Self}) -> leader;
-state_of(#state{}) -> follower.
-
-%% A same-state `next_state` keeps timeouts and fires no enter call, so deriving on
-%% every event is harmless.
-next(Data, Actions) ->
-    {next_state, state_of(Data), Data, Actions}.
-
-epoch(#state{replica = R}) -> dgen_registry_replica:epoch(R).
-applied_version(#state{replica = R}) -> dgen_registry_replica:version(R).
-
-%% ---------------------------------------------------------------------------
-%% handle_continue/2
-%% ---------------------------------------------------------------------------
-
-%% Safe here: the supervisor is no longer blocked on our init/1 (see init/1).
-handle_continue(
-    discover_elector, State = #state{member_id = {_Node, Name} = MemberId, join_token = Token}
-) ->
-    Elector = dgen_registry:elector_pid(Name),
-    true = is_pid(Elector),
-    %% `fresh = true`: never synced, so this member cannot be hiding any bindings.
-    dgen_registry_elector:join(Elector, MemberId, Token, true),
-    {noreply, State#state{elector = Elector}}.
-
-%% ---------------------------------------------------------------------------
-%% handle_call/3
-%% ---------------------------------------------------------------------------
+%% The leadership lifecycle lives on the role edges, in the state functions' enter
+%% clauses: leader/3 assumes, non_leader_enter/2 relinquishes.
+handle_event(enter, OldState, State, Data) ->
+    apply(?MODULE, State, [enter, OldState, Data]);
+%% -- calls ------------------------------------------------------------------
 
 %% Readiness probe (dgen_registry:await_ready/2): a leader is known and state synced.
-handle_call(ready, _From, State = #state{leader = Leader, synced = Synced}) ->
-    {reply, Leader =/= undefined andalso Synced, State};
+handle_event({call, From}, ready, _State, Data = #data{leader = Leader, synced = Synced}) ->
+    next(Data, [{reply, From, Leader =/= undefined andalso Synced}]);
 %% Status probe (dgen_registry:status/1). Reports this member's own *belief* about
 %% leadership, which can lag the elector's committed view during a handoff (§5.1).
-handle_call(status, _From, State) ->
-    #state{member_id = Self, leader = Leader, synced = Synced} = State,
-    {reply,
-        #{
-            member_id => Self,
-            leader => Leader,
-            is_leader => Leader =:= Self,
-            epoch => epoch(State),
-            synced => Synced,
-            applied_version => applied_version(State)
-        },
-        State};
-%% ---- Name registration ----------------------------------------------------
-
+handle_event({call, From}, status, _State, Data) ->
+    #data{member_id = Self, leader = Leader, synced = Synced} = Data,
+    Status = #{
+        member_id => Self,
+        leader => Leader,
+        is_leader => Leader =:= Self,
+        epoch => epoch(Data),
+        synced => Synced,
+        applied_version => applied_version(Data)
+    },
+    next(Data, [{reply, From, Status}]);
 %% Routing (leader / follower / no leader) is in route_register/5; the only immediate
 %% reply is an adjudicated `no`.
-handle_call({register, LogicalName, Pid, Meta}, From, State) ->
-    {noreply, route_register(LogicalName, Pid, Meta, From, State)};
-%% ---- Name unregistration ----------------------------------------------------
-
-handle_call({unregister, LogicalName}, From, State) ->
-    route_unregister(LogicalName, From, State);
-%% ---- Metadata write (set_metadata) ----------------------------------------
-
-handle_call(
-    {set_metadata, LogicalName, Index, Data},
-    From,
-    State = #state{leader = Leader, member_id = Leader}
-) ->
-    {noreply, enqueue_op({set_meta, LogicalName, Index, Data, {meta, From}}, State)};
-%% Follower: forward as an intent. The reply routes back through this member so the
-%% leader's `{names_batch}` (FIFO, ahead of it) has updated our row first:
-%% read-after-write for a local snapshot read.
-handle_call({set_metadata, LogicalName, Index, Data}, From, State) ->
-    {noreply, submit_intent({set_meta, LogicalName, Index, Data}, From, State)};
-%% ---- Consistent metadata read (leader only) --------------------------------
-
-handle_call(
-    {get_metadata, LogicalName},
-    From,
-    State = #state{leader = Leader, member_id = Leader, replica = R}
-) ->
-    %% Fenced (Guarantee 5): the row is captured now, and a spawned helper verifies
-    %% leadership against the durable leader key before replying, so a deposed leader
-    %% cannot answer authoritatively.
-    reply_fenced(From, dgen_registry_replica:lookup_metadata(R, LogicalName), undefined, State),
-    {noreply, State};
-handle_call(
-    {get_metadata, LogicalName},
-    From,
-    State = #state{leader = Leader}
-) when Leader =/= undefined ->
-    %% The leader answers `From` directly; unreachable leader answers now.
-    case member_reachable(Leader) of
-        true ->
-            cast_to_member(Leader, {get_metadata_req, LogicalName, From}),
-            {noreply, State};
-        false ->
-            {reply, undefined, State}
-    end;
-handle_call({get_metadata, _LogicalName}, _From, State) ->
-    {reply, undefined, State};
-%% ---- Indexed query (on the mailbox, so batch-consistent, §6) ---------------
-
-handle_call({query, Constraints}, _From, State = #state{replica = R}) ->
-    {reply, dgen_registry_replica:query_constraints(R, Constraints), State};
-%% Consistent query: on the leader, fenced like the other consistent reads; otherwise
-%% forwarded and answered by the leader directly.
-handle_call(
-    {query_consistent, Constraints},
-    From,
-    State = #state{leader = Leader, member_id = Leader, replica = R}
-) ->
-    reply_fenced(From, dgen_registry_replica:query_constraints(R, Constraints), [], State),
-    {noreply, State};
-handle_call(
-    {query_consistent, Constraints}, From, State = #state{leader = Leader}
-) when Leader =/= undefined ->
-    case member_reachable(Leader) of
-        true ->
-            cast_to_member(Leader, {query_req, Constraints, From}),
-            {noreply, State};
-        false ->
-            {reply, [], State}
-    end;
-handle_call({query_consistent, _Constraints}, _From, State) ->
-    {reply, [], State};
-%% ---- Consistent read (leader only) ----------------------------------------
-
-handle_call(
-    {whereis, LogicalName},
-    From,
-    State = #state{leader = Leader, member_id = Leader}
-) ->
-    %% Fenced, as in the {get_metadata} leader clause.
-    reply_fenced(
-        From, dgen_registry_replica:lookup_pid(State#state.replica, LogicalName), undefined, State
-    ),
-    {noreply, State};
-handle_call(
-    {whereis, LogicalName},
-    From,
-    State = #state{leader = Leader}
-) when Leader =/= undefined ->
-    %% The leader replies to `From` directly so this loop never blocks on it.
-    case member_reachable(Leader) of
-        true ->
-            cast_to_member(Leader, {whereis_req, LogicalName, From}),
-            {noreply, State};
-        false ->
-            {reply, undefined, State}
-    end;
-handle_call({whereis, _LogicalName}, _From, State) ->
-    {reply, undefined, State};
-%% ---- Snapshot read ---------------------------------------------------------
-%% Served lock-free by the caller (`dgen_registry:whereis_name/1`); no handler here.
-
-%% ---- Handoff gather (any member) -------------------------------------------
-
-%% Our records, applied version and release trail, for a new leader's freshest-wins
-%% reconstruction (§5.7 / §4.4) and trail merge (§5.6).
-handle_call(
-    get_names_snapshot,
-    _From,
-    State = #state{replica = R, conflicts = C}
-) ->
+handle_event({call, From}, {register, LogicalName, Pid, Meta}, _State, Data) ->
+    next(route_register(LogicalName, Pid, Meta, From, Data), []);
+handle_event({call, From}, {unregister, LogicalName}, _State, Data) ->
+    {noreply, Data1} = route_unregister(LogicalName, From, Data),
+    next(Data1, []);
+%% Indexed query (on the mailbox, so batch-consistent, §6).
+handle_event({call, From}, {query, Constraints}, _State, Data = #data{replica = R}) ->
+    next(Data, [{reply, From, dgen_registry_replica:query_constraints(R, Constraints)}]);
+%% Snapshot reads are served lock-free by the caller (`dgen_registry:whereis_name/1`).
+%%
+%% Handoff gather (any member): our records, applied version and release trail, for a
+%% new leader's freshest-wins reconstruction (§5.7 / §4.4) and trail merge (§5.6).
+handle_event({call, From}, get_names_snapshot, _State, Data = #data{replica = R, conflicts = C}) ->
     %% Shipped as an off-heap binary; see dgen_registry_replica:encode/1.
     Released = dgen_registry_conflicts:trail(C),
-    {reply, {dgen_registry_replica:encode(R), dgen_registry_replica:version(R), Released},
-        State};
+    Reply = {dgen_registry_replica:encode(R), dgen_registry_replica:version(R), Released},
+    next(Data, [{reply, From, Reply}]);
+%% -- casts ------------------------------------------------------------------
 
-handle_call(_Request, _From, State) ->
-    {reply, {error, unknown_call}, State}.
-
-%% ---- Elector calls (dispatched from handle_event) ---------------------------
-
-%% Bodies of `{elector_assume_and_distribute, …}`. `MemberId` is the joiner that
-%% triggered it (`undefined` for a member_down); `AllIds` the full member list.
-%%
-%% Fast path: a continuing, synced leader for this epoch is authoritative (every
-%% follower is a prefix of its stream), so it skips the gather and re-snapshotting
-%% the followers; it only monitors and onboards the joiner.
-assume_fast_path(MemberId, AllIds, Tokens, FreshIds, Epoch, State = #state{member_id = Self}) ->
-    State1 = merge_peer_tokens(
-        Tokens, add_member_monitors(extra_member_ids(MemberId, AllIds, Self), State)
-    ),
-    %% A fresh joiner holds no bindings: onboard now. A rejoining previously-synced
-    %% member may hold divergent bindings (§5.6 partition heal), so gather its replica
-    %% off the loop and adjudicate it in {joiner_gathered} first (best-effort).
-    case MemberId =:= Self orelse lists:member(MemberId, FreshIds) of
-        true ->
-            {reply, ok, onboard_joiner(MemberId, AllIds, Tokens, State1)};
-        false ->
-            spawn_joiner_gather(MemberId, AllIds, Tokens, Epoch, State1),
-            {reply, ok, State1}
-    end.
-
-assume_genuine(MemberId, AllIds, Tokens, FreshIds, Epoch, State = #state{member_id = Self}) ->
-    %% Genuine change: the freshest-wins gather is a network fan-out, so it runs off
-    %% the loop and the elector is answered `ok` now (an inline gather would time out
-    %% its call and stall queued membership changes). Our own records and version are
-    %% captured now so a broadcast landing mid-gather cannot skew freshest-wins.
-    SelfRecords = dgen_registry_replica:records(State#state.replica),
-    OtherIds = lists:delete(Self, AllIds),
-    Ref = make_ref(),
-    spawn_assume_gather(
-        {MemberId, AllIds, Tokens, FreshIds, Epoch, Ref},
-        SelfRecords,
-        applied_version(State),
-        OtherIds,
-        State#state.elector,
-        self(),
-        State#state.tenant,
-        State#state.tuid,
-        State#state.conflicts
-    ),
-    %% No leader for the window: writes block and are re-driven by the continuation
-    %% rather than forwarded to the old, possibly-dead leader.
-    {reply, ok, State#state{assume_ref = Ref, leader = undefined}}.
-
-%% ---------------------------------------------------------------------------
-%% handle_cast/2
-%% ---------------------------------------------------------------------------
-
-%% Leader: a forwarded registration, answered via {register_reply} once committed.
-handle_cast(
-    {register_req, Ref, FollowerId, LogicalName, Pid, Meta},
-    State = #state{leader = Leader, member_id = Leader}
-) ->
-    case reject_new_when_degraded(LogicalName, State) of
-        true ->
-            cast_to_member(FollowerId, {register_reply, Ref, no}),
-            {noreply, State};
-        false ->
-            {noreply, enqueue_op({add, LogicalName, Pid, Meta, {forward, FollowerId, Ref}}, State)}
-    end;
-%% Not the leader: stay silent rather than give a non-adjudicated `no` (§3); the
-%% follower re-drives its intent.
-handle_cast({register_req, _Ref, _FollowerId, _LogicalName, _Pid, _Meta}, State) ->
-    {noreply, State};
-%% Leader: a forwarded unregister, answered via {unregister_reply} once committed.
-handle_cast(
-    {unregister_req, Ref, FollowerId, LogicalName},
-    State = #state{leader = Leader, member_id = Leader, replica = R}
-) ->
-    ReleasedPid = dgen_registry_replica:lookup_pid(R, LogicalName),
-    {noreply,
-        enqueue_op(
-            {remove, LogicalName, ReleasedPid, {forward_unreg, FollowerId, Ref}},
-            row_delete(State, LogicalName)
-        )};
 %% Follower: a forwarded unregister committed (FIFO: after its {names_batch}).
-handle_cast({unregister_reply, Ref}, State) ->
-    {noreply, intent_reply(Ref, unregister, State)};
-%% Leader: a forwarded set_metadata, answered via {set_meta_reply} once committed.
-handle_cast(
-    {set_meta_req, Ref, FollowerId, LogicalName, Index, Data},
-    State = #state{leader = Leader, member_id = Leader}
-) ->
-    {noreply,
-        enqueue_op({set_meta, LogicalName, Index, Data, {forward_meta, FollowerId, Ref}}, State)};
-%% Not the leader (stale belief): reject so the caller retries.
-handle_cast({set_meta_req, Ref, FollowerId, _LogicalName, _Index, _Data}, State) ->
-    cast_to_member(FollowerId, {set_meta_reply, Ref, {error, no_leader}}),
-    {noreply, State};
+handle_event(cast, {unregister_reply, Ref}, _State, Data) ->
+    next(intent_reply(Ref, unregister, Data), []);
 %% Follower: FIFO puts the matching {names_batch} ahead of this, so read-after-write
 %% holds for a local get_metadata.
-handle_cast({set_meta_reply, Ref, Result}, State) ->
-    {noreply, intent_reply(Ref, {set_meta, Result}, State)};
-%% Leader: forwarded consistent reads answer the caller's `From` directly, fenced.
-handle_cast(
-    {get_metadata_req, LogicalName, From},
-    State = #state{leader = Leader, member_id = Leader, replica = R}
-) ->
-    reply_fenced(From, dgen_registry_replica:lookup_metadata(R, LogicalName), undefined, State),
-    {noreply, State};
-handle_cast({get_metadata_req, _LogicalName, From}, State) ->
-    gen_server:reply(From, undefined),
-    {noreply, State};
-handle_cast(
-    {query_req, Constraints, From},
-    State = #state{leader = Leader, member_id = Leader, replica = R}
-) ->
-    reply_fenced(From, dgen_registry_replica:query_constraints(R, Constraints), [], State),
-    {noreply, State};
-handle_cast({query_req, _Constraints, From}, State) ->
-    gen_server:reply(From, []),
-    {noreply, State};
-handle_cast(
-    {whereis_req, LogicalName, From},
-    State = #state{leader = Leader, member_id = Leader, replica = R}
-) ->
-    reply_fenced(From, dgen_registry_replica:lookup_pid(R, LogicalName), undefined, State),
-    {noreply, State};
-%% Not the leader (stale belief): `undefined`; the caller can retry.
-handle_cast({whereis_req, _LogicalName, From}, State) ->
-    gen_server:reply(From, undefined),
-    {noreply, State};
+handle_event(cast, {set_meta_reply, Ref, Result}, _State, Data) ->
+    next(intent_reply(Ref, {set_meta, Result}, Data), []);
 %% Follower: a forwarded registration's verdict at commit Version. A `yes` is
 %% version-guarded (§5.5): answered only once our replica has applied Version, so we
 %% are a second holder the handoff gather (§5.7) is guaranteed to see. Normally true
 %% (FIFO: the batch precedes the reply); if the batch was gap-refused the ack waits
 %% for the resync. See dgen_registry_intents.
-handle_cast({register_reply, Ref, Result, Version}, State) ->
-    {noreply, intent_reply(Ref, {register, Result, Version}, State)};
+handle_event(cast, {register_reply, Ref, Result, Version}, _State, Data) ->
+    next(intent_reply(Ref, {register, Result, Version}, Data), []);
 %% Rolling upgrade: unversioned reply from a pre-version leader; `legacy`, not 0 (see
 %% dgen_registry_intents:on_reply/4).
-handle_cast({register_reply, Ref, Result}, State) ->
-    {noreply, intent_reply(Ref, {register, Result, legacy}, State)};
+handle_event(cast, {register_reply, Ref, Result}, _State, Data) ->
+    next(intent_reply(Ref, {register, Result, legacy}, Data), []);
 %% Follower: confirm we hold a batch's bindings (FIFO: after its {names_batch}).
 %% Version-guarded: if we have not applied that version (gap, stale epoch) we must not
 %% claim to hold them.
-handle_cast(
-    {replicate_sync, BatchRef, LeaderId, Version},
-    State = #state{member_id = Self}
+handle_event(
+    cast, {replicate_sync, BatchRef, LeaderId, Version}, _State, Data = #data{member_id = Self}
 ) ->
-    case applied_version(State) >= Version of
+    case applied_version(Data) >= Version of
         true -> cast_to_member(LeaderId, {replicate_ack, BatchRef, Self});
         false -> ok
     end,
-    {noreply, State};
+    next(Data, []);
 %% Leader: once `register_replicas` distinct followers ack, answer the batch's direct
 %% registrations `yes`.
-handle_cast({replicate_ack, BatchRef, FollowerId}, State = #state{pipeline = P}) ->
+handle_event(cast, {replicate_ack, BatchRef, FollowerId}, _State, Data = #data{pipeline = P}) ->
     case dgen_registry_pipeline:ack(BatchRef, FollowerId, P) of
         {done, Direct, TimerRef, P1} ->
             erlang:cancel_timer(TimerRef),
             deliver_direct(Direct),
-            {noreply, State#state{pipeline = P1}};
+            next(Data#data{pipeline = P1}, []);
         {waiting, P1} ->
-            {noreply, State#state{pipeline = P1}}
+            next(Data#data{pipeline = P1}, [])
     end;
 %% Replication broadcast: one message per committed batch. dgen_registry_replica
 %% admits it only if contiguous (PrevV), so our replica stays a prefix of the leader's
 %% stream; a gap requests a resync. Applying it as a unit keeps "same applied_version
 %% implies same content" true (see broadcast_batch/5).
-handle_cast({names_batch, Ops, Epoch, PrevV, Version, LeaderId}, State = #state{replica = R}) ->
-    State1 =
+handle_event(
+    cast, {names_batch, Ops, Epoch, PrevV, Version, LeaderId}, _State, Data = #data{replica = R}
+) ->
+    Data1 =
         case dgen_registry_replica:offer_batch(Epoch, PrevV, Version, Ops, R) of
             {applied, R1} ->
-                intents_advanced(record_released(Ops, cancel_resync(State#state{replica = R1})));
+                intents_advanced(record_released(Ops, cancel_resync(Data#data{replica = R1})));
             gap ->
-                request_resync(LeaderId, State);
+                request_resync(LeaderId, Data);
             _StaleEpochOrDuplicate ->
-                State
+                Data
         end,
-    {noreply, State1};
-%% Leader: answer a resync request with a snapshot at our epoch and applied version.
-handle_cast(
-    {resync_req, FollowerId},
-    State = #state{leader = Leader, member_id = Leader, replica = R}
-) ->
-    RecordsBin = dgen_registry_replica:encode(R),
-    cast_to_member(
-        FollowerId,
-        {apply_names_snapshot, RecordsBin, Leader, [], #{}, dgen_registry_replica:epoch(R),
-            dgen_registry_replica:version(R)}
-    ),
-    {noreply, State};
-%% A pid-guarded retract (strict_replication fail-closed, §8) forwarded by a member
-%% that could not commit it, so a binding answered `no` cannot live on. The pid guard
-%% never clobbers a name since re-registered.
-handle_cast(
-    {retract_req, LogicalName, Pid}, State = #state{leader = Leader, member_id = Leader}
-) ->
-    {noreply, enqueue_op({retract, LogicalName, Pid}, State)};
-handle_cast({retract_req, LogicalName, Pid}, State = #state{leader = Leader}) when
-    Leader =/= undefined
-->
-    cast_to_member(Leader, {retract_req, LogicalName, Pid}),
-    {noreply, State};
-handle_cast({retract_req, LogicalName, Pid}, State) ->
-    %% No leader (likely mid-handoff): hold it as an answered unregister intent so
-    %% it is re-driven rather than lost.
-    {noreply, submit_intent({unregister, LogicalName, Pid}, answered, State)};
+    next(Data1, []);
 %% Leadership snapshot from the new leader: replica, leader transition and member
 %% monitors apply in one cast, so nothing interleaves. The version re-baselines us.
-handle_cast(
+handle_event(
+    cast,
     {apply_names_snapshot, RecordsPayload, NewLeader, ExtraMembers, Tokens, Epoch, Version},
-    State = #state{member_id = Self, leader = OldLeader, replica = R}
+    _State,
+    Data = #data{member_id = Self, leader = OldLeader, replica = R}
 ) ->
     %% Version-monotonic, not merely epoch-guarded: a late snapshot can never roll the
     %% replica backward (the handoff-gather race in the TLA+ spec). A refused one is
@@ -737,167 +356,371 @@ handle_cast(
         {accepted, R1} ->
             %% Replica before the leader transition: assume_leadership reads the
             %% names back from the table.
-            State0 = cancel_resync(State#state{replica = R1}),
-            State1 = do_leader_changed(NewLeader, OldLeader, Self, State0),
+            Data0 = cancel_resync(Data#data{replica = R1}),
+            Data1 = do_leader_changed(NewLeader, OldLeader, Self, Data0),
             %% Supersedes any in-flight assume gather.
-            State2 = State1#state{assume_ref = undefined},
-            State3 = add_member_monitors(ExtraMembers, State2),
-            State4 = merge_peer_tokens(Tokens, State3),
-            {noreply,
-                maybe_start_commit(redrive_intents(moved, intents_advanced(mark_synced(State4))))};
+            Data2 = Data1#data{assume_ref = undefined},
+            Data3 = add_member_monitors(ExtraMembers, Data2),
+            Data4 = merge_peer_tokens(Tokens, Data3),
+            next(
+                maybe_start_commit(redrive_intents(moved, intents_advanced(mark_synced(Data4)))),
+                []
+            );
         stale ->
-            {noreply, State}
+            next(Data, [])
     end;
-%% Rolling upgrade: legacy fire-and-forget unregister casts from pre-call nodes.
-handle_cast(
-    {unregister, LogicalName},
-    State = #state{leader = Leader, member_id = Leader, replica = R}
-) ->
-    %% Capture the bound pid before the optimistic delete, or plan_op/3 could not
-    %% tell a real unregister from a no-op.
-    ReleasedPid = dgen_registry_replica:lookup_pid(R, LogicalName),
-    {noreply,
-        enqueue_op({remove, LogicalName, ReleasedPid, undefined}, row_delete(State, LogicalName))};
-handle_cast({unregister, LogicalName}, State = #state{leader = Leader}) when
-    Leader =/= undefined
-->
-    cast_to_member(Leader, {unregister, LogicalName}),
-    {noreply, row_delete(State, LogicalName)};
 %% Leader fast path onboarding a joiner: an up-to-date follower only monitors it and
 %% records its token (so a later DOWN is fenced with the elector's token).
-handle_cast({peer_joined, MemberId, Tokens}, State) ->
-    {noreply, merge_peer_tokens(Tokens, add_member_monitors([MemberId], State))};
-%% Presence subscription delta from the elector (§4.9); a stale push to a deposed
-%% leader is dropped (the next leader is reseeded on assume).
-handle_cast({presence_update, Update, Epoch}, State = #state{member_id = Self, leader = Self}) ->
-    case Epoch >= epoch(State) of
-        true -> {noreply, apply_presence_update(Update, State)};
-        false -> {noreply, State}
-    end;
-handle_cast({presence_update, _Update, _Epoch}, State) ->
-    {noreply, State};
-handle_cast(_, State) ->
-    {noreply, State}.
-
-apply_presence_update({subscribe, SubId, Watch, Notify}, State = #state{subs = Subs}) ->
-    seed_subscription(SubId, State#state{subs = Subs#{SubId => {Watch, Notify}}});
-apply_presence_update(
-    {unsubscribe, SubId}, State = #state{subs = Subs, sub_matches = SM, notify_matches = NM}
-) ->
-    State#state{
-        subs = maps:remove(SubId, Subs),
-        sub_matches = maps:remove(SubId, SM),
-        notify_matches = maps:remove(SubId, NM)
-    };
-apply_presence_update(unsubscribe_all, State) ->
-    State#state{subs = #{}, sub_matches = #{}, notify_matches = #{}}.
-
-%% ---------------------------------------------------------------------------
-%% handle_info/2
-%% ---------------------------------------------------------------------------
+handle_event(cast, {peer_joined, MemberId, Tokens}, _State, Data) ->
+    next(merge_peer_tokens(Tokens, add_member_monitors([MemberId], Data)), []);
+%% -- infos ------------------------------------------------------------------
 
 %% Too few replica acks for these direct registrations in time (§8): degrade open
 %% (ack `yes` leader-only, telemetry) or, with `strict_replication`, fail closed
 %% (reject and retract).
-handle_info({replicate_timeout, BatchRef}, State = #state{pipeline = P, config = Config}) ->
+handle_event(
+    info, {replicate_timeout, BatchRef}, _State, Data = #data{pipeline = P, config = Config}
+) ->
     case dgen_registry_pipeline:ack_timeout(BatchRef, P) of
         {expired, Direct, Needed, Got, P1} ->
-            State1 = State#state{pipeline = P1},
+            Data1 = Data#data{pipeline = P1},
             case dgen_config:strict_replication(Config) of
                 false ->
                     notify_degrade_open(Needed, Got, length(Direct)),
                     deliver_direct(Direct),
-                    {noreply, State1};
+                    next(Data1, []);
                 true ->
-                    {noreply, reject_and_retract_direct(Direct, State1)}
+                    next(reject_and_retract_direct(Direct, Data1), [])
             end;
         none ->
-            {noreply, State}
+            next(Data, [])
     end;
-handle_info({dgen_transaction, Ref, Reply}, State = #state{pipeline = P}) ->
+handle_event(info, {dgen_transaction, Ref, Reply}, _State, Data = #data{pipeline = P}) ->
     case dgen_registry_pipeline:finish(Ref, P) of
         {ok, Plan, MRef, P1} ->
             %% The result precedes the worker's DOWN, so flush drops it.
             erlang:demonitor(MRef, [flush]),
-            State1 = commit_result(Reply, Plan, State#state{pipeline = P1}),
-            {noreply, maybe_start_commit(State1)};
+            Data1 = commit_result(Reply, Plan, Data#data{pipeline = P1}),
+            next(maybe_start_commit(Data1), []);
         stale ->
-            {noreply, State}
+            next(Data, [])
     end;
-
 %% A registered process died (leader only). The DOWN carries Ref so the plan's
 %% ref-match guard ignores a stale DOWN for a name already re-bound. If we no longer
 %% lead, the new leader (which monitors the pid itself) drives the removal.
-handle_info({{down, LogicalName}, Ref, process, _Pid, _Reason}, State) ->
-    {noreply, enqueue_op({down, LogicalName, Ref}, State)};
-handle_info({'DOWN', Ref, process, _Pid, _Reason}, State) ->
-    #state{
+handle_event(info, {{down, LogicalName}, Ref, process, _Pid, _Reason}, _State, Data) ->
+    next(enqueue_op({down, LogicalName, Ref}, Data), []);
+handle_event(info, {'DOWN', Ref, process, _Pid, _Reason}, _State, Data) ->
+    #data{
         monitors = Monitors,
         elector = Elector,
         member_id = Self
-    } = State,
+    } = Data,
     case maps:get(Ref, Monitors, undefined) of
         undefined ->
             %% Not a peer monitor: the commit worker, or a late straggler.
-            case dgen_registry_pipeline:worker_down(Ref, State#state.pipeline) of
+            case dgen_registry_pipeline:worker_down(Ref, Data#data.pipeline) of
                 {ok, Plan, P1} ->
-                    State1 = State#state{pipeline = P1},
-                    {noreply, maybe_start_commit(surrender(failed, maps:get(ops, Plan), State1))};
+                    Data1 = Data#data{pipeline = P1},
+                    next(maybe_start_commit(surrender(failed, maps:get(ops, Plan), Data1)), []);
                 stale ->
-                    {noreply, State}
+                    next(Data, [])
             end;
         Self ->
-            {noreply, State};
+            next(Data, []);
         DeadMemberId ->
             %% Fence {member_down} with the elector's *current* token for the peer, not
             %% our cached one, which a dropped snapshot may have left stale (a stale
             %% token would strand a dead member and block failover, §5.7). The read runs
             %% in a helper, never inline: a call to the elector could deadlock against
             %% its own `{elector_assume_and_distribute}` call into this member.
-            Cached = maps:get(DeadMemberId, State#state.peer_tokens, undefined),
+            Cached = maps:get(DeadMemberId, Data#data.peer_tokens, undefined),
             spawn_member_down(Elector, DeadMemberId, Cached),
-            {noreply, remove_member(DeadMemberId, State)}
+            next(remove_member(DeadMemberId, Data), [])
     end;
-handle_info({nodeup, _Node}, State = #state{elector = Elector, member_id = Self}) ->
+handle_event(info, {nodeup, _Node}, _State, Data = #data{elector = Elector, member_id = Self}) ->
     %% We may have been removed during a partition: re-announce with a fresh token
     %% so a queued stale {member_down, Self, OldToken} is discarded.
     NewToken = make_ref(),
-    dgen_registry_elector:join(Elector, Self, NewToken, not State#state.synced),
+    dgen_registry_elector:join(Elector, Self, NewToken, not Data#data.synced),
     %% Partition heal: if our leader is reachable, re-drive intents now (idempotent)
     %% so a held or swallowed unregister is never lost (Non-goal 5), without waiting
     %% for the re-onboarding snapshot.
-    State1 = State#state{join_token = NewToken},
-    {noreply,
-        case intent_route(State1) of
-            none -> State1;
-            _Reachable -> redrive_intents(all, State1)
-        end};
+    Data1 = Data#data{join_token = NewToken},
+    case intent_route(Data1) of
+        none -> next(Data1, []);
+        _Reachable -> next(redrive_intents(all, Data1), [])
+    end;
+%% Periodic maintenance: prune the release trail and kill budget (§5.6) and stale
+%% intents.
+handle_event(
+    info, prune_released, _State, Data = #data{conflicts = C, members = Members, config = Config}
+) ->
+    schedule_timer(?PRUNE_INTERVAL, prune_released),
+    Now = erlang:system_time(millisecond),
+    AllConnected = lists:all(
+        fun({Node, _Name}) -> dgen_utils:node_reachable(Node) end,
+        maps:keys(Members)
+    ),
+    C1 = dgen_registry_conflicts:prune(Now, AllConnected, Config, C),
+    next(prune_intents(Data#data{conflicts = C1}), []);
+%% Unanswered resync request: clear the guard so the next gap (or heartbeat) retries.
+handle_event(info, resync_timeout, _State, Data) ->
+    next(Data#data{resync_timer = undefined}, []);
+%% From the connector: the durable election epoch is ahead of ours, so a handoff never
+%% reached us. Re-announcing triggers a fresh assume/fan-out.
+handle_event(info, {durable_epoch, DurableEpoch}, _State, Data) when is_integer(DurableEpoch) ->
+    case DurableEpoch > epoch(Data) of
+        true ->
+            #data{elector = Elector, member_id = Self, join_token = Token, synced = Synced} =
+                Data,
+            dgen_registry_elector:join(Elector, Self, Token, not Synced);
+        false ->
+            ok
+    end,
+    next(Data, []);
+handle_event(info, {durable_epoch, _DurableEpoch}, _State, Data) ->
+    next(Data, []);
+%% -- internal ---------------------------------------------------------------
+
+%% Safe here: the supervisor is no longer blocked on our init/1 (see init/1).
+handle_event(
+    internal,
+    discover_elector,
+    _State,
+    Data = #data{member_id = {_Node, Name} = MemberId, join_token = Token}
+) ->
+    Elector = dgen_registry:elector_pid(Name),
+    true = is_pid(Elector),
+    %% `fresh = true`: never synced, so this member cannot be hiding any bindings.
+    dgen_registry_elector:join(Elector, MemberId, Token, true),
+    next(Data#data{elector = Elector}, []);
+%% -- everything else is the current state's ----------------------------------
+
+handle_event(EventType, EventContent, State, Data) ->
+    apply(?MODULE, State, [EventType, EventContent, Data]).
+
+%% `assuming` wins: a mid-assume member clears its leader view on purpose.
+state_of(#data{assume_ref = Ref}) when Ref =/= undefined -> assuming;
+state_of(#data{leader = undefined}) -> searching;
+state_of(#data{leader = Self, member_id = Self}) -> leader;
+state_of(#data{}) -> follower.
+
+%% A same-state `next_state` keeps timeouts and fires no enter call, so deriving on
+%% every event is harmless.
+next(Data, Actions) ->
+    {next_state, state_of(Data), Data, Actions}.
+
+epoch(#data{replica = R}) -> dgen_registry_replica:epoch(R).
+applied_version(#data{replica = R}) -> dgen_registry_replica:version(R).
+
+%% ---------------------------------------------------------------------------
+%% State functions
+%% ---------------------------------------------------------------------------
+%%
+%% Called from handle_event/4 for the enter call and for every event it does not
+%% handle itself. Because the state is derived from data, `leader` is exactly
+%% `leader = member_id`, `follower` a known other leader, and `searching`/`assuming`
+%% no leader (`assume_ref` is only ever armed alongside `leader = undefined`).
+%%
+%% Fallthrough: searching and assuming -> leaderless/3 -> non_leader/3 -> unhandled/3;
+%% follower -> non_leader/3; leader -> unhandled/3.
+
+%% -- leader -----------------------------------------------------------------
+
+%% The assume/relinquish pairing lives on the role edges so no transition path can
+%% forget half of it. Deliberately not here: redrive_intents (fires on non-edge
+%% leadership events too) and fail_pending_acks (stays in do_leader_changed; a
+%% re-assumed leader's stale acks are already fenced by BatchRef).
+leader(enter, _OldState, Data) ->
+    {keep_state, assume_leadership(Data)};
+%% A continuing leader absorbs a join on the fast path; otherwise a genuine change.
+%% The epoch guard stays on Data: the `leader` state does not say which term.
+leader(
+    {call, From},
+    {elector_assume_and_distribute, MemberId, AllIds, Tokens, FreshIds, Epoch},
+    Data = #data{synced = Synced}
+) ->
+    {reply, Reply, Data1} =
+        case Synced andalso MemberId =/= undefined andalso epoch(Data) =:= Epoch of
+            true -> assume_fast_path(MemberId, AllIds, Tokens, FreshIds, Epoch, Data);
+            false -> assume_genuine(MemberId, AllIds, Tokens, FreshIds, Epoch, Data)
+        end,
+    next(Data1, [{reply, From, Reply}]);
+leader({call, From}, {set_metadata, LogicalName, Index, MetaData}, Data) ->
+    next(enqueue_op({set_meta, LogicalName, Index, MetaData, {meta, From}}, Data), []);
+%% Consistent reads are fenced (Guarantee 5): the value is captured now, and a spawned
+%% helper verifies leadership against the durable leader key before replying, so a
+%% deposed leader cannot answer authoritatively.
+leader({call, From}, {get_metadata, LogicalName}, Data = #data{replica = R}) ->
+    reply_fenced(From, dgen_registry_replica:lookup_metadata(R, LogicalName), undefined, Data),
+    next(Data, []);
+leader({call, From}, {query_consistent, Constraints}, Data = #data{replica = R}) ->
+    reply_fenced(From, dgen_registry_replica:query_constraints(R, Constraints), [], Data),
+    next(Data, []);
+leader({call, From}, {whereis, LogicalName}, Data = #data{replica = R}) ->
+    reply_fenced(From, dgen_registry_replica:lookup_pid(R, LogicalName), undefined, Data),
+    next(Data, []);
+%% A forwarded registration, answered via {register_reply} once committed.
+leader(cast, {register_req, Ref, FollowerId, LogicalName, Pid, Meta}, Data) ->
+    case reject_new_when_degraded(LogicalName, Data) of
+        true ->
+            cast_to_member(FollowerId, {register_reply, Ref, no}),
+            next(Data, []);
+        false ->
+            next(enqueue_op({add, LogicalName, Pid, Meta, {forward, FollowerId, Ref}}, Data), [])
+    end;
+%% A forwarded unregister, answered via {unregister_reply} once committed.
+leader(cast, {unregister_req, Ref, FollowerId, LogicalName}, Data = #data{replica = R}) ->
+    ReleasedPid = dgen_registry_replica:lookup_pid(R, LogicalName),
+    next(
+        enqueue_op(
+            {remove, LogicalName, ReleasedPid, {forward_unreg, FollowerId, Ref}},
+            row_delete(Data, LogicalName)
+        ),
+        []
+    );
+%% A forwarded set_metadata, answered via {set_meta_reply} once committed.
+leader(cast, {set_meta_req, Ref, FollowerId, LogicalName, Index, MetaData}, Data) ->
+    next(
+        enqueue_op(
+            {set_meta, LogicalName, Index, MetaData, {forward_meta, FollowerId, Ref}}, Data
+        ),
+        []
+    );
+%% Forwarded consistent reads answer the caller's `From` directly, fenced.
+leader(cast, {get_metadata_req, LogicalName, From}, Data = #data{replica = R}) ->
+    reply_fenced(From, dgen_registry_replica:lookup_metadata(R, LogicalName), undefined, Data),
+    next(Data, []);
+leader(cast, {query_req, Constraints, From}, Data = #data{replica = R}) ->
+    reply_fenced(From, dgen_registry_replica:query_constraints(R, Constraints), [], Data),
+    next(Data, []);
+leader(cast, {whereis_req, LogicalName, From}, Data = #data{replica = R}) ->
+    reply_fenced(From, dgen_registry_replica:lookup_pid(R, LogicalName), undefined, Data),
+    next(Data, []);
+%% Answer a resync request with a snapshot at our epoch and applied version.
+leader(cast, {resync_req, FollowerId}, Data = #data{leader = Leader, replica = R}) ->
+    RecordsBin = dgen_registry_replica:encode(R),
+    cast_to_member(
+        FollowerId,
+        {apply_names_snapshot, RecordsBin, Leader, [], #{}, dgen_registry_replica:epoch(R),
+            dgen_registry_replica:version(R)}
+    ),
+    next(Data, []);
+%% A pid-guarded retract (strict_replication fail-closed, §8) forwarded by a member
+%% that could not commit it, so a binding answered `no` cannot live on. The pid guard
+%% never clobbers a name since re-registered.
+leader(cast, {retract_req, LogicalName, Pid}, Data) ->
+    next(enqueue_op({retract, LogicalName, Pid}, Data), []);
+%% Rolling upgrade: legacy fire-and-forget unregister casts from pre-call nodes.
+leader(cast, {unregister, LogicalName}, Data = #data{replica = R}) ->
+    %% Capture the bound pid before the optimistic delete, or plan_op/3 could not
+    %% tell a real unregister from a no-op.
+    ReleasedPid = dgen_registry_replica:lookup_pid(R, LogicalName),
+    next(
+        enqueue_op({remove, LogicalName, ReleasedPid, undefined}, row_delete(Data, LogicalName)),
+        []
+    );
+%% Presence subscription delta from the elector (§4.9); a stale push is dropped (the
+%% next leader is reseeded on assume).
+leader(cast, {presence_update, Update, Epoch}, Data) ->
+    case Epoch >= epoch(Data) of
+        true -> next(apply_presence_update(Update, Data), []);
+        false -> next(Data, [])
+    end;
 %% Fast-path continuation for a rejoining (non-fresh) member: adjudicate its replica
 %% against our authoritative table (§5.6), merge its trail, then onboard it. A killed
-%% authority's DOWN drives the normal cleanup. handle_event/4 checked the epoch.
-handle_info(
-    {joiner_gathered, MemberId, AllIds, Tokens, _Epoch, Result},
-    State = #state{member_id = Self, leader = Self, members = Members}
+%% authority's DOWN drives the normal cleanup. Applies only in the term that spawned it.
+leader(
+    info,
+    {joiner_gathered, MemberId, AllIds, Tokens, Epoch, Result},
+    Data = #data{members = Members}
 ) when is_map_key(MemberId, Members) ->
-    State1 =
-        case Result of
-            {ok, {Records, _Version, Released}, Alive} ->
-                %% The resolved map is discarded: repair only kills and alarms.
-                OwnRecords = dgen_registry_replica:records(State#state.replica),
-                {_Records, S1} = repair_conflicts(OwnRecords, [Records], [Released], Alive, State),
-                S1;
-            error ->
-                %% Unanswered: onboard anyway; divergence surfaces at the next gather.
-                State
-        end,
-    {noreply, onboard_joiner(MemberId, AllIds, Tokens, State1)};
-%% The off-loop handoff gather returned (only while `assume_ref` matches). The
-%% freshest map is the reconstructed state: broadcasts are totally ordered and every
-%% replica is a prefix of the stream. MaxVersion re-baselines the followers.
-handle_info(
+    case epoch(Data) =:= Epoch of
+        true ->
+            Data1 =
+                case Result of
+                    {ok, {Records, _Version, Released}, Alive} ->
+                        %% The resolved map is discarded: repair only kills and alarms.
+                        OwnRecords = dgen_registry_replica:records(Data#data.replica),
+                        {_Records, D1} = repair_conflicts(
+                            OwnRecords, [Records], [Released], Alive, Data
+                        ),
+                        D1;
+                    error ->
+                        %% Unanswered: onboard anyway; divergence surfaces at the next
+                        %% gather.
+                        Data
+                end,
+            next(onboard_joiner(MemberId, AllIds, Tokens, Data1), []);
+        false ->
+            {keep_state, Data}
+    end;
+%% Deferred monitor sweep (see assume_leadership/1), one chunk per message, only in
+%% the term that armed it. A name already monitored (committed since the sweep began)
+%% or re-bound since its chunk was selected is skipped. A pid that died before its
+%% chunk fires an immediate `noproc` DOWN, so deferral loses nothing.
+leader(info, {monitor_sweep, Epoch, Cont0}, Data = #data{replica = R}) ->
+    case epoch(Data) =:= Epoch of
+        true -> next(monitor_sweep(Epoch, Cont0, R, Data), []);
+        false -> {keep_state, Data}
+    end;
+%% Retry a failed batch's ops while we still lead, dropping registrations whose caller
+%% died.
+leader(info, {requeue_ops, Ops}, Data) ->
+    Live = [Op || Op <- Ops, caller_alive(Op)],
+    next(maybe_start_commit(lists:foldl(fun enqueue_op/2, Data, Live)), []);
+%% Everyone keeps the timer running so a later election heartbeats immediately.
+leader(info, replica_heartbeat, Data) ->
+    broadcast_heartbeat(Data),
+    schedule_timer(?REPLICA_HEARTBEAT_INTERVAL, replica_heartbeat),
+    {keep_state, Data};
+leader(EventType, EventContent, Data) ->
+    unhandled(EventType, EventContent, Data).
+
+%% -- follower ---------------------------------------------------------------
+
+follower(enter, OldState, Data) ->
+    non_leader_enter(OldState, Data);
+%% Consistent reads: the leader answers `From` directly so this loop never blocks on
+%% it; an unreachable leader is answered now.
+follower({call, From}, {get_metadata, LogicalName}, Data = #data{leader = Leader}) ->
+    forward_read(Leader, {get_metadata_req, LogicalName, From}, From, undefined, Data);
+follower({call, From}, {query_consistent, Constraints}, Data = #data{leader = Leader}) ->
+    forward_read(Leader, {query_req, Constraints, From}, From, [], Data);
+follower({call, From}, {whereis, LogicalName}, Data = #data{leader = Leader}) ->
+    forward_read(Leader, {whereis_req, LogicalName, From}, From, undefined, Data);
+follower(cast, {retract_req, LogicalName, Pid}, Data = #data{leader = Leader}) ->
+    cast_to_member(Leader, {retract_req, LogicalName, Pid}),
+    next(Data, []);
+follower(cast, {unregister, LogicalName}, Data = #data{leader = Leader}) ->
+    cast_to_member(Leader, {unregister, LogicalName}),
+    next(row_delete(Data, LogicalName), []);
+follower(EventType, EventContent, Data) ->
+    non_leader(EventType, EventContent, Data).
+
+%% -- searching --------------------------------------------------------------
+
+searching(enter, OldState, Data) ->
+    non_leader_enter(OldState, Data);
+searching(EventType, EventContent, Data) ->
+    leaderless(EventType, EventContent, Data).
+
+%% -- assuming ---------------------------------------------------------------
+
+%% A leader entering `assuming` relinquishes at assume start; a death in the gather
+%% window is caught by the next sweep's immediate `noproc` DOWN.
+assuming(enter, OldState, Data) ->
+    non_leader_enter(OldState, Data);
+%% The off-loop handoff gather returned, for the assume that armed it (the ref);
+%% otherwise it was superseded and is dropped. The freshest map is the reconstructed
+%% state: broadcasts are totally ordered and every replica is a prefix of the stream.
+%% MaxVersion re-baselines the followers.
+assuming(
+    info,
     {assume_gathered, {MemberId, AllIds, Tokens, FreshIds, Epoch, Ref}, SelfRecords,
         FreshestRecords, {MaxVersion, Frontier}, PeerResults, Subs, Alive},
-    State = #state{member_id = Self, assume_ref = Ref}
+    Data = #data{member_id = Self, assume_ref = Ref}
 ) ->
     OtherIds = lists:delete(Self, AllIds),
     Peers = maps:values(PeerResults),
@@ -905,24 +728,24 @@ handle_info(
         MaxVersion, Frontier, OtherIds, FreshIds, PeerResults
     ),
     %% Repair the conflicts the gather exposes (§5.6): conflicted names are dropped.
-    {Records, State0} = repair_conflicts(
+    {Records, Data0} = repair_conflicts(
         FreshestRecords,
         [SelfRecords | [Recs || {Recs, _V, _Rel} <- Peers]],
         [Rel || {_Recs, _V, Rel} <- Peers],
         Alive,
-        State
+        Data
     ),
     %% Clearing assume_ref enters `leader`, whose enter call runs assume_leadership
     %% against the reconstructed replica and `Subs` (§4.9).
-    State2 = State0#state{
-        replica = dgen_registry_replica:adopt(Epoch, MaxVersion, Records, State0#state.replica),
+    Data2 = Data0#data{
+        replica = dgen_registry_replica:adopt(Epoch, MaxVersion, Records, Data0#data.replica),
         leader = Self,
-        conflicts = dgen_registry_conflicts:set_degraded(Degraded, State0#state.conflicts),
+        conflicts = dgen_registry_conflicts:set_degraded(Degraded, Data0#data.conflicts),
         assume_ref = undefined,
         subs = Subs
     },
-    State3 = add_member_monitors(extra_member_ids(MemberId, AllIds, Self), State2),
-    State4 = merge_peer_tokens(Tokens, State3),
+    Data3 = add_member_monitors(extra_member_ids(MemberId, AllIds, Self), Data2),
+    Data4 = merge_peer_tokens(Tokens, Data3),
     %% Encode once; every cast shares the refc binary.
     RecordsBin = dgen_registry_replica:encode_records(Records),
     lists:foreach(
@@ -936,29 +759,152 @@ handle_info(
         OtherIds
     ),
     %% Re-drive every unresolved intent into our own pipeline.
-    {noreply, maybe_start_commit(redrive_intents(moved, mark_synced(cancel_resync(State4))))};
-%% Periodic maintenance: prune the release trail and kill budget (§5.6) and stale
-%% intents.
-handle_info(prune_released, State = #state{conflicts = C, members = Members, config = Config}) ->
-    arm(?PRUNE_INTERVAL, prune_released),
-    Now = erlang:system_time(millisecond),
-    AllConnected = lists:all(
-        fun({Node, _Name}) -> dgen_utils:node_reachable(Node) end,
-        maps:keys(Members)
-    ),
-    C1 = dgen_registry_conflicts:prune(Now, AllConnected, Config, C),
-    {noreply, prune_intents(State#state{conflicts = C1})};
-%% Unanswered resync request: clear the guard so the next gap (or heartbeat) retries.
-handle_info(resync_timeout, State) ->
-    {noreply, State#state{resync_timer = undefined}};
-%% Deferred monitor sweep (see assume_leadership/1), one chunk per message. A name
-%% already monitored (committed since the sweep began) or re-bound since its chunk was
-%% selected is skipped. A pid that died before its chunk fires an immediate `noproc`
-%% DOWN, so deferral loses nothing. handle_event/4 checked the epoch.
-handle_info(
-    {monitor_sweep, Epoch, Cont0},
-    State = #state{member_id = Self, leader = Self, replica = R}
+    next(maybe_start_commit(redrive_intents(moved, mark_synced(cancel_resync(Data4)))), []);
+%% A forwarded registration reaching a member mid-assume is postponed until the assume
+%% resolves; if superseded, it stays silent and the forwarder re-drives.
+assuming(cast, {register_req, _Ref, _FollowerId, _Name, _Pid, _Meta}, Data) ->
+    {keep_state, Data, [postpone]};
+assuming(EventType, EventContent, Data) ->
+    leaderless(EventType, EventContent, Data).
+
+%% -- shared by the non-leader states ----------------------------------------
+
+non_leader_enter(leader, Data) ->
+    {keep_state, relinquish_leadership(Data)};
+non_leader_enter(_OldState, Data) ->
+    {keep_state, Data}.
+
+%% `searching` and `assuming`: no leader to forward to.
+leaderless({call, From}, {get_metadata, _LogicalName}, Data) ->
+    next(Data, [{reply, From, undefined}]);
+leaderless({call, From}, {query_consistent, _Constraints}, Data) ->
+    next(Data, [{reply, From, []}]);
+leaderless({call, From}, {whereis, _LogicalName}, Data) ->
+    next(Data, [{reply, From, undefined}]);
+%% No leader (likely mid-handoff): hold the retract as an answered unregister intent so
+%% it is re-driven rather than lost.
+leaderless(cast, {retract_req, LogicalName, Pid}, Data) ->
+    next(submit_intent({unregister, LogicalName, Pid}, answered, Data), []);
+leaderless(EventType, EventContent, Data) ->
+    non_leader(EventType, EventContent, Data).
+
+%% `searching`, `assuming` and `follower`.
+non_leader(
+    {call, From},
+    {elector_assume_and_distribute, MemberId, AllIds, Tokens, FreshIds, Epoch},
+    Data
 ) ->
+    {reply, Reply, Data1} = assume_genuine(MemberId, AllIds, Tokens, FreshIds, Epoch, Data),
+    next(Data1, [{reply, From, Reply}]);
+%% Forward as an intent. The reply routes back through this member so the leader's
+%% `{names_batch}` (FIFO, ahead of it) has updated our row first: read-after-write for
+%% a local snapshot read.
+non_leader({call, From}, {set_metadata, LogicalName, Index, MetaData}, Data) ->
+    next(submit_intent({set_meta, LogicalName, Index, MetaData}, From, Data), []);
+%% Stale belief that we lead: reject so the caller retries.
+non_leader(cast, {set_meta_req, Ref, FollowerId, _LogicalName, _Index, _MetaData}, Data) ->
+    cast_to_member(FollowerId, {set_meta_reply, Ref, {error, no_leader}}),
+    next(Data, []);
+%% Stale belief that we lead: answer the empty value; the caller can retry.
+non_leader(cast, {get_metadata_req, _LogicalName, From}, Data) ->
+    gen_server:reply(From, undefined),
+    next(Data, []);
+non_leader(cast, {query_req, _Constraints, From}, Data) ->
+    gen_server:reply(From, []),
+    next(Data, []);
+non_leader(cast, {whereis_req, _LogicalName, From}, Data) ->
+    gen_server:reply(From, undefined),
+    next(Data, []);
+%% Deposed: surrender a failed batch's ops (dgen_registry_pipeline:surrender/2).
+non_leader(info, {requeue_ops, Ops}, Data) ->
+    next(surrender(deposed, Ops, Data), []);
+non_leader(info, replica_heartbeat, Data) ->
+    schedule_timer(?REPLICA_HEARTBEAT_INTERVAL, replica_heartbeat),
+    {keep_state, Data};
+non_leader(EventType, EventContent, Data) ->
+    unhandled(EventType, EventContent, Data).
+
+%% Ignored in this state. A non-leader stays silent on leader-only protocol messages
+%% (`register_req`, `unregister_req`, `resync_req`, `presence_update`) rather than give
+%% a non-adjudicated answer (§3); the forwarder re-drives. Superseded gather results
+%% and stale sweep steps land here too.
+unhandled({call, From}, _Request, Data) ->
+    next(Data, [{reply, From, {error, unknown_call}}]);
+unhandled(_EventType, _EventContent, Data) ->
+    next(Data, []).
+
+forward_read(Leader, Req, From, Default, Data) ->
+    case member_reachable(Leader) of
+        true ->
+            cast_to_member(Leader, Req),
+            next(Data, []);
+        false ->
+            next(Data, [{reply, From, Default}])
+    end.
+
+%% ---------------------------------------------------------------------------
+%% Elector calls (dispatched from the state functions)
+%% ---------------------------------------------------------------------------
+
+%% Bodies of `{elector_assume_and_distribute, …}`. `MemberId` is the joiner that
+%% triggered it (`undefined` for a member_down); `AllIds` the full member list.
+%%
+%% Fast path: a continuing, synced leader for this epoch is authoritative (every
+%% follower is a prefix of its stream), so it skips the gather and re-snapshotting
+%% the followers; it only monitors and onboards the joiner.
+assume_fast_path(MemberId, AllIds, Tokens, FreshIds, Epoch, Data = #data{member_id = Self}) ->
+    Data1 = merge_peer_tokens(
+        Tokens, add_member_monitors(extra_member_ids(MemberId, AllIds, Self), Data)
+    ),
+    %% A fresh joiner holds no bindings: onboard now. A rejoining previously-synced
+    %% member may hold divergent bindings (§5.6 partition heal), so gather its replica
+    %% off the loop and adjudicate it in {joiner_gathered} first (best-effort).
+    case MemberId =:= Self orelse lists:member(MemberId, FreshIds) of
+        true ->
+            {reply, ok, onboard_joiner(MemberId, AllIds, Tokens, Data1)};
+        false ->
+            spawn_joiner_gather(MemberId, AllIds, Tokens, Epoch, Data1),
+            {reply, ok, Data1}
+    end.
+
+assume_genuine(MemberId, AllIds, Tokens, FreshIds, Epoch, Data = #data{member_id = Self}) ->
+    %% Genuine change: the freshest-wins gather is a network fan-out, so it runs off
+    %% the loop and the elector is answered `ok` now (an inline gather would time out
+    %% its call and stall queued membership changes). Our own records and version are
+    %% captured now so a broadcast landing mid-gather cannot skew freshest-wins.
+    SelfRecords = dgen_registry_replica:records(Data#data.replica),
+    OtherIds = lists:delete(Self, AllIds),
+    Ref = make_ref(),
+    spawn_assume_gather(
+        {MemberId, AllIds, Tokens, FreshIds, Epoch, Ref},
+        SelfRecords,
+        applied_version(Data),
+        OtherIds,
+        Data#data.elector,
+        self(),
+        Data#data.tenant,
+        Data#data.tuid,
+        Data#data.conflicts
+    ),
+    %% No leader for the window: writes block and are re-driven by the continuation
+    %% rather than forwarded to the old, possibly-dead leader.
+    {reply, ok, Data#data{assume_ref = Ref, leader = undefined}}.
+
+apply_presence_update({subscribe, SubId, Watch, Notify}, Data = #data{subs = Subs}) ->
+    seed_subscription(SubId, Data#data{subs = Subs#{SubId => {Watch, Notify}}});
+apply_presence_update(
+    {unsubscribe, SubId}, Data = #data{subs = Subs, sub_matches = SM, notify_matches = NM}
+) ->
+    Data#data{
+        subs = maps:remove(SubId, Subs),
+        sub_matches = maps:remove(SubId, SM),
+        notify_matches = maps:remove(SubId, NM)
+    };
+apply_presence_update(unsubscribe_all, Data) ->
+    Data#data{subs = #{}, sub_matches = #{}, notify_matches = #{}}.
+
+%% One chunk of the deferred monitor sweep; re-sends itself until the table is done.
+monitor_sweep(Epoch, Cont0, R, Data) ->
     Tab = dgen_registry_replica:tab(R),
     Select =
         case Cont0 of
@@ -971,7 +917,7 @@ handle_info(
         end,
     case Select of
         '$end_of_table' ->
-            {noreply, State};
+            Data;
         {Pairs, Cont1} ->
             NTR1 =
                 lists:foldl(
@@ -984,71 +930,48 @@ handle_info(
                             false -> Acc#{Name => monitor_name(Name, Pid)}
                         end
                     end,
-                    State#state.name_to_ref,
+                    Data#data.name_to_ref,
                     Pairs
                 ),
             self() ! {monitor_sweep, Epoch, Cont1},
-            {noreply, State#state{name_to_ref = NTR1}}
-    end;
-%% Retry a failed batch's ops if we still lead (dropping registrations whose caller
-%% died), otherwise surrender them as deposed (dgen_registry_pipeline:surrender/2).
-handle_info({requeue_ops, Ops}, State = #state{leader = Self, member_id = Self}) ->
-    Live = [Op || Op <- Ops, caller_alive(Op)],
-    {noreply, maybe_start_commit(lists:foldl(fun enqueue_op/2, State, Live))};
-handle_info({requeue_ops, Ops}, State) ->
-    {noreply, surrender(deposed, Ops, State)};
-%% From the connector: the durable election epoch is ahead of ours, so a handoff never
-%% reached us. Re-announcing triggers a fresh assume/fan-out.
-handle_info({durable_epoch, DurableEpoch}, State) when is_integer(DurableEpoch) ->
-    case DurableEpoch > epoch(State) of
-        true ->
-            #state{elector = Elector, member_id = Self, join_token = Token, synced = Synced} =
-                State,
-            dgen_registry_elector:join(Elector, Self, Token, not Synced);
-        false ->
-            ok
-    end,
-    {noreply, State};
-handle_info({durable_epoch, _DurableEpoch}, State) ->
-    {noreply, State};
-handle_info(_Info, State) ->
-    {noreply, State}.
+            Data#data{name_to_ref = NTR1}
+    end.
 
-terminate(_Reason, _StatemState, _State) ->
+terminate(_Reason, _StatemState, _Data) ->
     net_kernel:monitor_nodes(false),
     ok.
 
-code_change(_OldVsn, StatemState, State, _Extra) ->
-    {ok, StatemState, State}.
+code_change(_OldVsn, StatemState, Data, _Extra) ->
+    {ok, StatemState, Data}.
 
 %% ---------------------------------------------------------------------------
 %% Internal helpers
 %% ---------------------------------------------------------------------------
 
-do_leader_changed(NewLeader, OldLeader, Self, State) ->
+do_leader_changed(NewLeader, OldLeader, Self, Data) ->
     %% Forwarded intents are re-routed by the caller's redrive_intents/2; the
     %% assume/relinquish halves run in the state enter calls.
     if
         OldLeader =:= Self, NewLeader =/= Self ->
             %% Lost leadership: resolve direct registrations awaiting replica acks
             %% so their timers do not fire into a follower.
-            fail_pending_acks(State#state{leader = NewLeader});
+            fail_pending_acks(Data#data{leader = NewLeader});
         true ->
-            State#state{leader = NewLeader}
+            Data#data{leader = NewLeader}
     end.
 
 %% Registered-process monitors are not created inline but by chunked, epoch-fenced
 %% {monitor_sweep, …} self-sends that interleave with live traffic. Safe because a
 %% monitor on an already-dead (or unreachable) pid fires an immediate DOWN, so a death
 %% before its chunk is caught, never lost; dead-pid cleanup has no promptness bound.
-assume_leadership(State) ->
-    self() ! {monitor_sweep, epoch(State), start},
+assume_leadership(Data) ->
+    self() ! {monitor_sweep, epoch(Data), start},
     %% Seed watch sets so the first commit's deltas are computed correctly (§4.9).
-    recompute_sub_matches(State).
+    recompute_sub_matches(Data).
 
 %% Rebuild every subscription's watch and notify sets from the replica (on assume
 %% only; apply_committed_plan maintains them after). A silent reseed: no snapshots.
-recompute_sub_matches(State = #state{subs = Subs, replica = R}) ->
+recompute_sub_matches(Data = #data{subs = Subs, replica = R}) ->
     SM = maps:map(
         fun(_SubId, {Watch, _Notify}) -> dgen_registry_replica:query_match_names(R, Watch) end,
         Subs
@@ -1057,19 +980,19 @@ recompute_sub_matches(State = #state{subs = Subs, replica = R}) ->
         fun(_SubId, {_Watch, Notify}) -> dgen_registry_replica:query_match_names(R, Notify) end,
         Subs
     ),
-    State#state{sub_matches = SM, notify_matches = NM}.
+    Data#data{sub_matches = SM, notify_matches = NM}.
 
 %% Demonitor all registered pids; keep the replica for snapshot reads. The pipeline's
 %% cached commit version is dropped so it cannot pin a later term's read version.
-relinquish_leadership(State = #state{name_to_ref = NTR}) ->
+relinquish_leadership(Data = #data{name_to_ref = NTR}) ->
     maps:foreach(
         fun(_LogicalName, Ref) ->
             erlang:demonitor(Ref, [flush])
         end,
         NTR
     ),
-    State#state{
-        name_to_ref = #{}, pipeline = dgen_registry_pipeline:new_term(State#state.pipeline)
+    Data#data{
+        name_to_ref = #{}, pipeline = dgen_registry_pipeline:new_term(Data#data.pipeline)
     }.
 
 %% Freshest-wins gather across our replica and every reachable peer. Broadcasts are
@@ -1093,7 +1016,7 @@ gather_maps(SelfNames, SelfVersion, OtherIds) ->
 
 %% Fast-path onboarding: ship the joiner our snapshot (with the member list) and tell
 %% existing followers to monitor it via {peer_joined}; their replicas are untouched.
-onboard_joiner(MemberId, AllIds, Tokens, State = #state{member_id = Self, replica = R}) ->
+onboard_joiner(MemberId, AllIds, Tokens, Data = #data{member_id = Self, replica = R}) ->
     RecordsBin = dgen_registry_replica:encode(R),
     cast_to_member(
         MemberId,
@@ -1104,13 +1027,13 @@ onboard_joiner(MemberId, AllIds, Tokens, State = #state{member_id = Self, replic
         fun(Id) -> cast_to_member(Id, {peer_joined, MemberId, Tokens}) end,
         [Id || Id <- AllIds, Id =/= Self, Id =/= MemberId]
     ),
-    State.
+    Data.
 
 %% Fetch a rejoining member's replica and probe conflict pids' liveness off the
 %% leader's loop (both are RPCs), reporting {joiner_gathered, …}. Our `protected` table
 %% is readable from this helper.
-spawn_joiner_gather(MemberId, AllIds, Tokens, Epoch, State) ->
-    #state{replica = Replica, conflicts = C} = State,
+spawn_joiner_gather(MemberId, AllIds, Tokens, Epoch, Data) ->
+    #data{replica = Replica, conflicts = C} = Data,
     Owner = self(),
     _ = spawn(fun() ->
         Result =
@@ -1211,7 +1134,7 @@ fetch_subscriptions(_Elector) ->
     #{}.
 
 %% One member_names/1 helper per peer under one deadline; late answers are dropped by
-%% the catch-all handle_info clause.
+%% unhandled/3.
 gather_peer_snapshots([]) ->
     #{};
 gather_peer_snapshots(OtherIds) ->
@@ -1245,22 +1168,23 @@ collect_gather(Ref, Waiting, Deadline, Acc) ->
 
 %% Detect and repair conflicts (§5.6) per dgen_registry_conflicts:resolve/5, carrying
 %% out its kills and alarms. Returns the reconstruction with conflicted names dropped.
-repair_conflicts(Authority, Witnesses, Trails, Alive, State = #state{conflicts = C0}) ->
+repair_conflicts(Authority, Witnesses, Trails, Alive, Data = #data{conflicts = C0}) ->
     C1 = dgen_registry_conflicts:merge(Trails, C0),
     Trail = dgen_registry_conflicts:trail(C1),
     Conflicts = dgen_registry_conflicts:detect(Authority, Witnesses, Trail, probed(Alive)),
     Now = erlang:system_time(millisecond),
     {Records, C2, Effects} =
-        dgen_registry_conflicts:resolve(Conflicts, Authority, State#state.config, Now, C1),
+        dgen_registry_conflicts:resolve(Conflicts, Authority, Data#data.config, Now, C1),
     lists:foreach(
         fun
-            ({kill, Pid}) -> exit(Pid, kill);
+            ({kill, Pid}) ->
+                exit(Pid, kill);
             ({alarm, {Name, APid, Divergent}, Action}) ->
                 alarm_conflict(Name, APid, Divergent, Action)
         end,
         Effects
     ),
-    {Records, State#state{conflicts = C2}}.
+    {Records, Data#data{conflicts = C2}}.
 
 %% Parallel liveness probe; runs in the gather helpers, never on the member's loop.
 probe_alive([]) ->
@@ -1346,18 +1270,18 @@ member_names({Node, Name}) ->
 
 %% §5.6 prevention (opt-in `reject_when_degraded`): while degraded, refuse names the
 %% leader does not hold; they could be committed bindings the reconstruction missed.
-reject_new_when_degraded(Name, #state{conflicts = C, replica = R, config = Config}) ->
+reject_new_when_degraded(Name, #data{conflicts = C, replica = R, config = Config}) ->
     dgen_registry_conflicts:degraded(C) andalso dgen_config:reject_when_degraded(Config) andalso
         not dgen_registry_replica:exists(R, Name).
 
 %% With no (reachable) leader a registration is never answered `no` (that would be a
 %% false `already_started`); it blocks as an intent until a leader appears.
-route_register(Name, Pid, Meta, From, State = #state{leader = Leader, member_id = Self}) ->
+route_register(Name, Pid, Meta, From, Data = #data{leader = Leader, member_id = Self}) ->
     if
         Leader =:= Self ->
-            enqueue_register(Name, Pid, Meta, From, State);
+            enqueue_register(Name, Pid, Meta, From, Data);
         true ->
-            submit_intent({register, Name, Pid, Meta}, From, State)
+            submit_intent({register, Name, Pid, Meta}, From, Data)
     end.
 
 %% Mirrors route_register. The bound pid is captured before the optimistic row_delete
@@ -1365,7 +1289,7 @@ route_register(Name, Pid, Meta, From, State = #state{leader = Leader, member_id 
 %% `ok` on commit. Follower: forward as a tracked intent, or with no reachable leader
 %% answer `ok` now and hold the intent until one is (CP: never lost).
 route_unregister(
-    LogicalName, From, State = #state{leader = Leader, member_id = Self, replica = R}
+    LogicalName, From, Data = #data{leader = Leader, member_id = Self, replica = R}
 ) ->
     ReleasedPid = dgen_registry_replica:lookup_pid(R, LogicalName),
 
@@ -1374,122 +1298,122 @@ route_unregister(
             {noreply,
                 enqueue_op(
                     {remove, LogicalName, ReleasedPid, {unreg, From}},
-                    row_delete(State, LogicalName)
+                    row_delete(Data, LogicalName)
                 )};
         true ->
-            State1 = row_delete(State, LogicalName),
-            {noreply, submit_intent({unregister, LogicalName, ReleasedPid}, From, State1)}
+            Data1 = row_delete(Data, LogicalName),
+            {noreply, submit_intent({unregister, LogicalName, ReleasedPid}, From, Data1)}
     end.
 
-enqueue_register(Name, Pid, Meta, From, State) ->
-    case reject_new_when_degraded(Name, State) of
+enqueue_register(Name, Pid, Meta, From, Data) ->
+    case reject_new_when_degraded(Name, Data) of
         true ->
             gen_server:reply(From, no),
-            State;
+            Data;
         false ->
-            enqueue_op({add, Name, Pid, Meta, {local, From}}, State)
+            enqueue_op({add, Name, Pid, Meta, {local, From}}, Data)
     end.
 
 %% ---------------------------------------------------------------------------
 %% Intents — requests this member cannot decide itself (dgen_registry_intents)
 %% ---------------------------------------------------------------------------
 
-intent_route(#state{leader = Self, member_id = Self}) ->
+intent_route(#data{leader = Self, member_id = Self}) ->
     self;
-intent_route(#state{leader = undefined}) ->
+intent_route(#data{leader = undefined}) ->
     none;
-intent_route(#state{leader = Leader}) ->
+intent_route(#data{leader = Leader}) ->
     case member_reachable(Leader) of
         true -> {remote, Leader};
         false -> none
     end.
 
-submit_intent(Kind, From, State = #state{intents = I}) ->
+submit_intent(Kind, From, Data = #data{intents = I}) ->
     Now = erlang:system_time(millisecond),
-    apply_intents(dgen_registry_intents:submit(Kind, From, Now, intent_route(State), I), State).
+    apply_intents(dgen_registry_intents:submit(Kind, From, Now, intent_route(Data), I), Data).
 
-intent_reply(Ref, Reply, State = #state{intents = I}) ->
-    apply_intents(dgen_registry_intents:on_reply(Ref, Reply, applied_version(State), I), State).
+intent_reply(Ref, Reply, Data = #data{intents = I}) ->
+    apply_intents(dgen_registry_intents:on_reply(Ref, Reply, applied_version(Data), I), Data).
 
 %% Our replica advanced: release the gap-deferred `yes` acks it now covers.
-intents_advanced(State = #state{intents = I}) ->
-    apply_intents(dgen_registry_intents:on_version(applied_version(State), I), State).
+intents_advanced(Data = #data{intents = I}) ->
+    apply_intents(dgen_registry_intents:on_version(applied_version(Data), I), Data).
 
 %% Re-drive unresolved intents: `Scope` is `moved` for a new leadership view, `all` for
 %% a restored link (see dgen_registry_intents:redrive/5).
-redrive_intents(Scope, State = #state{intents = I, config = Config}) ->
+redrive_intents(Scope, Data = #data{intents = I, config = Config}) ->
     Now = erlang:system_time(millisecond),
     TTL = dgen_config:register_timeout(Config),
-    Route = intent_route(State),
-    apply_intents(dgen_registry_intents:redrive(Route, Scope, Now, TTL, I), State).
+    Route = intent_route(Data),
+    apply_intents(dgen_registry_intents:redrive(Route, Scope, Now, TTL, I), Data).
 
 %% Drop intents whose callers timed out, bounding growth during a long partition.
-prune_intents(State = #state{intents = I, config = Config}) ->
+prune_intents(Data = #data{intents = I, config = Config}) ->
     Now = erlang:system_time(millisecond),
     TTL = dgen_config:register_timeout(Config),
-    State#state{intents = dgen_registry_intents:prune(Now, TTL, I)}.
+    Data#data{intents = dgen_registry_intents:prune(Now, TTL, I)}.
 
-apply_intents({Intents, Effects}, State) ->
-    lists:foldl(fun intent_effect/2, State#state{intents = Intents}, Effects).
+apply_intents({Intents, Effects}, Data) ->
+    lists:foldl(fun intent_effect/2, Data#data{intents = Intents}, Effects).
 
-intent_effect({reply, From, Value}, State) ->
+intent_effect({reply, From, Value}, Data) ->
     gen_server:reply(From, Value),
-    State;
-intent_effect({forward, Leader, Ref, Kind}, State = #state{member_id = Self}) ->
+    Data;
+intent_effect({forward, Leader, Ref, Kind}, Data = #data{member_id = Self}) ->
     cast_to_member(Leader, forward_msg(Ref, Self, Kind)),
-    State;
-intent_effect({retract, Leader, Name, Pid}, State) ->
+    Data;
+intent_effect({retract, Leader, Name, Pid}, Data) ->
     forward_retract(Leader, Name, Pid),
-    State;
-intent_effect({enqueue, {register, Name, Pid, Meta}, From}, State) ->
-    enqueue_register(Name, Pid, Meta, From, State);
-intent_effect({enqueue, {unregister, Name, Pid}, answered}, State) ->
-    enqueue_op({retract, Name, Pid}, State);
-intent_effect({resync, Leader}, State) ->
-    request_resync(Leader, State);
-intent_effect({insert_row, Name, Pid, {Index, Data}}, State) ->
-    row_insert(State, Name, Pid, Index, Data).
+    Data;
+intent_effect({enqueue, {register, Name, Pid, Meta}, From}, Data) ->
+    enqueue_register(Name, Pid, Meta, From, Data);
+intent_effect({enqueue, {unregister, Name, Pid}, answered}, Data) ->
+    enqueue_op({retract, Name, Pid}, Data);
+intent_effect({resync, Leader}, Data) ->
+    request_resync(Leader, Data);
+intent_effect({insert_row, Name, Pid, {Index, MetaData}}, Data) ->
+    row_insert(Data, Name, Pid, Index, MetaData).
 
 forward_msg(Ref, Self, {register, Name, Pid, Meta}) ->
     {register_req, Ref, Self, Name, Pid, Meta};
 forward_msg(Ref, Self, {unregister, Name, _ReleasedPid}) ->
     {unregister_req, Ref, Self, Name};
-forward_msg(Ref, Self, {set_meta, Name, Index, Data}) ->
-    {set_meta_req, Ref, Self, Name, Index, Data}.
+forward_msg(Ref, Self, {set_meta, Name, Index, MetaData}) ->
+    {set_meta_req, Ref, Self, Name, Index, MetaData}.
 
 %% Ops arriving during an in-flight commit accumulate and ride the next batch.
-enqueue_op(Op, State = #state{pipeline = P}) ->
-    maybe_start_commit(State#state{pipeline = dgen_registry_pipeline:enqueue(Op, P)}).
+enqueue_op(Op, Data = #data{pipeline = P}) ->
+    maybe_start_commit(Data#data{pipeline = dgen_registry_pipeline:enqueue(Op, P)}).
 
 %% At most one commit runs at a time, in a dgen_transaction worker off this loop. A
 %% member that no longer leads surrenders the queue instead.
-maybe_start_commit(State = #state{pipeline = P, leader = Leader, member_id = Self}) ->
+maybe_start_commit(Data = #data{pipeline = P, leader = Leader, member_id = Self}) ->
     case {dgen_registry_pipeline:in_flight(P), dgen_registry_pipeline:num_pending(P)} of
         {true, _} ->
-            State;
+            Data;
         {false, 0} ->
-            State;
+            Data;
         {false, _} when Leader =/= Self ->
             {Ops, P1} = dgen_registry_pipeline:take_pending(P),
-            surrender(deposed, Ops, State#state{pipeline = P1});
+            surrender(deposed, Ops, Data#data{pipeline = P1});
         {false, _} ->
-            start_commit(State)
+            start_commit(Data)
     end.
 
-start_commit(State) ->
-    Epoch = epoch(State),
-    Tab = dgen_registry_replica:tab(State#state.replica),
-    #state{
+start_commit(Data) ->
+    Epoch = epoch(Data),
+    Tab = dgen_registry_replica:tab(Data#data.replica),
+    #data{
         member_id = Self,
         tenant = Tenant,
         tuid = Tuid,
         name_to_ref = NTR,
         pipeline = P,
         config = Config
-    } = State,
+    } = Data,
     {ThisBatch, P1} = dgen_registry_pipeline:take_batch(dgen_config:commit_batch_size(Config), P),
     LastVersion = dgen_registry_pipeline:read_version(P1),
-    State1 = State#state{pipeline = P1},
+    Data1 = Data#data{pipeline = P1},
     %% Planning is O(batch): bindings resolve lazily (see plan_batch/4).
     Plan = plan_batch(ThisBatch, Tab, NTR, Epoch),
     #{dbop := DBOp, replies := RepliesRev} = Plan,
@@ -1497,7 +1421,7 @@ start_commit(State) ->
         true ->
             %% Only rejections: no commit needed.
             send_replies(lists:reverse(RepliesRev)),
-            maybe_start_commit(State1);
+            maybe_start_commit(Data1);
         false ->
             Ref = make_ref(),
             %% Pin last_version as the read version to skip a GRV; if stale, the
@@ -1510,12 +1434,12 @@ start_commit(State) ->
                 Self,
                 #{owner => self(), ref => Ref, epoch => Epoch, read_version => LastVersion}
             ),
-            State1#state{pipeline = dgen_registry_pipeline:start(Ref, MRef, Plan, P1)}
+            Data1#data{pipeline = dgen_registry_pipeline:start(Ref, MRef, Plan, P1)}
     end.
 
 %% Apply a committed batch: update the replica, (de)monitor pids, replicate, and
 %% answer callers.
-apply_committed_plan(Plan, Version, State) ->
+apply_committed_plan(Plan, Version, Data) ->
     #{
         dbop := DBOp,
         names := WNames,
@@ -1525,16 +1449,16 @@ apply_committed_plan(Plan, Version, State) ->
         released := Released,
         direct_meta := DirectMeta
     } = Plan,
-    #state{
+    #data{
         member_id = Self,
         name_to_ref = NTR0,
         members = Members,
         replica = R0
-    } = State,
+    } = Data,
     PrevVersion = dgen_registry_replica:version(R0),
     %% Only DBOp names are touched, so a concurrent optimistic unregister of an
     %% untouched name is never clobbered.
-    State0 = State#state{replica = dgen_registry_replica:commit(Version, DBOp, WNames, WMeta, R0)},
+    Data0 = Data#data{replica = dgen_registry_replica:commit(Version, DBOp, WNames, WMeta, R0)},
     NTR1 = apply_monitor_ops(DBOp, WNames, NTR0),
     %% Broadcast first, so the replicate_sync (FIFO behind it) reaches a follower only
     %% after it holds the batch. One message per batch, never per name: a partially
@@ -1542,11 +1466,11 @@ apply_committed_plan(Plan, Version, State) ->
     %% "same version implies same content" that the handoff gather relies on (§5.7).
     broadcast_batch(Members, lists:reverse(BcastsRev), PrevVersion, Version, Self),
     Now = erlang:system_time(millisecond),
-    State1 = State0#state{
+    Data1 = Data0#data{
         name_to_ref = NTR1,
-        pipeline = dgen_registry_pipeline:committed(Version, State0#state.pipeline),
+        pipeline = dgen_registry_pipeline:committed(Version, Data0#data.pipeline),
         %% Explicit releases extend the conflict trail (§5.6).
-        conflicts = dgen_registry_conflicts:released(Released, Now, State0#state.conflicts)
+        conflicts = dgen_registry_conflicts:released(Released, Now, Data0#data.conflicts)
     },
     %% Forwarded registrations and rejections are answered now (a forwarded `yes` is
     %% already two-holder); a direct `yes` waits for a follower's replica ack (§8).
@@ -1560,22 +1484,22 @@ apply_committed_plan(Plan, Version, State) ->
      || {Origin, yes} <- DirectYes, {Name, Pid} <- [maps:get(Origin, DirectMeta)]
     ],
     %% Presence notifications (§4.9), computed against the committed replica.
-    State2 = fire_presence(DBOp, State1),
-    confirm_direct(EnrichedDirect, Version, State2).
+    Data2 = fire_presence(DBOp, Data1),
+    confirm_direct(EnrichedDirect, Version, Data2).
 
 %% Presence for a committed batch (leader only, §4.9), diffing the changed names per
 %% subscription: watch-set changes yield `joined`/`left` for continuing notify targets;
 %% a pid newly entering the notify set gets the full watch snapshot.
-fire_presence(_DBOp, State = #state{subs = Subs}) when map_size(Subs) =:= 0 ->
-    State;
-fire_presence(DBOp, State = #state{replica = R, subs = Subs}) ->
+fire_presence(_DBOp, Data = #data{subs = Subs}) when map_size(Subs) =:= 0 ->
+    Data;
+fire_presence(DBOp, Data = #data{replica = R, subs = Subs}) ->
     Tab = dgen_registry_replica:tab(R),
     RealNames = maps:keys(DBOp),
     maps:fold(
         fun(SubId, {Watch, Notify}, S) ->
             diff_subscription(SubId, Watch, Notify, RealNames, Tab, S)
         end,
-        State,
+        Data,
         Subs
     ).
 
@@ -1583,7 +1507,7 @@ fire_presence(DBOp, State = #state{replica = R, subs = Subs}) ->
 %% current notify targets.
 seed_subscription(
     SubId,
-    State = #state{
+    Data = #data{
         subs = Subs, replica = R, sub_matches = SM, notify_matches = NM
     }
 ) ->
@@ -1592,18 +1516,18 @@ seed_subscription(
             WatchMatches = dgen_registry_replica:query_match_names(R, Watch),
             NotifyMatches = dgen_registry_replica:query_match_names(R, Notify),
             send_presence(SubId, snapshot_events(WatchMatches), pidset(NotifyMatches)),
-            State#state{
+            Data#data{
                 sub_matches = SM#{SubId => WatchMatches},
                 notify_matches = NM#{SubId => NotifyMatches}
             };
         _ ->
-            State
+            Data
     end.
 
 %% Diff one subscription and fire its notifications. Done on pid-sets, so a pid already
 %% a target under another name gets no duplicate snapshot.
-diff_subscription(SubId, Watch, Notify, RealNames, Tab, State) ->
-    #state{sub_matches = SM, notify_matches = NM} = State,
+diff_subscription(SubId, Watch, Notify, RealNames, Tab, Data) ->
+    #data{sub_matches = SM, notify_matches = NM} = Data,
     {WatchEvents, WatchAfter} = diff_query_matches(Watch, RealNames, maps:get(SubId, SM, #{}), Tab),
     NotifyBefore = maps:get(SubId, NM, #{}),
     {_NotifyEvents, NotifyAfter} = diff_query_matches(Notify, RealNames, NotifyBefore, Tab),
@@ -1612,7 +1536,7 @@ diff_subscription(SubId, Watch, Notify, RealNames, Tab, State) ->
     ContinuingTargets = AfterPids -- NewTargets,
     send_presence(SubId, WatchEvents, ContinuingTargets),
     send_presence(SubId, snapshot_events(WatchAfter), NewTargets),
-    State#state{sub_matches = SM#{SubId => WatchAfter}, notify_matches = NM#{SubId => NotifyAfter}}.
+    Data#data{sub_matches = SM#{SubId => WatchAfter}, notify_matches = NM#{SubId => NotifyAfter}}.
 
 %% Diff a query's membership over the changed names: `joined`/`left` events and the
 %% updated `#{Name => Pid}` map.
@@ -1669,26 +1593,26 @@ is_direct_yes(_Other) -> false.
 %% Replicate-before-ack for direct registrations (§5.5, §8): wait for
 %% `register_replicas` distinct follower acks (capped by follower count; none needed if
 %% there are no followers), or the `strict_replication` policy on timeout.
-confirm_direct([], _Version, State) ->
-    State;
+confirm_direct([], _Version, Data) ->
+    Data;
 confirm_direct(
     Direct,
     Version,
-    State = #state{members = Members, member_id = Self, pipeline = P, config = Config}
+    Data = #data{members = Members, member_id = Self, pipeline = P, config = Config}
 ) ->
     Needed = min(dgen_config:register_replicas(Config), map_size(Members)),
     case Needed =< 0 of
         true ->
             deliver_direct(Direct),
-            State;
+            Data;
         false ->
             BatchRef = make_ref(),
             %% Carries Version so a gapped follower that lacks the batch never acks.
             broadcast_to_peers(Members, {replicate_sync, BatchRef, Self, Version}),
-            TimerRef = arm(
+            TimerRef = schedule_timer(
                 dgen_config:replicate_timeout(Config), {replicate_timeout, BatchRef}
             ),
-            State#state{
+            Data#data{
                 pipeline = dgen_registry_pipeline:await_acks(BatchRef, Direct, TimerRef, Needed, P)
             }
     end.
@@ -1697,13 +1621,13 @@ deliver_direct(Direct) ->
     lists:foreach(fun({Origin, _Name, _Pid}) -> deliver_reply(Origin, yes) end, Direct).
 
 %% strict_replication fail-closed: reject and retract (a pid-guarded, committed clear).
-reject_and_retract_direct(Direct, State) ->
+reject_and_retract_direct(Direct, Data) ->
     lists:foldl(
         fun({Origin, Name, Pid}, S) ->
             deliver_reply(Origin, no),
             enqueue_op({retract, Name, Pid}, S)
         end,
-        State,
+        Data,
         Direct
     ).
 
@@ -1796,7 +1720,7 @@ seed_lookup(WN, Tab, Name) ->
         _ -> lookup_name(Tab, Name)
     end.
 
-plan_op({add, Name, Pid, {Index, Data} = Meta, Origin}, Epoch, Acc) ->
+plan_op({add, Name, Pid, {Index, MetaData} = Meta, Origin}, Epoch, Acc) ->
     #{
         tab := Tab,
         names := WN,
@@ -1826,11 +1750,11 @@ plan_op({add, Name, Pid, {Index, Data} = Meta, Origin}, Epoch, Acc) ->
                 wntr := WNTR#{Name => {pending, Pid}},
                 dbop := DB#{Name => {set, node(Pid)}},
                 replies := [{Origin, yes} | Rs],
-                bcasts := [{name_registered, Name, Pid, Index, Data, Epoch} | Bs],
+                bcasts := [{name_registered, Name, Pid, Index, MetaData, Epoch} | Bs],
                 direct_meta := DM1
             }
     end;
-plan_op({set_meta, Name, Index, Data, Origin}, Epoch, Acc) ->
+plan_op({set_meta, Name, Index, MetaData, Origin}, Epoch, Acc) ->
     #{tab := Tab, names := WN, meta := WMeta, dbop := DB, replies := Rs, bcasts := Bs} = Acc,
     case seed_lookup(WN, Tab, Name) of
         undefined ->
@@ -1844,10 +1768,10 @@ plan_op({set_meta, Name, Index, Data, Origin}, Epoch, Acc) ->
                     _ -> {meta, node(Pid)}
                 end,
             Acc#{
-                meta := WMeta#{Name => {Index, Data}},
+                meta := WMeta#{Name => {Index, MetaData}},
                 dbop := DB#{Name => DBVal},
                 replies := [{Origin, ok} | Rs],
-                bcasts := [{metadata_set, Name, Index, Data, Epoch} | Bs]
+                bcasts := [{metadata_set, Name, Index, MetaData, Epoch} | Bs]
             }
     end;
 plan_op({remove, Name, ReleasedPid, Origin}, Epoch, Acc) ->
@@ -1955,10 +1879,10 @@ send_replies(Replies) ->
 
 %% Extend the conflict trail (§5.6) from an applied batch. Keyed by {Name, Pid}, so a
 %% release under one name never masks a conflict on another name the same pid holds.
-record_released(Ops, State = #state{conflicts = C}) ->
+record_released(Ops, Data = #data{conflicts = C}) ->
     Pairs = [{Name, Pid} || {name_unregistered, Name, Pid} <- Ops, is_pid(Pid)],
     Now = erlang:system_time(millisecond),
-    State#state{conflicts = dgen_registry_conflicts:released(Pairs, Now, C)}.
+    Data#data{conflicts = dgen_registry_conflicts:released(Pairs, Now, C)}.
 
 %% One `{names_batch, Ops, Epoch, PrevV, Version, LeaderId}` per committed batch; the
 %% epoch is carried once on the envelope. Followers use PrevV/Version for gap detection
@@ -1990,14 +1914,14 @@ broadcast_batch(Members, [First | _] = Ops, PrevV, Version, Self) ->
 -ifdef(MUTATION_QUIET_RESYNC).
 %% MUTATION (test-only, `DGEN_MUTATION=quiet_resync`): the heartbeat advertises
 %% nothing, so a follower that loses the stream's tail stays diverged while quiet.
-broadcast_heartbeat(_State) ->
+broadcast_heartbeat(_Data) ->
     ok.
 -else.
 %% The leader's periodic empty batch at {Applied, Applied}; see
 %% ?REPLICA_HEARTBEAT_INTERVAL.
-broadcast_heartbeat(State = #state{members = Members, member_id = Self}) ->
-    Applied = applied_version(State),
-    broadcast_to_peers(Members, {names_batch, [], epoch(State), Applied, Applied, Self}),
+broadcast_heartbeat(Data = #data{members = Members, member_id = Self}) ->
+    Applied = applied_version(Data),
+    broadcast_to_peers(Members, {names_batch, [], epoch(Data), Applied, Applied, Self}),
     ok.
 -endif.
 
@@ -2005,33 +1929,33 @@ bcast_epoch({name_registered, _Name, _Pid, _Index, _Data, Epoch}) -> Epoch;
 bcast_epoch({metadata_set, _Name, _Index, _Data, Epoch}) -> Epoch;
 bcast_epoch({name_unregistered, _Name, _ReleasedPid, Epoch}) -> Epoch.
 
-strip_bcast_epoch({name_registered, Name, Pid, Index, Data, _Epoch}) ->
-    {name_registered, Name, Pid, Index, Data};
-strip_bcast_epoch({metadata_set, Name, Index, Data, _Epoch}) ->
-    {metadata_set, Name, Index, Data};
+strip_bcast_epoch({name_registered, Name, Pid, Index, MetaData, _Epoch}) ->
+    {name_registered, Name, Pid, Index, MetaData};
+strip_bcast_epoch({metadata_set, Name, Index, MetaData, _Epoch}) ->
+    {metadata_set, Name, Index, MetaData};
 strip_bcast_epoch({name_unregistered, Name, ReleasedPid, _Epoch}) ->
     {name_unregistered, Name, ReleasedPid}.
 
 %% Ask `LeaderId` for a snapshot after a gap, at most once per ?RESYNC_RETRY.
-request_resync(LeaderId, State = #state{resync_timer = undefined, member_id = Self}) ->
+request_resync(LeaderId, Data = #data{resync_timer = undefined, member_id = Self}) ->
     cast_to_member(LeaderId, {resync_req, Self}),
-    Ref = arm(?RESYNC_RETRY, resync_timeout),
-    State#state{resync_timer = Ref};
-request_resync(_LeaderId, State) ->
-    State.
+    Ref = schedule_timer(?RESYNC_RETRY, resync_timeout),
+    Data#data{resync_timer = Ref};
+request_resync(_LeaderId, Data) ->
+    Data.
 
-cancel_resync(State = #state{resync_timer = undefined}) ->
-    State;
-cancel_resync(State = #state{resync_timer = Ref}) ->
+cancel_resync(Data = #data{resync_timer = undefined}) ->
+    Data;
+cancel_resync(Data = #data{resync_timer = Ref}) ->
     erlang:cancel_timer(Ref),
-    State#state{resync_timer = undefined}.
+    Data#data{resync_timer = undefined}.
 
 %% Mark synced, re-announcing once with `fresh = false`.
-mark_synced(State = #state{synced = true}) ->
-    State;
-mark_synced(State = #state{elector = Elector, member_id = Self, join_token = Token}) ->
+mark_synced(Data = #data{synced = true}) ->
+    Data;
+mark_synced(Data = #data{elector = Elector, member_id = Self, join_token = Token}) ->
     dgen_registry_elector:join(Elector, Self, Token, false),
-    State#state{synced = true}.
+    Data#data{synced = true}.
 
 %% Connected, so a cast will not be dropped?
 member_reachable({Node, _Name}) ->
@@ -2052,8 +1976,8 @@ spawn_member_down(Elector, MemberId, Cached) ->
 %% captured at the mailbox point; the verify runs in a helper so the DB round-trip
 %% never blocks the loop. Linearizable because leadership is continuous within an
 %% epoch. Any failure answers `Denied` (the CP refusal).
-reply_fenced(From, Value, Denied, State = #state{tenant = Tenant, tuid = Tuid, member_id = Self}) ->
-    Epoch = epoch(State),
+reply_fenced(From, Value, Denied, Data = #data{tenant = Tenant, tuid = Tuid, member_id = Self}) ->
+    Epoch = epoch(Data),
 
     _ = spawn(fun() ->
         Reply =
@@ -2070,39 +1994,39 @@ forward_retract(Leader, Name, Pid) ->
     cast_to_member(Leader, {retract_req, Name, Pid}).
 
 %% Applied only if committed under the leadership view it was planned in.
-commit_result(Reply, Plan, State = #state{leader = Leader, member_id = Self}) ->
+commit_result(Reply, Plan, Data = #data{leader = Leader, member_id = Self}) ->
     case Reply of
         {committed, Version} when Leader =:= Self ->
-            case maps:get(epoch, Plan) =:= epoch(State) of
+            case maps:get(epoch, Plan) =:= epoch(Data) of
                 true ->
-                    apply_committed_plan(Plan, Version, State);
+                    apply_committed_plan(Plan, Version, Data);
                 false ->
                     %% Older epoch: applying or broadcasting an old-term plan would
                     %% diverge replicas. Only the version bump was durable, so retry.
-                    surrender(failed, maps:get(ops, Plan), State)
+                    surrender(failed, maps:get(ops, Plan), Data)
             end;
         {aborted, fenced} ->
             %% A newer leader exists and we have not heard: ask now.
-            surrender(failed, maps:get(ops, Plan), rejoin_once_fenced(State));
+            surrender(failed, maps:get(ops, Plan), rejoin_once_fenced(Data));
         _Deposed_or_error ->
-            surrender(failed, maps:get(ops, Plan), State)
+            surrender(failed, maps:get(ops, Plan), Data)
     end.
 
 %% A fenced commit proves we were deposed unheard: re-announce now rather than wait
 %% for the connector's durable-epoch check. Once per epoch, since each join is a
 %% durable queue entry and a partitioned member keeps being fenced.
-rejoin_once_fenced(State = #state{fence_rejoined = Epoch}) when Epoch =/= undefined ->
-    case epoch(State) of
-        Epoch -> State;
-        _ -> rejoin_once_fenced(State#state{fence_rejoined = undefined})
+rejoin_once_fenced(Data = #data{fence_rejoined = Epoch}) when Epoch =/= undefined ->
+    case epoch(Data) of
+        Epoch -> Data;
+        _ -> rejoin_once_fenced(Data#data{fence_rejoined = undefined})
     end;
-rejoin_once_fenced(State) ->
-    #state{elector = Elector, member_id = Self, join_token = Token, synced = Synced} = State,
+rejoin_once_fenced(Data) ->
+    #data{elector = Elector, member_id = Self, join_token = Token, synced = Synced} = Data,
     dgen_registry_elector:join(Elector, Self, Token, not Synced),
-    State#state{fence_rejoined = epoch(State)}.
+    Data#data{fence_rejoined = epoch(Data)}.
 
 %% Carry out dgen_registry_pipeline:surrender/2: replies, intents, delayed retries.
-surrender(Reason, Ops, State) ->
+surrender(Reason, Ops, Data) ->
     lists:foldl(
         fun
             ({reply, Origin, Value}, S) ->
@@ -2111,10 +2035,10 @@ surrender(Reason, Ops, State) ->
             ({intent, Kind, From}, S) ->
                 submit_intent(Kind, From, S);
             ({retry, Retry}, S) ->
-                arm(?REQUEUE_DELAY, {requeue_ops, Retry}),
+                schedule_timer(?REQUEUE_DELAY, {requeue_ops, Retry}),
                 S
         end,
-        State,
+        Data,
         dgen_registry_pipeline:surrender(Reason, Ops)
     ).
 
@@ -2124,16 +2048,16 @@ caller_alive({add, _Name, _Pid, _Meta, {local, {Caller, _Tag}}}) when node(Calle
 caller_alive(_Op) ->
     true.
 
-%% Logs the arm so a simulated `{clock, Ms}` trace entry is attributable; `?ETA_LOG`
-%% is a no-op in production builds.
-arm(Delay, Msg) ->
+%% Logs an `arm` event so a simulated `{clock, Ms}` trace entry is attributable;
+%% `?ETA_LOG` is a no-op in production builds.
+schedule_timer(Delay, Msg) ->
     _ = ?ETA_LOG({arm, Msg, Delay}),
     erlang:send_after(Delay, self(), Msg).
 
 %% Losing leadership with direct registrations awaiting acks: resolve them by the
 %% replicate-timeout policy (§8). Fail-closed hands the pid-guarded retract to the
 %% intents so the caller's `no` cannot leave the binding alive.
-fail_pending_acks(State = #state{pipeline = P, config = Config}) ->
+fail_pending_acks(Data = #data{pipeline = P, config = Config}) ->
     {Batches, P1} = dgen_registry_pipeline:take_acks(P),
     Strict = dgen_config:strict_replication(Config),
     lists:foldl(
@@ -2155,7 +2079,7 @@ fail_pending_acks(State = #state{pipeline = P, config = Config}) ->
                     )
             end
         end,
-        State#state{pipeline = P1},
+        Data#data{pipeline = P1},
         Batches
     ).
 
@@ -2165,11 +2089,11 @@ fail_pending_acks(State = #state{pipeline = P, config = Config}) ->
 
 %% The optimistic delete on unregister, and the legacy unversioned reply's insert
 %% (rolling upgrade). Neither moves the replica's version.
-row_delete(S = #state{replica = R}, Name) ->
-    S#state{replica = dgen_registry_replica:delete(R, Name)}.
+row_delete(S = #data{replica = R}, Name) ->
+    S#data{replica = dgen_registry_replica:delete(R, Name)}.
 
-row_insert(S = #state{replica = R}, Name, Pid, Index, Data) ->
-    S#state{replica = dgen_registry_replica:insert(R, Name, Pid, Index, Data)}.
+row_insert(S = #data{replica = R}, Name, Pid, Index, MetaData) ->
+    S#data{replica = dgen_registry_replica:insert(R, Name, Pid, Index, MetaData)}.
 
 %% Bare table, so plan_batch/4 stays testable against a plain ETS table.
 lookup_name(Tab, Name) ->
@@ -2178,8 +2102,8 @@ lookup_name(Tab, Name) ->
         [] -> undefined
     end.
 
-add_member_monitors(MemberIds, State) ->
-    #state{member_id = Self, members = Members, monitors = Monitors} = State,
+add_member_monitors(MemberIds, Data) ->
+    #data{member_id = Self, members = Members, monitors = Monitors} = Data,
     {NewMembers, NewMonitors} = lists:foldl(
         fun(MemberId, {MA, MonA}) ->
             case MemberId =:= Self orelse maps:is_key(MemberId, MA) of
@@ -2194,22 +2118,22 @@ add_member_monitors(MemberIds, State) ->
         {Members, Monitors},
         MemberIds
     ),
-    State#state{members = NewMembers, monitors = NewMonitors}.
+    Data#data{members = NewMembers, monitors = NewMonitors}.
 
-remove_member(MemberId, State = #state{members = Members, monitors = Monitors}) ->
+remove_member(MemberId, Data = #data{members = Members, monitors = Monitors}) ->
     case maps:get(MemberId, Members, undefined) of
         undefined ->
-            State;
+            Data;
         Ref ->
             erlang:demonitor(Ref, [flush]),
             %% Drop the peer's token (the caller already read it). The departure time
             %% keeps trail pruning suspended for a TTL window (§5.6).
-            State#state{
+            Data#data{
                 members = maps:remove(MemberId, Members),
                 monitors = maps:remove(Ref, Monitors),
-                peer_tokens = maps:remove(MemberId, State#state.peer_tokens),
+                peer_tokens = maps:remove(MemberId, Data#data.peer_tokens),
                 conflicts = dgen_registry_conflicts:departed(
-                    erlang:system_time(millisecond), State#state.conflicts
+                    erlang:system_time(millisecond), Data#data.conflicts
                 )
             }
     end.
@@ -2234,8 +2158,8 @@ extra_member_ids(MemberId, AllIds, MemberId) -> AllIds;
 extra_member_ids(MemberId, _AllIds, _Id) -> [MemberId].
 
 %% The elector is authoritative and always sends current tokens, so overwrite.
-merge_peer_tokens(Tokens, State = #state{peer_tokens = PeerTokens}) ->
-    State#state{peer_tokens = maps:merge(PeerTokens, Tokens)}.
+merge_peer_tokens(Tokens, Data = #data{peer_tokens = PeerTokens}) ->
+    Data#data{peer_tokens = maps:merge(PeerTokens, Tokens)}.
 
 broadcast_to_peers(Members, Msg) ->
     maps:foreach(fun(MemberId, _) -> cast_to_member(MemberId, Msg) end, Members).
