@@ -7,17 +7,17 @@
 -moduledoc """
 Behaviour that wraps the lifecycle of a single FDB transaction in a process.
 
-`dgen_backend:transactional/2` runs a closure and auto-retries it: simple, but
-the transaction is anonymous and the caller's process blocks for the whole
-commit. `dgen_transaction` instead gives the transaction **its own process**.
-The owning process creates the transaction, runs a callback module's body
-against it, decides when to commit, drives the retry loop, and delivers the
-outcome asynchronously. Two things this buys us:
+`dgen_backend:transactional/2` runs a closure and retries it automatically.
+That is simple, but the caller never holds the transaction, and the caller's
+process blocks for the whole commit. `dgen_transaction` instead gives the
+transaction **its own process**. That process creates the transaction, runs the
+body from a callback module against it, decides when to commit, drives the
+retry loop, and delivers the outcome asynchronously. This buys us two things:
 
-1. **More control over the transaction lifecycle.** For example, a dgen_transaction
-   can be written using a previous transaction's GRV instead of paying for
-   a fresh GRV, then falling back to a fresh GRV automatically on retry
-   (the backend's `on_error/2` resets the read version).
+1. **More control over the transaction lifecycle.** For example, a
+   dgen_transaction can reuse the read version (GRV) of a previous transaction
+   instead of paying for a fresh one. On retry it falls back to a fresh GRV
+   automatically, because the backend's `on_error/2` resets the read version.
 2. **Non-blocking commit.** A calling process can hand a write to a
    `dgen_transaction` worker and keep receiving messages from its queue
    while the commit is in flight, learning the result via a message.
@@ -49,34 +49,35 @@ When the transaction reaches a terminal state the worker sends the owner
 {dgen_transaction, Ref, Reply}
 ```
 
-where `Ref` is the caller-supplied (or generated) correlation token and `Reply`
-is one of:
+where `Ref` is the correlation token, either supplied by the caller or
+generated, and `Reply` is one of:
 
 - `{committed, Result}` — `Result` is whatever `handle_committed/2` returned.
-- `{aborted, Reason}` — the module chose not to commit / not to retry.
+- `{aborted, Reason}` — the module chose not to commit, or not to retry.
 - `{error, Reason}` — a non-retryable backend error, retry-limit exhaustion, or
   the worker terminating abnormally.
 
 ## Callbacks
 
-- `init/1` — set up callback state.
-- `handle_begin/2` — issue the transaction body (reads for fencing + writes)
-  against the live `Tx`; replayed on every retry unless `handle_retry/2` is
-  provided. Returns a directive (noreply, commit, etc).
+- `init/1` — sets up the callback state.
+- `handle_begin/2` — issues the transaction body against the live `Tx`. That is
+  the reads that guard the commit against conflicts, plus the writes. It is
+  replayed on every retry unless the module provides `handle_retry/2`. Returns
+  a directive such as `noreply` or `commit`.
 - `handle_committed/2` — called with the committed version after a successful
-  commit; returns `{ok, Result}`.
+  commit. Returns `{ok, Result}`.
 
 Optional:
 
-- `handle_cast/3`, `handle_call/4` — interactive operations against the live
-  transaction before commit (the process-model the caller drives directly).
-- `handle_retry/2` — re-issue the body on retry (defaults to `handle_begin/2`).
-- `handle_conflict/2` — veto or allow a retry on a retryable error
-  (defaults to `retry`). It governs retryable errors raised **either** by the
-  commit **or** while issuing the body (e.g. a read at a stale pinned read
-  version) — both route through `handle_conflict/2` → `on_error/2` → replay, so a
-  too-old pinned read falls back to a fresh GRV rather than failing the worker.
-- `terminate/2` — cleanup; receives the terminal `Reply`.
+- `handle_cast/3`, `handle_call/4` — let the caller drive the live transaction
+  directly with messages before it commits.
+- `handle_retry/2` — re-issues the body on retry. Defaults to `handle_begin/2`.
+- `handle_conflict/2` — allows or vetoes a retry after a retryable error.
+  Defaults to `retry`. It sees retryable errors from the commit **and** from
+  issuing the body, such as a read at a pinned read version that has grown too
+  old. Both go through `handle_conflict/2` → `on_error/2` → replay. So a stale
+  pinned read version falls back to a fresh GRV instead of failing the worker.
+- `terminate/2` — cleans up. Receives the terminal `Reply`.
 
 *This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
@@ -107,9 +108,10 @@ Optional:
 
 -export_type([directive/0]).
 
-%% The transaction handle is passed to the body callbacks; everything else the
-%% body needs (directory, tuid, the batch being committed, …) lives in the
-%% callback module's own state.  dgen_transaction itself is directory-agnostic.
+%% The body callbacks receive the transaction handle. Everything else the body
+%% needs, such as the directory, the tuid or the batch being committed, lives in
+%% the callback module's own state. dgen_transaction itself knows nothing about
+%% directories.
 -callback init(Args :: term()) -> {ok, cb_state()} | {stop, Reason :: term()}.
 -callback handle_begin(Tx :: dgen_backend:tx(), State :: cb_state()) -> directive().
 -callback handle_committed(CommittedVersion :: integer(), State :: cb_state()) ->
@@ -146,8 +148,8 @@ Optional:
     ref :: term(),
     retries = 0 :: non_neg_integer(),
     max_retries :: non_neg_integer() | infinity,
-    %% Set once the terminal Reply has been delivered to the owner, so the
-    %% gen_server terminate/2 does not deliver a second (failure) Reply.
+    %% Set once the owner has the terminal Reply, so that the gen_server
+    %% terminate/2 does not send it a second, failure Reply.
     done = false :: boolean()
 }).
 
@@ -167,10 +169,12 @@ Optional:
 -doc """
 Starts (and links) a transaction worker for `Module`.
 
-`Opts` must contain `{db, Db}`. Optional keys: `read_version`
-(`undefined` | `V`, default `undefined`), `owner` (default the caller),
-`ref` (correlation token, default a fresh `make_ref/0`), `max_retries`
-(default `infinity`).
+`Opts` must contain `{db, Db}`. The optional keys are:
+
+- `read_version`: `undefined` or a version `V`. Defaults to `undefined`.
+- `owner`: defaults to the caller.
+- `ref`: the correlation token. Defaults to a fresh `make_ref/0`.
+- `max_retries`: defaults to `infinity`.
 """.
 -endif.
 -spec start_link(module(), term(), opts()) -> {ok, pid()} | {error, term()}.
@@ -196,11 +200,11 @@ start_monitor(Module, Args, Opts) ->
 -doc """
 Runs a transaction worker synchronously and returns its `Reply`.
 
-Convenience wrapper around `gen_server:start_monitor/3` (unlinked, started and
-monitored atomically): blocks until the worker delivers its terminal `Reply`, or
-returns `{error, {crashed, Reason}}` if the worker dies first. Intended for
-callers that want the explicit-lifecycle features (cached GRV, module-controlled
-retry) without managing the worker.
+Starts the worker with `gen_server:start_monitor/3`, which monitors it
+atomically without linking. Blocks until the worker delivers its terminal
+`Reply`, or returns `{error, {crashed, Reason}}` if the worker dies first. Use
+it when you want the lifecycle control, such as a cached GRV or retries decided
+by the module, without managing the worker yourself.
 """.
 -endif.
 -spec run(module(), term(), opts()) -> term().
@@ -280,7 +284,7 @@ handle_info(_Info, St) ->
 terminate(_Reason, #st{done = true}) ->
     ok;
 terminate(Reason, St = #st{done = false}) ->
-    %% Abnormal exit before a terminal Reply was delivered — tell the owner.
+    %% We are exiting abnormally before the owner got a terminal Reply, so tell it.
     _ = finish(St, {error, {terminated, Reason}}),
     ok.
 
@@ -291,11 +295,12 @@ code_change(_OldVsn, St, _Extra) ->
 %% Directive handling
 %% ---------------------------------------------------------------------------
 
-%% Run the transaction body (handle_begin first, handle_retry/handle_begin on a
-%% replay) and act on its directive.  The body invocation is wrapped so that a
-%% retryable FDB error raised *inside it* (e.g. a read at a stale pinned read
-%% version) routes through the same retry machinery as a commit conflict —
-%% retries are the callback module's decision (handle_conflict/2), not a crash.
+%% Runs the transaction body and acts on its directive. The first attempt runs
+%% handle_begin, and a replay runs handle_retry or handle_begin. We catch errors
+%% from the body so that a retryable FDB error raised inside it, such as a read at
+%% a stale pinned read version, goes through the same retry path as a commit
+%% conflict. The callback module decides whether to retry in handle_conflict/2,
+%% instead of the worker crashing.
 run_body(St = #st{mod = M, retries = N}) ->
     BodyResult =
         try
@@ -347,8 +352,8 @@ do_commit(St = #st{b = B, tx = Tx, mod = M, cb = Cb}) ->
         error:Reason -> handle_fdb_error(Reason, St)
     end.
 
-%% A backend error from the body or the commit: a non-FDB error is fatal; an FDB
-%% error code is offered to the module for a retry decision.
+%% Handles a backend error from the body or the commit. A non-FDB error is fatal.
+%% For an FDB error code, we let the module decide whether to retry.
 handle_fdb_error(Reason, St = #st{b = B}) ->
     case B:error_code(Reason) of
         error ->
@@ -380,7 +385,8 @@ retry_commit(Code, St = #st{retries = N, max_retries = Max}) when
 retry_commit(Code, St = #st{b = B, tx = Tx, retries = N}) ->
     try B:wait(B:on_error(Tx, Code)) of
         _ ->
-            %% Transaction reset for retry (read version cleared → fresh GRV).
+            %% on_error reset the transaction and cleared its read version, so
+            %% the retry gets a fresh GRV.
             run_body(St#st{retries = N + 1})
     catch
         error:Reason ->
@@ -400,7 +406,7 @@ apply_read_version(_B, _Tx, undefined) ->
 apply_read_version(B, Tx, Version) ->
     B:set_read_version(Tx, Version).
 
-%% Deliver the terminal Reply to the owner exactly once and mark the worker done.
+%% Delivers the terminal Reply to the owner exactly once and marks the worker done.
 finish(St = #st{done = true}, _Reply) ->
     St;
 finish(St = #st{owner = Owner, ref = Ref, mod = M, cb = Cb}, Reply) ->

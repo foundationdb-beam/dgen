@@ -37,7 +37,7 @@ One module, `DgenRegistryReplication.tla`:
 **Deliberately out of scope**: unregister, retract and `DOWN` cleanup; the
 §5.6 conflict trail and kill budget; metadata, queries and presence; membership
 joins and partial gathers, including the continuing-leader join fast path
-(`assume_fast_path/6` / `onboard_joiner` / `{peer_joined}`); `register_replicas
+(`assume_leadership_fast_path/6` / `cast_data_to_new_member` / `{peer_joined}`); `register_replicas
 > 1` (`RecvAck` resolves on the first follower ack); Erlang-distribution-only
 partitions. The simulation harness covers register/unregister concurrency. The
 module header in the `.tla` has the full scope note.
@@ -72,7 +72,7 @@ take seconds.
 | `DgenRegistryReplicationHandoffRaceUnique` | fail | the same race checked against `UniqueBinding` alone: the freed name is re-issued to a second pid |
 | `DgenRegistryReplicationHandoffGatherOnly` | fail | the gather fence alone off: it is needed on its own |
 | `DgenRegistryReplicationSnapMonotonicOnly` | fail | the snapshot guard alone off: it is needed on its own |
-| `DgenRegistryReplicationNoGuard` | fail | optimistic follower acks (`VersionGuardedAck = FALSE`) lose `DurableAcked`. The code's versionless `{register_reply, Ref, Result}` rolling-upgrade clause has this shape |
+| `DgenRegistryReplicationNoGuard` | fail | optimistic follower acks (`VersionGuardedAck = FALSE`) lose `DurableAcked` |
 | `DgenRegistryReplicationDegradeOpen` | fail | degrade-open (`strict_replication = false`) loses `DurableAcked` |
 | `DgenRegistryReplicationAckReachable` | fail | vacuity canary: `NoAcks` fails, so acks are actually reachable |
 | `DgenRegistryReplicationDegradedReachable` | fail | vacuity canary: `NoDegradedAssume` fails, so degraded assumes are actually reachable |
@@ -85,11 +85,11 @@ behaviour, and a green run on the other configs means much less.
 | Spec | Code |
 |---|---|
 | `Elect` | `dgen_registry_elector` committing a membership/leadership change (abstracted to one durable write) |
-| `AssumeGather` (incl. the `SafeAssumeGather` version-key fence) | the `assuming` statem state: `assume_genuine/6` → `spawn_assume_gather` → `gather_caught_up/6` → the `{assume_gathered}` continuation, valid only in `assuming` for its arming ref. The continuing-leader join fast path (`assume_fast_path/6` / `onboard_joiner` / `{peer_joined}`) dispatches in the `leader` state and is out of scope |
+| `AssumeGather` (incl. the `SafeAssumeGather` version-key fence) | the `assuming` statem state: `prepare_to_assume_leadership/6` → `spawn_leadership_gather` → `gather_until_caught_up/6` → the `{assume_gathered}` continuation, valid only in `assuming` for its arming ref. The continuing-leader join fast path (`assume_leadership_fast_path/6` / `cast_data_to_new_member` / `{peer_joined}`) dispatches in the `leader` state and is out of scope |
 | `HeartbeatBcast` / `RecvHeartbeat` | `handle_event(info, replica_heartbeat, leader, …)` → `broadcast_heartbeat/1` (`{names_batch, [], E, V, V, Self}`) / the empty batch through `dgen_registry_replica:offer_batch/5` |
 | `CanCommit`'s `dbLeader/dbEpoch` conjuncts | the fenced version-key bump in `dgen_registry_names:start_commit/4` (§5.1) |
 | `RegisterForward` | follower `route_register` forward → leader `{register_req}` → group commit → `broadcast_batch/5` + `{register_reply, Ref, yes, Version}` |
-| `RegisterDirect` + `RecvSync`/`RecvAck` | leader-local `route_register` → `dgen_registry_pipeline:await_acks/5` / `{replicate_sync}` / `{replicate_ack}` → `dgen_registry_pipeline:ack/3` |
+| `RegisterDirect` + `RecvSync`/`RecvAck` | leader-local `route_register` → `dgen_registry_pipeline:await_acks/5` / `{replicate_sync}` / `{replicate_ack}` → `dgen_registry_pipeline:record_ack/3` |
 | `DegradeTimeout` | `handle_info({replicate_timeout, _})` with `strict_replication = false` |
 | `RecvBcastApply/Drop/Gap` | `dgen_registry_replica:offer_batch/5` → `applied` / `stale_epoch`+`duplicate` / `gap` (one `{names_batch, …}` per commit version). The member's `{names_batch}` handler reacts to the verdict |
 | `RecvReply` | `dgen_registry_intents:on_reply/4` incl. the `awaiting_version` phase. Flushes are `dgen_registry_intents:on_version/2`, called from the `{names_batch}` handler's `applied` branch and on an accepted snapshot. On a leadership change the code re-drives a deferred ack as a fresh forward (`redrive/5`) where the spec drops it: a fresh `RegisterForward` in spec terms |

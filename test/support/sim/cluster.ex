@@ -33,7 +33,7 @@ defmodule DGen.Sim.Cluster do
   table: `nodes()` does not list it and `dgen_utils:node_reachable/1` therefore
   answers `true` for every member id, since every member id's node component is
   the one real `node()`. So the *member*-level reactions to a node event are
-  exercised here (`handle_info({nodeup, _})`'s rejoin and unregister re-drive,
+  exercised here (the `{nodeup, _}` handler's rejoin and unregister re-drive,
   the peer-monitor DOWN that drives `{member_down}`), and the connector's
   reachability-keyed backstops — the `{nodedown, Node}` reap and the leader
   probe — are not: they filter member ids by node and no member id names a
@@ -374,8 +374,8 @@ defmodule DGen.Sim.Cluster do
         published
         |> Map.delete(:replica)
         |> Map.merge(%{
-          epoch: :dgen_registry_replica.epoch(replica),
-          applied_version: :dgen_registry_replica.version(replica)
+          epoch: :dgen_registry_replica.get_epoch(replica),
+          applied_version: :dgen_registry_replica.get_version(replica)
         })
 
       other ->
@@ -582,7 +582,7 @@ defmodule DGen.Sim.Cluster do
   which no other fault or lifecycle helper reaches. Returns `{cluster, name}`.
 
   On a healthy cluster this exercises the continuing-leader **fast path**
-  (`onboard_joiner` / `{peer_joined}` in `dgen_registry_member.erl`): the
+  (`cast_data_to_new_member` / `{peer_joined}` in `dgen_registry_member.erl`): the
   leader snapshots only the joiner and tells existing followers to just
   monitor it — no gather, no re-assume, epoch unchanged. That path is
   explicitly OUT of the TLA+ model's scope (its handoff premise is "the gather

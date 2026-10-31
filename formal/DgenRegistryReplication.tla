@@ -142,7 +142,7 @@ Elect(m) ==
                    epoch, leaderView, deferred, pendingAcks, resyncReq, chan>>
 
 \* The genuine-leadership-change path: elector_assume_and_distribute ->
-\* spawn_assume_gather -> gather_maps -> the {assume_gathered} continuation.
+\* spawn_leadership_gather -> gather_maps -> the {assume_gathered} continuation.
 \* Modeled atomically; the gather reaches every live member (see module
 \* header).  Freshest-wins: adopt the max-applied_version replica (version
 \* tie => identical content, which PrefixConsistency asserts).  Deferred
@@ -468,7 +468,7 @@ DegradeTimeout(l) ==
 (***************************************************************************)
 
 \* Epoch-guarded (Epoch >= CurrentEpoch) wholesale re-baseline.  On a
-\* leadership change the deferred acks are rejected (do_leader_changed);
+\* leadership change the deferred acks are rejected (the apply_names_snapshot handler);
 \* on a same-leader snapshot (a resync) the version advance releases them
 \* (flush_deferred).  A member that believed it led relinquishes.
 \*

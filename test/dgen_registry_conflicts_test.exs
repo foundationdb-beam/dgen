@@ -6,7 +6,7 @@ defmodule DGen.RegistryConflictsTest do
   returns the kills and alarms for the member to carry out. These tests pin
   which gathered states are a conflict, what the remedy does with one (and when
   it holds back), when the release trail may expire, and the version-defined
-  `degraded/5`.
+  `is_reconstruction_degraded/5`.
   """
   use ExUnit.Case, async: true
 
@@ -99,21 +99,6 @@ defmodule DGen.RegistryConflictsTest do
                )
     end
 
-    test "a legacy bare-pid trail entry (rolling upgrade) still suppresses" do
-      p1 = spawn_live()
-      p2 = spawn_live()
-      # A pre-upgrade member's gathered trail keys by pid alone; the detector
-      # honours that coarser shape until the mixed entries age out.
-      released = %{p2 => System.system_time(:millisecond)}
-
-      assert [] =
-               detect(
-                 %{n: rec(p1)},
-                 [%{n: rec(p1)}, %{n: rec(p2)}],
-                 released
-               )
-    end
-
     test "a dead divergent pid is not a conflict" do
       p1 = spawn_live()
       p2 = spawn(fn -> :ok end)
@@ -171,9 +156,9 @@ defmodule DGen.RegistryConflictsTest do
     end
 
     # The leader adjudicates on its own loop, so liveness is probed ahead of time in
-    # the gather helpers (conflict_pids/3 says which pids) and handed in as data
+    # the gather helpers (get_conflict_pids/3 says which pids) and handed in as data
     # (detect/4). No probe — no RPC — runs during adjudication.
-    test "conflict_pids/3 names exactly the pids adjudication would probe" do
+    test "get_conflict_pids/3 names exactly the pids adjudication would probe" do
       [p1, p2, p3, p4] = for _ <- 1..4, do: spawn_live()
 
       fresh = %{n: rec(p1), agreed: rec(p3)}
@@ -181,7 +166,7 @@ defmodule DGen.RegistryConflictsTest do
       released = %{{:trailed, p4} => System.system_time(:millisecond)}
 
       assert Enum.sort([p1, p2]) ==
-               :dgen_registry_conflicts.conflict_pids(fresh, witnesses, released)
+               :dgen_registry_conflicts.get_conflict_pids(fresh, witnesses, released)
     end
 
     test "detect/4 decides on the liveness it is given, not by probing" do
@@ -251,46 +236,47 @@ defmodule DGen.RegistryConflictsTest do
 
     test "merging keeps each entry's latest release time" do
       p = spawn_live()
-      c = Conflicts.released([{:n, p}], 10, Conflicts.new())
+      c = Conflicts.record_releases([{:n, p}], 10, Conflicts.new())
       c = Conflicts.merge([%{{:n, p} => 5}, %{{:m, p} => 7}], c)
 
-      assert Conflicts.trail(c) == %{{:n, p} => 10, {:m, p} => 7}
+      assert Conflicts.get_trail(c) == %{{:n, p} => 10, {:m, p} => 7}
     end
 
     test "entries expire after the TTL only while every member is connected" do
       p = spawn_live()
-      c = Conflicts.released([{:n, p}], 0, Conflicts.new())
+      c = Conflicts.record_releases([{:n, p}], 0, Conflicts.new())
 
-      assert Conflicts.trail(Conflicts.prune(5_000, false, @ttl_config, c)) != %{}
-      assert Conflicts.trail(Conflicts.prune(5_000, true, @ttl_config, c)) == %{}
+      assert Conflicts.get_trail(Conflicts.prune(5_000, false, @ttl_config, c)) != %{}
+      assert Conflicts.get_trail(Conflicts.prune(5_000, true, @ttl_config, c)) == %{}
     end
 
     test "entries outlive a member departure by a TTL" do
       p = spawn_live()
 
       c =
-        Conflicts.released([{:n, p}], 0, Conflicts.new()) |> then(&Conflicts.departed(4_500, &1))
+        Conflicts.record_releases([{:n, p}], 0, Conflicts.new())
+        |> then(&Conflicts.record_departure(4_500, &1))
 
-      assert Conflicts.trail(Conflicts.prune(5_000, true, @ttl_config, c)) != %{}
-      assert Conflicts.trail(Conflicts.prune(6_000, true, @ttl_config, c)) == %{}
+      assert Conflicts.get_trail(Conflicts.prune(5_000, true, @ttl_config, c)) != %{}
+      assert Conflicts.get_trail(Conflicts.prune(6_000, true, @ttl_config, c)) == %{}
     end
   end
 
-  describe "degraded/5" do
+  describe "is_reconstruction_degraded/5" do
     test "is exactly a reconstruction below the durable version key" do
-      assert Conflicts.degraded(9, 10, [:a], [], %{})
-      refute Conflicts.degraded(10, 10, [:a], [], %{})
+      assert Conflicts.is_reconstruction_degraded(9, 10, [:a], [], %{})
+      refute Conflicts.is_reconstruction_degraded(10, 10, [:a], [], %{})
     end
 
     test "ignores who answered the gather when the key is known" do
       # :b never answered and was never synced — still not degraded.
-      refute Conflicts.degraded(10, 10, [:a, :b], [], %{a: :snapshot})
+      refute Conflicts.is_reconstruction_degraded(10, 10, [:a, :b], [], %{a: :snapshot})
     end
 
     test "falls back to reachability when the key could not be read" do
-      assert Conflicts.degraded(10, :unknown, [:a, :b], [], %{a: :snapshot})
+      assert Conflicts.is_reconstruction_degraded(10, :unknown, [:a, :b], [], %{a: :snapshot})
       # A member marked fresh (never synced) holds nothing to miss.
-      refute Conflicts.degraded(10, :unknown, [:a, :b], [:b], %{a: :snapshot})
+      refute Conflicts.is_reconstruction_degraded(10, :unknown, [:a, :b], [:b], %{a: :snapshot})
     end
   end
 end

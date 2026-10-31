@@ -79,9 +79,8 @@ defmodule DGen.Sim.Invariants do
   first. It does not hold continuously, and not because of a bug: members write
   their replica *optimistically*, outside the replicated stream, without advancing
   `applied_version`. `route_unregister/3` deletes the row locally the moment the
-  caller asks, before the leader has committed anything, and a follower's
-  `handle_register_reply/4` inserts the row when the leader's `yes` arrives. Both
-  leave that member holding different content from its peers *at the same version*
+  caller asks, before the leader has committed anything. That leaves the member
+  holding different content from its peers *at the same version*
   for as long as the batch takes to come back around.
 
   So a mid-flight difference here is ordinary speculation, not divergence. What

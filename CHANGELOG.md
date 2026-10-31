@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.4.3 (TBD)
+## v0.5.0 (TBD)
 
 ### Bug fixes
 
@@ -18,6 +18,11 @@
 - `dgen_registery_member`'s internal implementation is refactored into
   `dgen_registry_replica`, `dgen_registry_intents`, `dgen_registry_pipeline`,
   and `dgen_registry_conflicts`.
+
+### Breaking changes
+
+- Some internal legacy behavior has been removed. It may affect systems during
+  a rolling upgrade from 0.4.x to 0.5.x.
 
 ## v0.4.2 (2026-10-04)
 

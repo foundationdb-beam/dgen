@@ -8,11 +8,11 @@ Behaviour defining the storage backend for dgen.
 
 A backend must implement all required callbacks to provide:
 
-- **Transactions** — serializable read-write transactions over the keyspace.
-- **Key-value operations** — get, set, clear, range reads, atomic adds.
-- **Watches** — notifications when a key changes.
-- **Versionstamps** — globally-ordered, unique write stamps for FIFO queuing.
-- **Directory layer** — tuple-key packing, range calculation, namespace isolation.
+- **Transactions.** Serializable read-write transactions over the keyspace.
+- **Key-value operations.** Get, set, clear, range reads, and atomic adds.
+- **Watches.** Notifications when a key changes.
+- **Versionstamps.** Unique, globally ordered write stamps, used for FIFO queuing.
+- **Directory layer.** Tuple-key packing, range calculation, and namespace isolation.
 
 The default backend is `dgen_erlfdb`, which delegates to FoundationDB via the
 `erlfdb` library.
@@ -35,9 +35,9 @@ config :dgen, backend: MyBackend
 
 ## Implementing a backend
 
-A backend module must implement this behaviour. All watch and future operations
-must return `{dgen_future, Ref, BackendData}` tuples where `Ref` is a reference
-that will appear in a `{Ref, ready}` message sent to the watching process.
+A backend module must implement this behaviour. Every watch and future operation
+must return a `{dgen_future, Ref, BackendData}` tuple. `Ref` is a reference, and
+the backend later sends `{Ref, ready}` to the watching process.
 
 ## Types
 
@@ -89,33 +89,36 @@ when
 
 %% Conflict ranges and read-version control.
 %%
-%% `add_read_conflict_key/2` records a read-conflict on `Key` *without* reading
-%% it: the commit fails if another transaction wrote `Key` between this
-%% transaction's read version and its commit version.  Used by the registry to
-%% fence a registration commit against a concurrent leadership change without
-%% paying a storage read for the leader key's value.
+%% `add_read_conflict_key/2` records a read conflict on `Key` without reading it.
+%% The commit then fails if another transaction wrote `Key` between this
+%% transaction's read version and its commit version. The registry uses this to
+%% fence a registration commit against a concurrent leadership change, without
+%% paying for a storage read of the leader key.
 %%
-%% `set_read_version/2` pins the read version (e.g. to a prior commit version)
-%% so a fenced write-only batch need not pay a GRV; `get_committed_version/1`
-%% returns that prior commit version after a successful commit.
+%% `set_read_version/2` pins the read version, for example to an earlier commit
+%% version, so a fenced write-only batch doesn't have to fetch a new read version.
+%% `get_committed_version/1` returns a transaction's commit version after it
+%% commits, which the caller can pin on the next batch.
 -callback add_read_conflict_key(Tx :: tx(), Key :: key()) -> ok.
 -callback get_read_version(Tx :: tx()) -> future().
 -callback set_read_version(Tx :: tx(), Version :: integer()) -> ok.
 -callback get_committed_version(Tx :: tx()) -> integer().
 
-%% Transaction lifecycle (explicit, process-model form).
+%% Explicit transaction lifecycle.
 %%
-%% `transactional/2` runs and auto-retries a closure; these callbacks instead
-%% expose the underlying steps so a caller (`dgen_transaction`) can own a single
-%% transaction across messages, decide when to commit, and control retries.
+%% `transactional/2` runs a closure and retries it automatically. These callbacks
+%% expose the individual steps instead, so a caller such as `dgen_transaction` can
+%% keep one transaction open across messages, decide when to commit, and control
+%% retries itself.
 %%
 %% `create_transaction/1` opens a fresh transaction against a database handle.
-%% `commit/1` returns a future; waiting it yields `ok` or **raises** the backend's
-%% transaction error.  `on_error/2` takes the FDB error code and returns a future
-%% whose wait succeeds (after backoff, transaction reset for retry) iff the error
-%% is retryable, and raises otherwise.  `error_code/1` maps a caught exception
-%% reason to its integer Backend error code, or `error` if it is not one — so
-%% callers never match the backend-specific error tuple directly.
+%% `commit/1` returns a future. Waiting on it returns `ok` or raises the backend's
+%% transaction error. `on_error/2` takes the FDB error code and returns a future.
+%% If the error is retryable, waiting on that future backs off, resets the
+%% transaction for a retry, and succeeds. Otherwise it raises. `error_code/1` maps
+%% a caught exception reason to the backend's integer error code, or to `error` if
+%% it isn't a backend error. This way callers never match the backend-specific
+%% error tuple directly.
 -callback create_transaction(Db :: db()) -> tx().
 -callback commit(Tx :: tx()) -> future().
 -callback on_error(Tx :: tx(), ErrorCode :: integer()) -> future().
@@ -131,7 +134,7 @@ when
 -callback wait(Future :: future()) -> term().
 -callback wait_for_all(Futures :: [future()]) -> [term()].
 
-%% Watches — must return {dgen_future, Ref, BackendData}
+%% Watches. These must return `{dgen_future, Ref, BackendData}`.
 -callback watch(Tx :: tx(), Key :: key()) -> future().
 -callback watch(Tx :: tx(), Key :: key(), Opts :: list()) -> future().
 

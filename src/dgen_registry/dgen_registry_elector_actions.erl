@@ -9,41 +9,43 @@
 -moduledoc false.
 -endif.
 
-%% Post-commit actions returned by `dgen_registry_elector:handle_cast_tx/3`.  Each is a
-%% fun of the committed elector state, run by `dgen_server` in the elector process
-%% after the transaction commits.
+%% Post-commit actions returned by `dgen_registry_elector:handle_cast_tx/3`. Each one is
+%% a fun that takes the committed elector state. `dgen_server` runs it in the elector
+%% process after the transaction commits.
 %%
 %% *This documentation is LLM-generated. See the AI disclosure in README.md.*
 
 -export([
-    assume_distribute/1,
-    presence_push/1
+    push_leader_to_members/1,
+    push_presence_to_leader/1
 ]).
 
-%% Post-commit: an unreachable leader must not fail the action (the change is already
-%% committed; members self-correct on the next membership event).
-assume_distribute(TriggerMember) ->
+%% Tells the leader to take over and distribute the snapshot. An unreachable leader
+%% must not fail the action. The change is already committed, and members correct
+%% themselves on the next membership event.
+push_leader_to_members(TriggerMember) ->
     fun(#{members := All, leader := Leader, epoch := Epoch}) ->
         case Leader of
             undefined ->
                 ok;
             _ ->
                 try
-                    %% The leader pulls subscriptions from its co-located elector.
+                    %% The leader reads subscriptions from the elector on its own node.
                     call_to_member(
                         Leader,
                         {elector_assume_and_distribute, TriggerMember, maps:keys(All),
-                            member_tokens(All), fresh_ids(All), Epoch}
+                            get_member_tokens(All), get_fresh_ids(All), Epoch}
                     )
                 catch
                     exit:Reason ->
-                        depose_if_dead(Leader, Reason, All)
+                        maybe_force_leader_down(Leader, Reason, All)
                 end
         end
     end.
 
-%% Fire-and-forget; a dropped push is caught up by the reseed on the next handoff.
-presence_push(Update) ->
+%% Sends a presence change to the leader without waiting. If the push is dropped, the
+%% reseed on the next handoff catches the leader up.
+push_presence_to_leader(Update) ->
     fun(#{leader := Leader, epoch := Epoch}) ->
         case Leader of
             undefined -> ok;
@@ -51,12 +53,13 @@ presence_push(Update) ->
         end
     end.
 
-%% `noproc` means the leader's node answered but its registry is gone; leaving it as
-%% leader strands the cluster, so force a re-election (fenced with its current token).
-%% Not-connected is ambiguous and deliberately not deposed: disambiguating would open a
-%% distribution connection and defeat partition detection.  Timeouts = slow, left alone.
-%% `self()` is the elector: actions run in its process.
-depose_if_dead(Leader, Reason, All) ->
+%% `noproc` means the leader's node answered but its registry is gone. Leaving it as
+%% leader would strand the cluster, so we force a re-election by casting `member_down`
+%% with its current token. We deliberately don't depose a leader that is merely not
+%% connected. That case is ambiguous, and finding out would open a distribution
+%% connection and defeat partition detection. A timeout just means the leader is slow,
+%% so we leave it alone too. `self()` is the elector, because actions run in its process.
+maybe_force_leader_down(Leader, Reason, All) ->
     case is_noproc(Reason) andalso maps:get(Leader, All, undefined) of
         #{join_token := Token} ->
             % We have to avoid calling `dgen_registry_elector:member_down/3` because
@@ -70,23 +73,23 @@ is_noproc(noproc) -> true;
 is_noproc({noproc, _}) -> true;
 is_noproc(_) -> false.
 
-%% Same auto-reconnect guard as call_to_member/2.
+%% Uses the same guard against auto-reconnect as call_to_member/2.
 push_to_leader({Node, Name}, Msg) ->
     case dgen_utils:node_reachable(Node) of
         true -> gen_statem:cast({Name, Node}, Msg);
         false -> ok
     end.
 
-member_tokens(Members) ->
+get_member_tokens(Members) ->
     maps:map(fun(_, #{join_token := T}) -> T end, Members).
 
-fresh_ids(Members) ->
+get_fresh_ids(Members) ->
     [Id || {Id, Info} <- maps:to_list(Members), maps:get(fresh, Info, false)].
 
 call_to_member({Node, Name}, Msg) ->
-    %% Never let the call auto-reconnect a disconnected node: the resulting nodeup makes
-    %% the peer re-join with a new token, so its `{member_down}` is discarded as stale
-    %% and the partition goes undetected (§5.7).
+    %% Never let the call auto-reconnect a disconnected node. The resulting nodeup
+    %% makes the peer re-join with a new token. Its `{member_down}` is then discarded as
+    %% stale, and the partition goes undetected (§5.7).
     case dgen_utils:node_reachable(Node) of
         true -> gen_statem:call({Name, Node}, Msg, ?SnapshotTimeout);
         false -> exit({nodedown, Node})

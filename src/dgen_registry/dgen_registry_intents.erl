@@ -2,40 +2,47 @@
 
 -define(DOCATTRS, ?OTP_RELEASE >= 27).
 
+-include("dgen_registry_member.hrl").
+
 -if(?DOCATTRS).
 -moduledoc false.
 -endif.
 
-%% A non-leader member's unfinished client requests: writes only the leader can commit.
-%% `§N.N` refers to docs/design/dgen_registry_design.md.
+%% Tracks the client requests a non-leader member is holding until the leader
+%% commits them. `§N.N` refers to docs/design/dgen_registry_design.md.
 %%
-%% An intent owes a reply (a blocked caller's `From`), an effect (a change that must
-%% reach the leader), or both. It is a kind in a phase, keyed by its forward's reference;
-%% a reply under an unknown reference (superseded or answered) is ignored.
+%% Each intent is one request. It may owe the caller a reply, owe the leader a
+%% change, or both. We store it under the reference we sent with the forward, so
+%% the leader's reply can find it. If a reply arrives under a reference we no
+%% longer hold, the intent was already answered or re-sent, and we drop the reply.
 %%
-%%   kinds                              phases
-%%   {register, Name, Pid, Meta}        awaiting_leader          no reachable leader
-%%   {unregister, Name, ReleasedPid}    {forwarded, Leader}      sent; awaiting a reply
-%%   {set_meta, Name, Index, Data}      {awaiting_version, V, L} L committed it at V;
-%%                                                               awaiting our replica
+%% An intent moves through these phases:
 %%
-%% Three events move it: on_reply/4 (the leader answered), on_version/2 (our replica
-%% advanced), redrive/5 (a leader may have been established).
+%%   awaiting_leader           No leader is reachable yet.
+%%   {forwarded, L}            We sent it to leader L and are waiting for a reply.
+%%   {awaiting_version, V, L}  L committed it at version V. We are waiting for our
+%%                             replica to reach V.
 %%
-%% Re-drive follows idempotence, by kind alone:
-%%   - register: re-routed until its outcome is known. Same pid, same name is idempotent
-%%     (§5.2), so `no` is always adjudicated, never caused by leadership moving.
-%%   - unregister: re-driven as a pid-guarded retract, safe against re-registration.
-%%   - set_meta: a replace, unsafe to re-send under reordering; if its leader no longer
-%%     leads, the caller gets `{error, no_leader}`.
+%% Three events move it forward: on_reply/4 (the leader answered), on_version/2
+%% (our replica advanced), and redrive/5 (leadership may have changed).
 %%
-%% Pure: functions return effects for the member to carry out.
+%% When leadership changes, each kind is re-sent only as far as re-sending is safe:
+%%   - register: re-sent until we know the outcome. Registering the same pid under
+%%     the same name twice is harmless (§5.2), so a `no` always means another pid
+%%     holds the name, never that leadership moved.
+%%   - unregister: re-sent as a retract that only removes the name if the same pid
+%%     still holds it, so it can't undo a later registration.
+%%   - set_meta: replaces the value, so a late duplicate could overwrite a newer
+%%     one. If its leader has stepped down, the caller gets `{error, no_leader}`.
+%%
+%% The functions here have no side effects. They return effects for the member
+%% to carry out.
 %%
 %% *This documentation is LLM-generated. See the AI disclosure in README.md.*
 
 -export([new/0, submit/5, on_reply/4, on_version/2, redrive/5, prune/3]).
 
--export_type([t/0, kind/0, route/0, scope/0, effect/0]).
+-export_type([t/0, kind/0, phase/0, route/0, scope/0, effect/0]).
 
 -type member_id() :: dgen_registry_elector:member_id().
 -type from() :: gen_server:from().
@@ -50,26 +57,7 @@
     | {forwarded, member_id()}
     | {awaiting_version, non_neg_integer(), member_id()}.
 
--record(intent, {
-    kind :: kind(),
-    phase :: phase(),
-    %% `answered`: the reply was given but the effect is still owed.
-    from :: from() | answered,
-    %% Wall-clock ms of the request; compared against the caller timeout.
-    at :: integer(),
-    %% Arrival order. Effects are emitted in this order, never map (reference) order,
-    %% so the message schedule is reproducible under deterministic simulation.
-    seq :: non_neg_integer()
-}).
-
--record(intents, {
-    all = #{} :: #{reference() => #intent{}},
-    %% Ref => V of the `awaiting_version` subset: a replica advance scans only these.
-    deferred = #{} :: #{reference() => non_neg_integer()},
-    next_seq = 0 :: non_neg_integer()
-}).
-
--opaque t() :: #intents{}.
+-type t() :: #intents{}.
 
 %% Where a request can go right now, as the member sees it.
 -type route() :: self | {remote, member_id()} | none.
@@ -78,16 +66,14 @@
 
 -type effect() ::
     {reply, from(), term()}
-    %% Tracked forward to the leader.
+    %% Forward to the leader and wait for its reply.
     | {forward, member_id(), reference(), kind()}
-    %% Untracked pid-guarded clear.
+    %% Ask the leader to clear the name if this pid still holds it. No reply.
     | {retract, member_id(), Name :: term(), pid()}
-    %% We lead: our own commit pipeline.
+    %% We are the leader, so commit it ourselves.
     | {enqueue, kind(), from() | answered}
-    %% A committed `yes` is ahead of our replica: ask the leader for a snapshot.
-    | {resync, member_id()}
-    %% A pre-version leader's `yes` (rolling upgrade): the reply binds the row.
-    | {insert_row, Name :: term(), pid(), Meta :: {map(), term()}}.
+    %% Our replica is behind a committed `yes`, so ask the leader for a snapshot.
+    | {resync, member_id()}.
 
 -spec new() -> t().
 new() -> #intents{}.
@@ -96,9 +82,10 @@ new() -> #intents{}.
 %% Submission
 %% ---------------------------------------------------------------------------
 
-%% Accept a request on a non-leader. A forwardable unregister/set_meta is tracked and
-%% its caller waits for the commit; everything else, including an `answered`
-%% unregister the pipeline surrendered, takes the re-drive path.
+%% Accepts a request on a non-leader. When a leader is reachable, an unregister or
+%% set_meta is forwarded and its caller waits for the commit. Everything else goes
+%% through dispatch/4, the same path a re-drive takes. That includes an unregister
+%% the pipeline handed back already answered.
 -spec submit(kind(), from() | answered, integer(), route(), t()) -> {t(), [effect()]}.
 submit({set_meta, _, _, _}, From, _Now, Route, T) when Route =:= none; Route =:= self ->
     {T, [{reply, From, {error, no_leader}}]};
@@ -106,10 +93,10 @@ submit(Kind, From, Now, Route, T = #intents{next_seq = Seq}) ->
     I = #intent{kind = Kind, phase = awaiting_leader, from = From, at = Now, seq = Seq},
     T1 = T#intents{next_seq = Seq + 1},
     case Route of
-        %% An `answered` unregister re-drives as a pid-guarded retract instead.
+        %% An unregister that was already answered goes to dispatch/4 as a retract.
         {remote, L} when element(1, Kind) =/= register, From =/= answered ->
             Ref = make_ref(),
-            {put(Ref, I#intent{phase = {forwarded, L}}, T1), [{forward, L, Ref, Kind}]};
+            {put_intent(Ref, I#intent{phase = {forwarded, L}}, T1), [{forward, L, Ref, Kind}]};
         _ ->
             dispatch(make_ref(), I, Route, T1)
     end.
@@ -118,75 +105,76 @@ submit(Kind, From, Now, Route, T = #intents{next_seq = Seq}) ->
 %% The three events
 %% ---------------------------------------------------------------------------
 
-%% The leader answered the forward under `Ref`; `Applied` is our replica's version.
-%% A register `yes` is version-guarded (§5.5): answered only once our replica holds the
-%% committing batch, so the handoff gather can see this member as a second holder.
-%% Never write the row here: the same batch may have cleared the name too.
+%% Handles the leader's reply to the forward sent under `Ref`. `Applied` is our
+%% replica's version. We hold a register `yes` until our replica reaches the
+%% version that committed it (§5.5). Otherwise a leadership handoff could gather
+%% our replica without the name and lose it. We don't write the row here, because
+%% the same batch may also have cleared the name.
 -spec on_reply(reference(), term(), non_neg_integer(), t()) -> {t(), [effect()]}.
 on_reply(Ref, Reply, Applied, T = #intents{all = All}) ->
     case All of
         #{Ref := I = #intent{phase = {forwarded, Leader}}} ->
-            resolve(Ref, I, Leader, Reply, Applied, delete(Ref, T));
+            resolve_reply(Ref, I, Leader, Reply, Applied, delete_intent(Ref, T));
         _ ->
             {T, []}
     end.
 
-resolve(_Ref, #intent{kind = {register, Name, Pid, Meta}, from = From}, _L, Reply, _A, T) when
-    Reply =:= {register, yes, legacy}
-->
-    %% Pre-version leader: no version to guard on; the reply alone binds the row.
-    {T, [{reply, From, yes}, {insert_row, Name, Pid, Meta}]};
-resolve(Ref, I = #intent{kind = {register, _, _, _}, from = From}, L, {register, yes, V}, A, T) ->
+resolve_reply(
+    Ref, I = #intent{kind = {register, _, _, _}, from = From}, L, {register, yes, V}, A, T
+) ->
     case V =< A of
         true -> {T, [{reply, From, yes}]};
-        false -> {put(Ref, I#intent{phase = {awaiting_version, V, L}}, T), [{resync, L}]}
+        false -> {put_intent(Ref, I#intent{phase = {awaiting_version, V, L}}, T), [{resync, L}]}
     end;
-resolve(_Ref, #intent{kind = {register, _, _, _}, from = From}, _L, {register, no, _}, _A, T) ->
+resolve_reply(_Ref, #intent{kind = {register, _, _, _}, from = From}, _L, {register, no, _}, _A, T) ->
     {T, [{reply, From, no}]};
-resolve(_Ref, #intent{kind = {set_meta, _, _, _}, from = From}, _L, {set_meta, Result}, _A, T) ->
+resolve_reply(
+    _Ref, #intent{kind = {set_meta, _, _, _}, from = From}, _L, {set_meta, Result}, _A, T
+) ->
     {T, [{reply, From, Result}]};
-resolve(_Ref, #intent{kind = {unregister, _, _}, from = From}, _L, unregister, _A, T) ->
-    {T, reply_if_owed(From, ok)};
-resolve(Ref, I, _Leader, _Mismatched, _Applied, T) ->
-    %% A reply whose shape does not match the kind it is keyed under: keep waiting.
-    {put(Ref, I, T), []}.
+resolve_reply(_Ref, #intent{kind = {unregister, _, _}, from = From}, _L, unregister, _A, T) ->
+    {T, maybe_reply(From, ok)};
+resolve_reply(Ref, I, _Leader, _Mismatched, _Applied, T) ->
+    %% The reply doesn't match the request's kind, so keep waiting.
+    {put_intent(Ref, I, T), []}.
 
-%% Release every deferred `yes` our replica now covers.
+%% Answers every held `yes` whose version our replica has now reached.
 -spec on_version(non_neg_integer(), t()) -> {t(), [effect()]}.
 on_version(_Applied, T = #intents{deferred = D}) when map_size(D) =:= 0 ->
     {T, []};
 on_version(Applied, T = #intents{all = All, deferred = D}) ->
-    Due = in_order([{Ref, maps:get(Ref, All)} || {Ref, V} <- maps:to_list(D), V =< Applied]),
+    Due = sort_by_arrival([{Ref, maps:get(Ref, All)} || {Ref, V} <- maps:to_list(D), V =< Applied]),
     lists:foldl(
         fun({Ref, #intent{from = From}}, {Acc, Effs}) ->
-            {delete(Ref, Acc), Effs ++ [{reply, From, yes}]}
+            {delete_intent(Ref, Acc), Effs ++ [{reply, From, yes}]}
         end,
         {T, []},
         Due
     ).
 
-%% Re-drive unresolved intents by kind (see header); register/set_meta past `TTL` (the
-%% caller timeout) are dropped unreplied. A register awaiting a version from the current
-%% leader is kept; one forwarded to it is kept only when `Scope = moved`. With `all` (a
-%% node came back) that forward may have died with the link, so it is re-sent; a
-%% duplicate is decided idempotently but costs a second commit.
+%% Re-sends unresolved intents, following the rules in the module header.
+%% Registers and set_metas older than `TTL` (the caller's timeout) are dropped
+%% without a reply, since nobody is waiting. A register already waiting on the
+%% current leader is left alone. With `Scope = all`, a node has reconnected and
+%% a forward to it may have been lost with the old link, so we send it again. A
+%% duplicate is harmless but costs an extra commit.
 -spec redrive(route(), scope(), integer(), non_neg_integer(), t()) -> {t(), [effect()]}.
 redrive(Route, Scope, Now, TTL, T = #intents{all = All}) ->
     {T1, EffsRev} = lists:foldl(
         fun({Ref, I}, {Acc, Effs}) ->
-            {Acc1, New} = redrive_one(Ref, I, Route, Scope, Now, TTL, delete(Ref, Acc)),
+            {Acc1, New} = redrive_one(Ref, I, Route, Scope, Now, TTL, delete_intent(Ref, Acc)),
             {Acc1, lists:reverse(New, Effs)}
         end,
         {T, []},
-        in_order(maps:to_list(All))
+        sort_by_arrival(maps:to_list(All))
     ),
     {T1, lists:reverse(EffsRev)}.
 
 redrive_one(Ref, I = #intent{kind = {register, _, _, _}, at = At}, Route, Scope, Now, TTL, T) ->
     case {Now - At >= TTL, I#intent.phase, Route} of
         {true, _, _} -> {T, []};
-        {false, {awaiting_version, _V, L}, {remote, L}} -> {put(Ref, I, T), []};
-        {false, {forwarded, L}, {remote, L}} when Scope =:= moved -> {put(Ref, I, T), []};
+        {false, {awaiting_version, _V, L}, {remote, L}} -> {put_intent(Ref, I, T), []};
+        {false, {forwarded, L}, {remote, L}} when Scope =:= moved -> {put_intent(Ref, I, T), []};
         {false, _, _} -> dispatch(make_ref(), I#intent{phase = awaiting_leader}, Route, T)
     end;
 redrive_one(Ref, I = #intent{kind = {unregister, _, _}}, Route, _Scope, _Now, _TTL, T) ->
@@ -195,18 +183,19 @@ redrive_one(Ref, I = #intent{kind = {set_meta, _, _, _}}, Route, _Scope, Now, TT
     #intent{from = From, at = At} = I,
     case {Now - At >= TTL, I#intent.phase, Route} of
         {true, _, _} -> {T, []};
-        {false, {forwarded, L}, {remote, L}} -> {put(Ref, I, T), []};
+        {false, {forwarded, L}, {remote, L}} -> {put_intent(Ref, I, T), []};
         {false, _, _} -> {T, [{reply, From, {error, no_leader}}]}
     end.
 
-%% Drop timed-out register/set_meta intents so a long leaderless window cannot grow
-%% the map. Unregisters are kept: their effect is owed whether or not anyone waits.
+%% Drops timed-out registers and set_metas so the map can't grow during a long
+%% stretch without a leader. Unregisters are kept, because the name must still be
+%% removed even when nobody is waiting.
 -spec prune(integer(), non_neg_integer(), t()) -> t().
 prune(Now, TTL, T = #intents{all = All}) ->
     maps:fold(
         fun
             (_Ref, #intent{kind = {unregister, _, _}}, Acc) -> Acc;
-            (Ref, #intent{at = At}, Acc) when Now - At >= TTL -> delete(Ref, Acc);
+            (Ref, #intent{at = At}, Acc) when Now - At >= TTL -> delete_intent(Ref, Acc);
             (_Ref, _I, Acc) -> Acc
         end,
         T,
@@ -217,36 +206,39 @@ prune(Now, TTL, T = #intents{all = All}) ->
 %% Internal
 %% ---------------------------------------------------------------------------
 
-%% Send a register/unregister where `Route` allows, keeping it while it owes something.
+%% Sends a register or unregister along `Route`, and keeps the intent while it
+%% still owes something.
 dispatch(_Ref, #intent{kind = Kind = {register, _, _, _}, from = From}, self, T) ->
     {T, [{enqueue, Kind, From}]};
 dispatch(Ref, I = #intent{kind = Kind = {register, _, _, _}}, {remote, L}, T) ->
-    {put(Ref, I#intent{phase = {forwarded, L}}, T), [{forward, L, Ref, Kind}]};
+    {put_intent(Ref, I#intent{phase = {forwarded, L}}, T), [{forward, L, Ref, Kind}]};
 dispatch(Ref, I = #intent{kind = {register, _, _, _}}, none, T) ->
-    {put(Ref, I#intent{phase = awaiting_leader}, T), []};
-%% An unregister's caller is answered `ok` now; the removal follows as a retract.
+    {put_intent(Ref, I#intent{phase = awaiting_leader}, T), []};
+%% An unregister's caller gets `ok` right away. The removal follows as a retract.
 dispatch(_Ref, #intent{kind = {unregister, _Name, undefined}, from = From}, _Route, T) ->
-    %% Nothing was bound locally when it was asked: nothing to retract.
-    {T, reply_if_owed(From, ok)};
+    %% The name wasn't bound locally when the caller asked, so there's nothing to retract.
+    {T, maybe_reply(From, ok)};
 dispatch(_Ref, #intent{kind = Kind = {unregister, _, _}, from = From}, self, T) ->
-    {T, reply_if_owed(From, ok) ++ [{enqueue, Kind, answered}]};
+    {T, maybe_reply(From, ok) ++ [{enqueue, Kind, answered}]};
 dispatch(_Ref, #intent{kind = {unregister, Name, Pid}, from = From}, {remote, L}, T) ->
-    {T, reply_if_owed(From, ok) ++ [{retract, L, Name, Pid}]};
+    {T, maybe_reply(From, ok) ++ [{retract, L, Name, Pid}]};
 dispatch(Ref, I = #intent{kind = {unregister, _, _}, from = From}, none, T) ->
-    %% CP: answer now, keep the intent until a leader can take it.
-    {put(Ref, I#intent{phase = awaiting_leader, from = answered}, T), reply_if_owed(From, ok)}.
+    %% Answer now, and keep the intent until a leader can take it.
+    {put_intent(Ref, I#intent{phase = awaiting_leader, from = answered}, T), maybe_reply(From, ok)}.
 
-reply_if_owed(answered, _Value) -> [];
-reply_if_owed(From, Value) -> [{reply, From, Value}].
+maybe_reply(answered, _Value) -> [];
+maybe_reply(From, Value) -> [{reply, From, Value}].
 
-put(Ref, I = #intent{phase = {awaiting_version, V, _L}}, T = #intents{all = A, deferred = D}) ->
+put_intent(
+    Ref, I = #intent{phase = {awaiting_version, V, _L}}, T = #intents{all = A, deferred = D}
+) ->
     T#intents{all = A#{Ref => I}, deferred = D#{Ref => V}};
-put(Ref, I, T = #intents{all = A, deferred = D}) ->
+put_intent(Ref, I, T = #intents{all = A, deferred = D}) ->
     T#intents{all = A#{Ref => I}, deferred = maps:remove(Ref, D)}.
 
-%% `{Ref, Intent}` pairs in arrival order.
-in_order(Pairs) ->
+%% Sorts `{Ref, Intent}` pairs into arrival order.
+sort_by_arrival(Pairs) ->
     lists:sort(fun({_, A}, {_, B}) -> A#intent.seq =< B#intent.seq end, Pairs).
 
-delete(Ref, T = #intents{all = A, deferred = D}) ->
+delete_intent(Ref, T = #intents{all = A, deferred = D}) ->
     T#intents{all = maps:remove(Ref, A), deferred = maps:remove(Ref, D)}.

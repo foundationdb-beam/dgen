@@ -695,11 +695,11 @@ defmodule DGen.RegistryTest do
   # Snapshot codec (pure, unit-tested in isolation)
   #
   # encode/1 folds the replica's ETS table straight into a pair list inside the blob
-  # (no records-map materialization); decode_records/1 must normalize every wire
-  # shape — this build's list-in-binary and map-in-binary, plus both pre-binary
-  # legacy forms — to the one map callers use. A shape the decoder silently
-  # mishandled would surface as a corrupt replica after a resync or handoff, so
-  # the tolerance is pinned here rather than trusted.
+  # (no records-map materialization); decode_records/1 must normalize both blob
+  # shapes — list-in-binary (encode/1) and map-in-binary (encode_records/1) — to the
+  # one map callers use. A shape the decoder silently mishandled would surface as a
+  # corrupt replica after a resync or handoff, so the tolerance is pinned here
+  # rather than trusted.
   # ---------------------------------------------------------------------------
 
   describe "snapshot codec (dgen_registry_replica encode/1, decode_records/1)" do
@@ -732,24 +732,6 @@ defmodule DGen.RegistryTest do
                  :dgen_registry_replica.encode_records(records)
                )
     end
-
-    test "legacy wire shapes still normalize (rolling upgrade)" do
-      p1 = spawn_live()
-
-      # Pre-binary-era apply_names_snapshot: an on-heap [{name, record}] list.
-      assert %{a: {^p1, %{}, nil}} =
-               :dgen_registry_replica.decode_records([{:a, {p1, %{}, nil}}])
-
-      # Pre-binary-era get_names_snapshot: a bare records map.
-      assert %{a: {^p1, %{}, nil}} =
-               :dgen_registry_replica.decode_records(%{a: {p1, %{}, nil}})
-
-      # Pre-list-era binary: a map inside the blob (what an old node still sends).
-      assert %{a: {^p1, %{}, nil}} =
-               :dgen_registry_replica.decode_records(
-                 :erlang.term_to_binary(%{a: {p1, %{}, nil}}, [:compressed])
-               )
-    end
   end
 
   # ---------------------------------------------------------------------------
@@ -758,7 +740,7 @@ defmodule DGen.RegistryTest do
   # A group commit's plan is built *before* anything lands in the member's ETS
   # table, so an op must still see an earlier op's not-yet-committed decision if
   # both touch the same name within one batch. plan_batch resolves this lazily
-  # (seed_lookup/3: the batch's own overlay first, a point ETS lookup otherwise)
+  # (lookup_in_batch/3: the batch's own overlay first, a point ETS lookup otherwise)
   # rather than needing a full pre-seeded map of the registry. These tests pin
   # that overlay directly — in particular the `removed` marker it uses to mean
   # "an earlier op in this batch explicitly cleared this name", which matters
@@ -1207,7 +1189,8 @@ defmodule DGen.RegistryTest do
       # behind what the member has already applied.
       GenServer.cast(
         member,
-        {:apply_names_snapshot, %{}, leader, [], %{}, epoch + 1, v - 1}
+        {:apply_names_snapshot, :dgen_registry_replica.encode_records(%{}), leader, [], %{},
+         epoch + 1, v - 1}
       )
 
       # Barrier: ensure the member has processed (and rejected) the stale snapshot.
@@ -1235,7 +1218,9 @@ defmodule DGen.RegistryTest do
       # guard does not block a forward snapshot.
       GenServer.cast(
         member,
-        {:apply_names_snapshot, %{new_name: {new_pid, %{}, %{}}}, leader, [], %{}, epoch, v + 1}
+        {:apply_names_snapshot,
+         :dgen_registry_replica.encode_records(%{new_name: {new_pid, %{}, %{}}}), leader, [], %{},
+         epoch, v + 1}
       )
 
       :sys.get_state(member)
@@ -1295,7 +1280,12 @@ defmodule DGen.RegistryTest do
     end
 
     defp follow(member, leader, epoch, version) do
-      GenServer.cast(member, {:apply_names_snapshot, %{}, leader, [], %{}, epoch, version})
+      GenServer.cast(
+        member,
+        {:apply_names_snapshot, :dgen_registry_replica.encode_records(%{}), leader, [], %{},
+         epoch, version}
+      )
+
       :sys.get_state(member)
     end
 
@@ -1462,8 +1452,9 @@ defmodule DGen.RegistryTest do
 
       GenServer.cast(
         member,
-        {:apply_names_snapshot, %{held: {held, %{}, :undefined}}, {node(), winner}, [], %{},
-         epoch + 2, v}
+        {:apply_names_snapshot,
+         :dgen_registry_replica.encode_records(%{held: {held, %{}, :undefined}}),
+         {node(), winner}, [], %{}, epoch + 2, v}
       )
 
       assert_receive {:"$gen_cast", {:retract_req, :held, ^held}},
@@ -1513,7 +1504,13 @@ defmodule DGen.RegistryTest do
       on_exit(fn -> Process.exit(fake, :kill) end)
       fake_name = :"degr_fake_#{:erlang.unique_integer([:positive])}"
       Process.register(fake, fake_name)
-      GenServer.cast(member, {:apply_names_snapshot, %{}, {node(), fake_name}, [], %{}, epoch, v})
+
+      GenServer.cast(
+        member,
+        {:apply_names_snapshot, :dgen_registry_replica.encode_records(%{}), {node(), fake_name},
+         [], %{}, epoch, v}
+      )
+
       {:follower, _} = :sys.get_state(member)
 
       %{reg: reg, member: member, self_id: self_id, epoch: epoch}

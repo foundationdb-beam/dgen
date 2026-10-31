@@ -6,26 +6,32 @@
 -include("../../include/dgen_eta.hrl").
 
 % Actions (aka side effects) taken by the elector
--define(ActionAssumeDistribute(MemberId), dgen_registry_elector_actions:assume_distribute(MemberId)).
--define(ActionPresencePush(Msg), dgen_registry_elector_actions:presence_push(Msg)).
+-define(ActionPushLeaderToMembers(MemberId),
+    dgen_registry_elector_actions:push_leader_to_members(MemberId)
+).
+-define(ActionPushPresenceToLeader(Msg),
+    dgen_registry_elector_actions:push_presence_to_leader(Msg)
+).
 
 -if(?DOCATTRS).
 -moduledoc false.
 -endif.
 
-%% `dgen_server` callback tracking registry membership and electing a leader.  State
-%% is durable and shared by every node of the registry; messages arrive via a durable
-%% FIFO queue. See docs/design/dgen_registry_design.md.
+%% A `dgen_server` callback that tracks registry membership and elects a leader. Its
+%% state is durable and shared by every node of the registry, and messages reach it
+%% through a durable FIFO queue. See docs/design/dgen_registry_design.md.
 %%
-%% Leadership is sticky (kept while the incumbent is a member) to avoid thrashing.
-%% A membership change routes through the leader as a post-commit action, with no
-%% distributed lock (§5.7): committing the new leader key fences the old leader, whose
-%% next batch commit then aborts.  The leader gathers replicas, resolves conflicts
-%% (§5.6) and casts the snapshot to followers from its own process, so per-pair FIFO
-%% orders it before any later `{name_registered}`.
+%% Leadership is sticky. The current leader keeps the role as long as it is a member,
+%% which avoids thrashing. A membership change reaches the leader as a post-commit
+%% action, with no distributed lock (§5.7). Committing a new leader key fences the old
+%% leader, so its next batch commit aborts. The leader gathers replicas, resolves
+%% conflicts (§5.6) and casts the snapshot to followers from its own process. Erlang
+%% delivers messages between two processes in order, so each follower gets the
+%% snapshot before any later `{name_registered}`.
 %%
-%% Leader key `{Tuid, <<"leader">>}` holds `term_to_binary({MemberId | undefined,
-%% Epoch})`: the epoch makes it a real fencing token (no ABA on depose-and-re-elect).
+%% The leader key `{Tuid, <<"leader">>}` holds `term_to_binary({MemberId | undefined,
+%% Epoch})`. The epoch is what makes it a real fencing token. Without it, deposing a
+%% leader and re-electing the same member would leave the key unchanged.
 %%
 %% *This documentation is LLM-generated. See the AI disclosure in README.md.*
 
@@ -44,7 +50,7 @@
     priority_get_subscriptions/1,
     priority_get_subscriptions/2,
     get_member_token/3,
-    leader_db_key/2,
+    get_leader_db_key/2,
     tuid/1,
 
     init/1,
@@ -56,11 +62,11 @@
 
 -type member_id() :: {node(), atom()}.
 -type member_info() :: #{
-    % Each member joins with a token so that the system can differentiate messages when
-    % members go down. ABA-protection
+    % Each member joins with a fresh token. When a member goes down, the token tells
+    % us whether the DOWN refers to this join or an earlier one.
     join_token := reference(),
 
-    % `true` when the member has not yet synced any state. Used in state replication
+    % `true` when the member has not yet synced any state. Used in state replication.
     fresh => boolean()
 }.
 
@@ -72,14 +78,16 @@
     % The list of members who have joined
     members := #{member_id() => member_info()},
 
-    % The authoritative leader. The `dgen_registry_elector` is solely responsible for choosing the leader.
+    % The authoritative leader. Only `dgen_registry_elector` chooses the leader.
     leader := member_id() | undefined,
 
-    % A monotonic integer for leadership changes. ABA protection.
+    % Increases with every leadership change, so re-electing the same member still
+    % changes the leader key.
     epoch := non_neg_integer(),
 
-    %% Durable presence subscriptions (§4.9), `SubId => {Watch, Notify}`; survive a
-    %% full cluster restart.  Source of truth; the leader is fed deltas.
+    %% Durable presence subscriptions (§4.9), as `SubId => {Watch, Notify}`. They
+    %% survive a full cluster restart. This map is the source of truth, and the leader
+    %% receives changes to it as deltas.
     subscriptions => #{term() => {term(), term()}}
 }.
 
@@ -122,13 +130,13 @@ priority_get_subscriptions(Elector, Timeout) ->
 
 -if(?DOCATTRS).
 -doc """
-Client-side helper: read the token the elector holds for `MemberId` right now,
-falling back to `Default` if the member is unknown or the read fails.
+Returns the token the elector holds for `MemberId` right now. Returns `Default` if
+the member is unknown or the read fails.
 
-A priority read (bypasses the durable queue).  This is the fence for a
-`{member_down}`: reporting the elector's *current* token means a peer that has
-genuinely rejoined (advancing its token) is not clobbered by a stale DOWN, while a
-truly dead member is still reaped.  Pure — safe to call from an off-loop helper; the
+This is a priority read, so it skips the durable queue. Callers attach the result to
+a `{member_down}`. Because it is the elector's *current* token, a DOWN for a peer that
+has since rejoined with a new token is ignored, while a member that is really dead is
+still reaped. It has no side effects, so it is safe to call from a spawned helper. The
 member's peer-DOWN path and the connector's reap both use it.
 """.
 -endif.
@@ -149,19 +157,18 @@ Exported so callers can set up a backend watch without going through the
 elector process.
 """.
 -endif.
--spec leader_db_key(dgen_backend:dir(), dgen_server:tuid()) -> dgen_backend:key().
-leader_db_key(Dir, Tuid) ->
+-spec get_leader_db_key(dgen_backend:dir(), dgen_server:tuid()) -> dgen_backend:key().
+get_leader_db_key(Dir, Tuid) ->
     B = dgen_config:backend(),
     B:dir_pack(Dir, leader_key_tuple(Tuid)).
 
 -if(?DOCATTRS).
 -doc """
-The tenant-unique id (backend keyspace prefix) for registry `Name`.
+Returns the tenant-unique id for registry `Name`. It is the backend keyspace prefix.
 
-The single source of truth for the registry's backend key prefix: the elector, the
-member (its version-key commit and leader-key fence), and the top-level supervisor
-must all use the *same* tuid, so they derive it here rather than each rebuilding the
-literal.  Exported for that reason.
+The elector, the member, and the top-level supervisor must all use the *same* tuid.
+The member needs it for its version-key commit and its leader-key fence. So they all
+derive it here instead of each rebuilding the literal, which is why it is exported.
 """.
 -endif.
 -spec tuid(atom()) -> dgen_server:tuid().
@@ -174,14 +181,14 @@ tuid(Name) ->
 
 -if(?DOCATTRS).
 -doc """
-Initialises the elector state with an empty member map and undefined leader.
+Initialises the elector state with an empty member map and an undefined leader.
 
-`name` is the co-located member's **identity** — it is what `elect_leader/5` turns
-into the local `member_id/0` when preferring the local member for leadership.
-`keyspace` is the registry's durable **prefix**, and is what the tuid is derived
-from; it defaults to `name`. The two differ only when a registry is started with
-`dgen_registry:start_link/3`'s `keyspace` option, which lets several members of one
-registry share a VM (see that function's docs).
+`name` is the **identity** of the member on the same node. `elect_leader/5` turns it
+into the local `member_id/0` when it prefers the local member for leadership.
+`keyspace` is the registry's durable **prefix**, and the tuid is derived from it. It
+defaults to `name`. The two differ only when the registry is started with the
+`keyspace` option of `dgen_registry:start_link/3`, which lets several members of one
+registry share a VM. See that function's docs.
 """.
 -endif.
 -spec init(#{name := atom(), keyspace => atom()}) ->
@@ -199,20 +206,20 @@ init(Args = #{name := Name}) ->
 Processes membership change messages within a backend transaction.
 
 Handles `{join, MemberId, Token, Fresh}` and `{member_down, MemberId, Token}`.
-Returns `{noreply, NewState, Actions}` when the handoff must be routed through the
-leader (every join; a leader-changing member_down), else plain
-`{noreply, NewState}`. The `Actions` run after the transaction commits — no
-distributed lock (§5.7).
+Returns `{noreply, NewState, Actions}` when the handoff must go through the leader.
+That is every join, and every member_down that changes the leader. Otherwise it
+returns plain `{noreply, NewState}`. The `Actions` run after the transaction commits,
+so no distributed lock is needed (§5.7).
 
-Each `{join}` carries a unique token (a `reference()` generated by the member
-process before enqueuing) and a freshness flag (whether the member has ever synced
-registry state).  The elector stores both in `member_info`.
+Each `{join}` carries a unique token and a freshness flag. The member process creates
+the token with `make_ref()` before enqueuing. The flag says whether the member has
+ever synced registry state. The elector stores both in `member_info`.
 
-A `{member_down, MemberId, Token}` is silently discarded when its token does not
-match the stored token for that member — this means the member has rejoined with
-a new token since the DOWN was detected, so the message is stale.  This prevents
-a partition-recovery race where a `{member_down}` enqueued during the disconnect
-is processed after the subsequent `{join}` that heals the cluster.
+We silently drop a `{member_down, MemberId, Token}` when its token doesn't match the
+stored token for that member. A mismatch means the member has rejoined with a new
+token since the DOWN was detected, so the message is stale. This prevents a race in
+partition recovery, where a `{member_down}` enqueued during the disconnect is
+processed after the `{join}` that heals the cluster.
 """.
 -endif.
 -spec handle_cast_tx(dgen_server:tx_ctx(), term(), registry_state()) ->
@@ -224,16 +231,16 @@ handle_cast_tx(TxCtx, {join, MemberId, Token, Fresh}, State) ->
     NewMembers = Members#{MemberId => MemberInfo},
     {NewLeader, NewEpoch} = elect_leader(TxCtx, Name, NewMembers, OldLeader, OldEpoch),
     NewState = State#{members => NewMembers, leader => NewLeader, epoch => NewEpoch},
-    %% Every join routes through the leader so the joiner gets the snapshot from the same
-    %% sender as later name broadcasts (FIFO).
-    {noreply, NewState, [?ActionAssumeDistribute(MemberId)]};
+    %% Every join goes through the leader, so the joiner gets its snapshot from the same
+    %% process that sends later name broadcasts, and receives them in order.
+    {noreply, NewState, [?ActionPushLeaderToMembers(MemberId)]};
 handle_cast_tx(TxCtx, {member_down, MemberId, Token}, State) ->
     #{name := Name, members := Members, leader := OldLeader, epoch := OldEpoch} = State,
     case maps:get(MemberId, Members, undefined) of
         undefined ->
             {noreply, State};
         #{join_token := StoredToken} when StoredToken =/= Token ->
-            %% Stale: member rejoined with a new token since this DOWN was detected.
+            %% Stale. The member rejoined with a new token after this DOWN was detected.
             {noreply, State};
         _ ->
             NewMembers = maps:remove(MemberId, Members),
@@ -241,24 +248,26 @@ handle_cast_tx(TxCtx, {member_down, MemberId, Token}, State) ->
             NewState = State#{members => NewMembers, leader => NewLeader, epoch => NewEpoch},
             case NewLeader =:= OldLeader of
                 true ->
-                    %% Survivors saw the death via their own monitors; no broadcast.
+                    %% Survivors saw the death through their own monitors, so we
+                    %% don't broadcast.
                     {noreply, NewState};
                 false ->
-                    {noreply, NewState, [?ActionAssumeDistribute(undefined)]}
+                    {noreply, NewState, [?ActionPushLeaderToMembers(undefined)]}
             end
     end;
-%% Presence writes (§4.9) are casts for latency: `ok` means accepted, not committed.
-%% Idempotent upserts by application id, so a write lost before consume is recoverable.
+%% Presence writes (§4.9) are casts for latency, so `ok` means accepted, not committed.
+%% Each is an idempotent upsert keyed by the application's id, so the caller can simply
+%% repeat a write that was lost before the elector consumed it.
 handle_cast_tx(_TxCtx, {subscribe, SubId, Watch, Notify}, State) ->
     Subs = get_subscriptions(State),
     NewState = State#{subscriptions => Subs#{SubId => {Watch, Notify}}},
-    {noreply, NewState, [?ActionPresencePush({subscribe, SubId, Watch, Notify})]};
+    {noreply, NewState, [?ActionPushPresenceToLeader({subscribe, SubId, Watch, Notify})]};
 handle_cast_tx(_TxCtx, {unsubscribe, SubId}, State) ->
     Subs = get_subscriptions(State),
     NewState = State#{subscriptions => maps:remove(SubId, Subs)},
-    {noreply, NewState, [?ActionPresencePush({unsubscribe, SubId})]};
+    {noreply, NewState, [?ActionPushPresenceToLeader({unsubscribe, SubId})]};
 handle_cast_tx(_TxCtx, unsubscribe_all, State) ->
-    {noreply, State#{subscriptions => #{}}, [?ActionPresencePush(unsubscribe_all)]}.
+    {noreply, State#{subscriptions => #{}}, [?ActionPushPresenceToLeader(unsubscribe_all)]}.
 
 get_subscriptions(State) ->
     maps:get(subscriptions, State, #{}).
@@ -267,13 +276,13 @@ get_subscriptions(State) ->
 %% handle_call_tx/4  (all elector calls)
 %% ---------------------------------------------------------------------------
 
-%% dgen_server dispatches every call (including priority reads) to the `_tx` variant
-%% when exported, so there is deliberately no `handle_call/3`.
+%% When the `_tx` variant is exported, dgen_server sends every call to it, priority
+%% reads included. So there is deliberately no `handle_call/3`.
 -if(?DOCATTRS).
 -doc """
 Handles the elector's read-only priority calls: `get_leader`, `get_members`, `get_epoch`,
-`{get_member_token, _}`, and `get_subscriptions` (the durable subscription map, §4.9).
-The presence writes are casts — see handle_cast_tx/3.
+`{get_member_token, _}`, and `get_subscriptions`, which returns the durable
+subscription map (§4.9). The presence writes are casts. See handle_cast_tx/3.
 """.
 -endif.
 -spec handle_call_tx(dgen_server:tx_ctx(), term(), dgen_server:from(), registry_state()) ->
@@ -284,8 +293,9 @@ handle_call_tx(_TxCtx, get_members, _From, State) ->
     {reply, maps:keys(maps:get(members, State, #{})), State};
 handle_call_tx(_TxCtx, get_epoch, _From, State) ->
     {reply, maps:get(epoch, State, 0), State};
-%% Fresh from durable state, so a `{member_down}` is fenced with the token the elector
-%% actually holds, not a stale cached one that would get a genuine death discarded (§5.7).
+%% Reads the token from durable state, so a `{member_down}` carries the token the
+%% elector actually holds. A stale cached token would cause a real death to be
+%% discarded (§5.7).
 handle_call_tx(_TxCtx, {get_member_token, MemberId}, _From, State) ->
     Token =
         case maps:get(MemberId, maps:get(members, State, #{}), undefined) of
@@ -300,8 +310,9 @@ handle_call_tx(_TxCtx, get_subscriptions, _From, State) ->
 %% Internal helpers
 %% ---------------------------------------------------------------------------
 
-%% Sticky incumbent, else the local member (the transaction-race winner), else
-%% lists:min/1.  Epoch increments only when a new leader is chosen.
+%% Keeps the current leader if it is still a member. Otherwise it picks the local
+%% member, since this node won the transaction race, and failing that the lowest
+%% member id. The epoch increments only when a new leader is chosen.
 -spec elect_leader(
     dgen_server:tx_ctx(),
     atom(),

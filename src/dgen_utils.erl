@@ -1,8 +1,9 @@
 -module(dgen_utils).
 
-%% Small, dependency-free helpers shared across dgen modules (the BEAM/distribution
-%% analogue of dgen_key's key helpers).  Keep this module general: anything here
-%% should be useful to more than one caller and carry no dgen-specific state.
+%% Small, dependency-free helpers for the BEAM and distribution, shared across dgen
+%% modules. It plays the same role for them that `dgen_key` plays for keys. Keep this
+%% module general. Anything here should be useful to more than one caller and hold
+%% no dgen-specific state.
 %%
 %% *This documentation is LLM-generated. See the AI disclosure in README.md.*
 
@@ -12,35 +13,34 @@
 
 -if(?DOCATTRS).
 -doc """
-Is `Node` usable for a synchronous message right now — the local node, or a
-currently-connected one?
+Returns whether we can send `Node` a message right now. That is true for the local
+node and for any node that is currently connected.
 
-This is the predicate the registry uses everywhere it must decide whether a cast
-or call to a peer will actually be delivered (as opposed to silently triggering an
-automatic distribution *reconnect*, which would heal a partition before it can be
-observed — see `dgen_registry_member:cast_to_member/2` and
-`dgen_registry_elector:call_to_member/2`).  The local node is trivially reachable;
-a remote node is reachable iff it is in `nodes()`.
+The registry uses this check wherever it must decide whether a cast or call to a
+peer will really be delivered. Sending to a disconnected node would instead start an
+automatic distribution reconnect, which can heal a partition before the registry
+notices it. See `dgen_registry_member:cast_to_member/2` and
+`dgen_registry_elector:call_to_member/2`. A remote node is reachable only if it is
+in `nodes()`.
 """.
 -endif.
 -spec node_reachable(node()) -> boolean().
 node_reachable(Node) ->
     Node =:= node() orelse lists:member(Node, nodes()).
 
-%% Wall-clock sleep and monotonic read that stay real under simulation.
+%% A sleep and a monotonic clock read that stay on real time under simulation.
 %%
-%% This module deliberately carries no `dgen_eta.hrl` include, so calls routed
-%% through here are exempt from the eta transform.  That exemption is the entire
-%% point: a *startup* wait like `dgen_registry:await_ready/2` runs in whatever
-%% process is bringing the system up — under `eta_run` that is the driver, the one
-%% process whose transformed sleep arms a virtual deadline nothing will ever reach
-%% (`eta_time:sleep/1`'s own boundary rule).  Readiness polling is a wall-clock
-%% concern by definition: it happens before the schedule owns the system, or on a
-%% real node where there is no schedule at all.
+%% This module deliberately doesn't include `dgen_eta.hrl`, so the eta transform
+%% leaves calls through here alone. That is the whole point. A startup wait such as
+%% `dgen_registry:await_ready/2` runs in whichever process is bringing the system
+%% up. Under `eta_run` that is the driver. If the driver's sleep were transformed,
+%% it would wait for a virtual deadline that never arrives, by the boundary rule in
+%% `eta_time:sleep/1`. Readiness polling is about wall-clock time anyway. It happens
+%% either before the scheduler takes over, or on a real node with no scheduler.
 %%
-%% Do NOT reach for these inside a member/elector/connector code path that runs
-%% during a simulation — there they are a real-time leak of exactly the class the
-%% transform exists to remove.
+%% Do NOT use these in member, elector or connector code that runs during a
+%% simulation. There they would leak real time into the simulation, which is
+%% exactly what the transform exists to prevent.
 -spec real_sleep(non_neg_integer()) -> ok.
 real_sleep(Ms) ->
     timer:sleep(Ms).

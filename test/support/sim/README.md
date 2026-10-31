@@ -169,7 +169,7 @@ number.
    helper.
 4. **`dgen` and `dgen_registry` weren't built with the eta transform.** Their
    `gen_server:call`s escaped the scheduler. This was a simulation-only gap.
-5. **`telemetry_available/0` called `code_server` from inside a member.** It is
+5. **`is_telemetry_available/0` called `code_server` from inside a member.** It is
    now resolved in `init/1`.
 6. **`set_metadata/2` and `unregister_name/1` ignored `register_timeout`.**
 7. **One unregister freed a name twice.** An optimistic delete plus an

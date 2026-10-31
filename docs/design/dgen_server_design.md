@@ -2,11 +2,11 @@
 
 `dgen_server` brings the `gen_server` programming model (`init/1`,
 `handle_call/3`, `handle_cast/2`, ...) to a distributed system. A `dgen_server`
-is not an Erlang process: it is durable state plus a durable message queue in a
-strongly-consistent backend (default: FoundationDB), and it exists as long as
-that state does, independent of any process, node, or cluster.
+is not an Erlang process. It is durable state plus a durable message queue in a
+strongly-consistent backend (default: FoundationDB). It exists as long as that
+state does, independent of any process, node, or cluster.
 
-The [Guarantees](#6-guarantees) section is normative: behaviour that contradicts
+The [Guarantees](#6-guarantees) section is normative. Behaviour that contradicts
 it is a bug.
 
 **This document is LLM generated.**
@@ -15,17 +15,17 @@ it is a bug.
 
 ## 1. The one-minute model
 
-- Zero or more **consumer** processes, on any node, pull messages off the queue,
-  run your callback, and commit the new state (and reply, if any) in one
-  database transaction.
+- Zero or more **consumer** processes, on any node, pull messages off the queue
+  and run your callback. Each one commits the new state, and the reply if
+  there is one, in a single database transaction.
 - **Standard** messages (`call`, `cast`) go through the queue and are processed
   with strict serializability. **Priority** messages (`priority_call`,
   `priority_cast`, `handle_info`) skip the queue and run immediately, at the
   cost of ordering.
-- Callbacks run inside that transaction and must be pure; side effects go in
-  post-commit **Actions** (§4.3) or `handle_locked/4` (§4.4).
-- If a consumer crashes mid-transaction nothing commits; a queued message is
-  retried by the next consumer (priority messages are lost, §5).
+- Callbacks run inside that transaction and must be pure. Side effects go in
+  **Actions**, which run after the commit (§4.3), or in `handle_locked/4` (§4.4).
+- If a consumer crashes mid-transaction, nothing commits. The next consumer
+  retries a queued message. Priority messages are lost (§5).
 
 ---
 
@@ -101,18 +101,18 @@ GenServer.stop(pid)
   `erlfdb`.
 - **tenant**: a database handle plus a directory handle defining a key
   subspace. Every `dgen_server` is started against one.
-- **key-tuple**: a tuple encoded as a key in a tenant; extending it makes the
-  original a prefix containing other keys.
+- **key-tuple**: a tuple encoded as a key in a tenant. Extending it makes the
+  original a prefix that contains other keys.
 - **tuid**: the key-tuple identifying a `dgen_server` in its tenant. `init/1`
   may return `{ok, Tuid, State}` to choose it.
 - **message-queue**: the durable queue a `dgen_server` processes requests from.
 - **call-request / cast-request**: a queued operation that does / does not
   expect a response.
 - **priority-request**: a call or cast handled immediately, ignoring the queue
-  and its ordering; for urgent, usually read-only work.
-- **dgen_server process / consumer**: any process that can push requests onto
-  the queue / one that also processes them. A `dgen_server` may have zero, one,
-  or many consumers.
+  and its ordering. It is meant for urgent, usually read-only work.
+- **dgen_server process**: any process that can push requests onto the queue.
+- **consumer**: a dgen_server process that also processes requests. A
+  `dgen_server` may have zero, one, or many consumers.
 
 ---
 
@@ -131,15 +131,17 @@ GenServer.stop(pid)
 ### 4.2 `consume_k` and inlining
 
 `consume_k` (default `1`) is the maximum number of queued messages a consumer
-processes per transaction. A consume cycle peeks up to `consume_k` messages,
-processes them in order with the state carried in memory, commits the batch in
-**one** transaction (state read once, written once), and immediately re-arms.
+processes per transaction. A consume cycle peeks up to `consume_k` messages and
+processes them in order, carrying the state in memory. It commits the batch in
+**one** transaction, so the state is read once and written once. Then it starts
+the next cycle right away.
 
-A larger `consume_k` amortises per-transaction cost and raises throughput when
-callbacks are cheap, at the price of larger transactions and all-or-nothing
-batches (a conflict retries the whole batch). A busy consumer keeps draining,
-so it also tends to keep a **single** node as the active consumer, which helps
-when consumer identity matters (e.g. election-style callbacks).
+A larger `consume_k` spreads the cost of each transaction over more messages and
+raises throughput when callbacks are cheap. The price is larger transactions and
+all-or-nothing batches, because a conflict retries the whole batch. A busy
+consumer keeps draining, so it also tends to keep a **single** node as the
+active consumer. That helps when it matters which node consumes, as in
+election-style callbacks.
 
 **Inlining.** When `consume_k =:= 1`, a `call/2` whose queue is empty and
 unlocked is processed immediately in the caller's own transaction, with the
@@ -155,51 +157,57 @@ Callbacks may return `{reply, Reply, State, Actions}` or
 `{noreply, State, Actions}`, where `Actions` is a list of 1-arity functions
 that:
 
-- run after the transaction commits;
-- receive the committed `State` but cannot modify it;
-- are the place for side effects (logging, telemetry, external publishing);
-- may return `halt` to stop running the remaining actions.
+- run after the transaction commits.
+- receive the committed `State` but cannot modify it.
+- are the place for side effects such as logging, telemetry, and external
+  publishing.
+- may return `halt` to skip the remaining actions.
 
 With `consume_k > 1`, a batch's actions all run after its single commit and
 each receives the state as of the **end of the batch**.
 
 ### 4.4 Locking
 
-A callback may return `{lock, State}` to enter locked mode, for work that must
-finish before the next queued message is processed but cannot run inside a
-transaction (external API calls, long computations).
+A callback may return `{lock, State}` to enter locked mode. Locked mode is for
+work that must finish before the next queued message is processed but cannot
+run inside a transaction, such as external API calls or long computations.
 
 While locked:
 
 - Standard `call` and `cast` messages are queued but not processed.
 - Priority messages and `handle_info` still execute (§4.1).
-- `handle_locked/4` runs **outside** a transaction: no transaction limits, side
-  effects permitted, and the state it returns is written back.
+- `handle_locked/4` runs **outside** a transaction. It has no transaction
+  limits and may perform side effects, and the state it returns is written back.
 
 `lock_timeout` (default `infinity`) bounds how long a lock may be held. The
 holder normally clears the lock when `handle_locked/4` returns. If the holder
 is killed (SIGKILL, VM abort), another consumer clears the lock once
-`lock_timeout` ms have passed since it was set. With `infinity`, a dead holder
-blocks all consumers permanently. Set it safely above the worst-case
-`handle_locked/4` duration.
+`lock_timeout` ms have passed since it was set. We call that busting the lock.
+With `infinity`, a dead holder blocks all consumers permanently.
 
-Clearing a stale lock is a guess that the holder is dead, so the lock is
-fenced (§4.7): a busted holder's result is not committed, its message is
-requeued, and it exits with `{lock_fenced, requeued}`. (A priority or inline
-lock has no queued message: it exits with `{lock_fenced, not_requeued}`, and the
-caller receives the exit.) Its side effects have already happened, so
-**`handle_locked/4` must be safe to run twice**.
+Busting is a guess that the holder is dead, and a slow holder may still be
+running. So the lock is **fenced** (§4.7). If a holder was busted, we don't
+commit its result. Its message goes back on the queue, and the holder exits
+with `{lock_fenced, requeued}`. A priority or inline lock has no queued
+message, so the holder exits with `{lock_fenced, not_requeued}` and the caller
+receives the exit. Either way, the side effects of `handle_locked/4` have
+already happened, so **`handle_locked/4` must be safe to run twice**.
+
+Because of fencing, a wrong guess costs a retry rather than lost data. So set
+`lock_timeout` to how quickly you want to recover from a dead holder, rather
+than above the worst-case `handle_locked/4` duration.
 
 ### 4.5 Persisted state
 
 State is encoded to optimise partial updates:
 
-1. **Assigns map**: a map with all atom keys; one key per entry, unordered.
+1. **Assigns map**: a map whose keys are all atoms. Each entry gets its own
+   key, unordered.
 
         #{mykey => <<"my value">>, otherkey => 42}
 
-2. **Components list**: a list of maps each with an atom `id` key holding a
-   binary; one key per item, ordered by fractional indexing.
+2. **Components list**: a list of maps, each with an atom `id` key holding a
+   binary. Each item gets its own key, ordered by fractional indexing.
 
         [#{id => "item1", value => 1}, #{id => "item2", value => 2}]
 
@@ -208,10 +216,10 @@ State is encoded to optimise partial updates:
 4. **Nesting**: encodings nest recursively, e.g. a components list inside an
    assigns map.
 
-On update, assigns maps and components lists write only changed entries
-(clearing removed ones; reordering updates fractional indices); terms are
-rewritten in full. If the encoding type changes, the old keys are cleared and
-the new encoding written in full.
+On update, assigns maps and components lists write only the entries that
+changed. Removed entries are cleared, and reordering updates the fractional
+indices. Terms are rewritten in full. If the encoding type changes, we clear the
+old keys and write the new encoding in full.
 
 ### 4.6 Caching
 
@@ -222,40 +230,42 @@ consumer modifies the state.
 ### 4.7 Request flows
 
 **Call:** the caller enqueues the request with its from-key and watches the
-reply-sentinel-key. A consumer runs `handle_call/3`, writes the new state and,
-if the sentinel still exists, the reply; then commits. The consumer then runs
-the actions while the caller reads and clears the reply. A timed-out caller
-clears its reply keys so none leak; as with `gen_server`, the callback still
-runs and the state still changes.
+reply-sentinel-key. A consumer runs `handle_call/3` and writes the new state.
+If the sentinel still exists, it also writes the reply. Then it commits. After
+that, the consumer runs the actions while the caller reads and clears the reply.
+A caller that times out clears its reply keys so none leak. As with
+`gen_server`, the callback still runs and the state still changes.
 
-**Cast:** enqueue; a consumer runs `handle_cast/2`, commits, then runs the
-actions.
+**Cast:** the caller enqueues the request. A consumer runs `handle_cast/2`,
+commits, then runs the actions.
 
 **Lock:**
 
 1. The callback returns `{lock, NewState}`. In one transaction the consumer
    commits `NewState`, dequeues the message, and writes a lock key holding
-   `{Timestamp, Token}` (`Token` unique to this acquisition).
+   `{Timestamp, Token}`. `Token` is unique to this acquisition.
 2. Other consumers see the lock and wait on a DB watch.
 3. The holder calls `handle_locked/4` with the triggering event, message, and
    committed `NewState`.
-4. The holder commits the result in a second transaction, only if the lock key
-   still carries its `Token`. Otherwise nothing is written, the message is
+4. The holder commits the result in a second transaction, but only if the lock
+   key still carries its `Token`. Otherwise nothing is written, the message is
    requeued in that transaction, and the holder exits with
-   `{lock_fenced, requeued}` (`not_requeued` for a priority or inline lock).
-5. Whatever `handle_locked/4` returns, even on exception, the lock key is
-   cleared (only if it still carries this holder's `Token`) and the queue watch
-   notified, so waiting consumers resume.
+   `{lock_fenced, requeued}`. A priority or inline lock exits with
+   `{lock_fenced, not_requeued}` instead.
+5. However `handle_locked/4` ends, even with an exception, the holder clears the
+   lock key if it still carries its `Token`. Clearing notifies the queue watch,
+   so waiting consumers resume.
 
 ### 4.8 Internal terms
 
 - **from-key**: `{WaitingKey..., Timestamp, term_to_binary(Ref)}` identifies
-  one waiting caller under the **waiting-key** prefix; the timestamp lets
+  one waiting caller under the **waiting-key** prefix. The timestamp lets
   abandoned keys be garbage-collected.
-- **reply-sentinel-key**: chunk 0 of the reply, stored as `{From, <<"t">>, N}`
-  so replies may exceed the backend value-size limit; the caller watches it.
-- **quid**: prefix of all queue keys: **item-keys** (queued requests) and the
-  **push-key / pop-key** counters.
+- **reply-sentinel-key**: chunk 0 of the reply. Replies are stored in chunks as
+  `{From, <<"t">>, N}` so they may exceed the backend value-size limit. The
+  caller watches this key.
+- **quid**: the prefix of all queue keys. Under it are the **item-keys**, which
+  hold queued requests, and the **push-key** and **pop-key** counters.
 
 ---
 
@@ -269,17 +279,18 @@ operation and **at-least-once** if a consumer crashes before commit (bounded by
 from scratch.
 
 **During `handle_call`, `handle_cast`, `handle_info`:** the transaction aborts
-and state is unchanged. A `call`/`cast` stays in the queue and is retried by
-the next consumer (subject to `dead_letter_threshold`). A `priority_call`,
+and state is unchanged. A `call` or `cast` stays in the queue, and the next
+consumer retries it, subject to `dead_letter_threshold`. A `priority_call`,
 `priority_cast`, or `handle_info` message is lost.
 
 **Dead-letter queue.** A *poison message* consistently crashes consumers. With
 `dead_letter_threshold` set to a positive integer, each failed attempt
-increments a counter in the message envelope; at the threshold the message is
-moved to the dead-letter queue (DLQ) instead of retried, and:
+increments a counter in the message envelope. At the threshold, the message is
+moved to the dead-letter queue (DLQ) instead of being retried, and:
 
-- a blocked `call` caller raises `{dead_letter, N}` (`N` = attempt count);
-- the optional `handle_dead_letter/2` callback receives the message and count;
+- a blocked `call` caller raises `{dead_letter, N}`, where `N` is the attempt
+  count.
+- the optional `handle_dead_letter/2` callback receives the message and count.
 - a warning is logged.
 
 Dead-lettering is **disabled by default** (`infinity`):
@@ -342,35 +353,35 @@ entries = :dgen_queue.peek_dlq(tenant, quid)  # [{key, envelope, attempts, ts_ms
 its attempt count reset to zero, for retry after the cause is fixed.
 
 **During `handle_locked`:** the state committed with the lock is already
-persisted and the triggering message already dequeued. On an exception the lock
-is cleared before the process exits and the message is not retried. If the
-process dies without clearing it (SIGKILL, OOM, power loss), the lock blocks
-the queue until `lock_timeout` expires (forever with `infinity`, requiring
-manual intervention). If the holder is fenced, its message is requeued and
-retried (§4.4).
+persisted, and the triggering message is already dequeued. On an exception, the
+lock is cleared before the process exits, and the message is not retried. If
+the process dies without clearing the lock (SIGKILL, OOM, power loss), the lock
+blocks the queue until `lock_timeout` expires. With `infinity` it blocks
+forever and needs manual intervention. If the holder is fenced, its message is
+requeued and retried (§4.4).
 
 **During actions:** state is already committed and the message consumed. A
 crashing action stops the remaining actions; nothing is retried.
 
-**Supervisor restart:** if durable state exists, `init/1` is called but its
-state is ignored; the process resumes from the persisted state and consumes
-(if configured to) alongside any other consumers.
+**Supervisor restart:** if durable state exists, `init/1` is called but the
+state it returns is ignored. The process resumes from the persisted state and,
+if configured to, consumes alongside any other consumers.
 
 ---
 
 ## 6. Guarantees
 
-These are normative. Behaviour that violates one of these is a defect.
+These are normative. Behaviour that violates one of them is a defect.
 
 1. **Durability.** State and queued messages persist in the backend,
    independent of any Erlang process, node, or cluster.
 2. **Delivery.** Standard `call`/`cast` messages are processed exactly-once
    under normal operation. If a consumer crashes before its transaction
-   commits, the message is retried by another consumer: at-least-once in that
-   case, bounded by `dead_letter_threshold` when configured (§5).
+   commits, another consumer retries the message. In that case delivery is
+   at-least-once, bounded by `dead_letter_threshold` when configured (§5).
 3. **Serializability.** Standard messages are committed with strict
-   serializability via the durable queue: a batch's state read and write happen
-   in one transaction.
+   serializability through the durable queue. A batch reads and writes the
+   state in one transaction.
 4. **Priority messages trade ordering for immediacy.** `priority_call/2`,
    `priority_cast/2`, and `handle_info/2` always bypass the queue and the lock,
    so they are not ordered with respect to the queued stream.
@@ -380,9 +391,9 @@ These are normative. Behaviour that violates one of these is a defect.
    holder's `handle_locked/4`, priority messages, and `handle_info/2` execute;
    other standard `call`/`cast` messages wait until the lock clears.
 7. **Callback purity.** `handle_call/3`, `handle_cast/2`, and `handle_info/2`
-   run inside a database transaction and must not perform side effects; those
-   belong in `Actions` (§4.3) or `handle_locked/4` (§4.4), which run outside a
-   transaction.
+   run inside a database transaction and must not perform side effects. Side
+   effects belong in `Actions` (§4.3) or `handle_locked/4` (§4.4), which run
+   outside a transaction.
 
 ---
 
@@ -404,11 +415,11 @@ Options in the `Opts` proplist of `start/3,4` and `start_link/3,4`:
 ## 8. When `dgen_server` is (and isn't) a good fit
 
 **Good fit when** you want the `gen_server` model but need state and in-flight
-messages to survive process, node, or cluster death; a database round-trip per
-message is acceptable; and side effects can be deferred to `Actions` or done in
-`handle_locked/4`.
+messages to survive the death of a process, node, or cluster. A database
+round-trip per message must be acceptable, and side effects must be able to
+wait for `Actions` or run in `handle_locked/4`.
 
-**Reconsider when** you need purely in-memory latency (a plain `gen_server` is
-faster for state that need not survive a restart); your callbacks need
-non-deferrable side effects inline; or you cannot or do not want to operate a
-strongly-consistent external database.
+**Reconsider when** you need in-memory latency. A plain `gen_server` is faster
+for state that need not survive a restart. Also reconsider if your callbacks
+need side effects inline that can't be deferred, or if you can't or don't want
+to operate a strongly-consistent external database.

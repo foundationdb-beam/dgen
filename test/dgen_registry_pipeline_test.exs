@@ -24,31 +24,31 @@ defmodule DGen.RegistryPipelineTest do
 
       {batch, p} = Pipeline.take_batch(2, p)
       assert batch == [{:retract, 1, pid}, {:retract, 2, pid}]
-      assert Pipeline.num_pending(p) == 1
+      assert Pipeline.get_num_pending(p) == 1
 
       ref = make_ref()
       mref = make_ref()
-      p = Pipeline.start(ref, mref, %{ops: batch}, p)
-      assert Pipeline.in_flight(p)
+      p = Pipeline.start_commit(ref, mref, %{ops: batch}, p)
+      assert Pipeline.is_in_flight(p)
 
-      assert :stale = Pipeline.finish(make_ref(), p)
-      assert {:ok, %{ops: ^batch}, ^mref, p} = Pipeline.finish(ref, p)
-      refute Pipeline.in_flight(p)
+      assert :stale = Pipeline.finish_commit(make_ref(), p)
+      assert {:ok, %{ops: ^batch}, ^mref, p} = Pipeline.finish_commit(ref, p)
+      refute Pipeline.is_in_flight(p)
     end
 
     test "a dead worker releases the slot too", %{pid: pid} do
       mref = make_ref()
-      p = Pipeline.start(make_ref(), mref, %{ops: [{:retract, :n, pid}]}, Pipeline.new())
+      p = Pipeline.start_commit(make_ref(), mref, %{ops: [{:retract, :n, pid}]}, Pipeline.new())
 
-      assert :stale = Pipeline.worker_down(make_ref(), p)
-      assert {:ok, %{ops: [_]}, p} = Pipeline.worker_down(mref, p)
-      refute Pipeline.in_flight(p)
+      assert :stale = Pipeline.handle_worker_down(make_ref(), p)
+      assert {:ok, %{ops: [_]}, p} = Pipeline.handle_worker_down(mref, p)
+      refute Pipeline.is_in_flight(p)
     end
 
     test "the cached read version is dropped at the end of a term" do
-      p = Pipeline.committed(42, Pipeline.new())
-      assert Pipeline.read_version(p) == 42
-      assert Pipeline.read_version(Pipeline.new_term(p)) == :undefined
+      p = Pipeline.set_last_version(42, Pipeline.new())
+      assert Pipeline.get_read_version(p) == 42
+      assert Pipeline.get_read_version(Pipeline.start_new_term(p)) == :undefined
     end
   end
 
@@ -59,18 +59,18 @@ defmodule DGen.RegistryPipelineTest do
       timer = make_ref()
       p = Pipeline.await_acks(batch, direct, timer, 2, Pipeline.new())
 
-      assert {:waiting, p} = Pipeline.ack(batch, @follower, p)
-      assert {:waiting, p} = Pipeline.ack(batch, @follower, p)
-      assert {:done, ^direct, ^timer, p} = Pipeline.ack(batch, {:n3@host, :reg}, p)
-      assert :none = Pipeline.ack_timeout(batch, p)
+      assert {:waiting, p} = Pipeline.record_ack(batch, @follower, p)
+      assert {:waiting, p} = Pipeline.record_ack(batch, @follower, p)
+      assert {:done, ^direct, ^timer, p} = Pipeline.record_ack(batch, {:n3@host, :reg}, p)
+      assert :none = Pipeline.handle_ack_timeout(batch, p)
     end
 
     test "a timeout reports how many confirmed", %{pid: pid, from: from} do
       batch = make_ref()
       p = Pipeline.await_acks(batch, [{{:local, from}, :n, pid}], make_ref(), 2, Pipeline.new())
-      {:waiting, p} = Pipeline.ack(batch, @follower, p)
+      {:waiting, p} = Pipeline.record_ack(batch, @follower, p)
 
-      assert {:expired, [_], 2, 1, _p} = Pipeline.ack_timeout(batch, p)
+      assert {:expired, [_], 2, 1, _p} = Pipeline.handle_ack_timeout(batch, p)
     end
 
     test "losing leadership takes every batch, in arrival order", %{pid: pid, from: from} do

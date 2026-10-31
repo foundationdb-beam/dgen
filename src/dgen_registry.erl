@@ -300,8 +300,9 @@ start_link(Name, Tenant, Opts) ->
 Registers `Pid` under `{RegistryName, LogicalName}`.
 
 Routes through the local member, which forwards to the leader if needed.
-Returns `yes` on success, `no` if the name is already held by a *different*
-process or no leader is currently elected.
+Returns `yes` on success, or `no` if a *different* live process holds the name
+or an opt-in policy refuses it (§8). If no leader is reachable, the call waits
+for one, and exits if nothing is decided within `register_timeout` (§3).
 
 Registering the **same** pid under the **same** name again is an idempotent
 `yes` (not a `no`): a caller whose register call timed out — but whose
@@ -375,8 +376,7 @@ send(Name, Msg) ->
 Registers `Pid` under `{RegistryName, LogicalName}` with metadata.
 
 `MetaSpec` is `#{index => map(), data => term()}` (both optional; defaults `#{}` and
-`undefined`). Like `register_name/2`, returns `yes` on success or `no` if the name is
-already taken, no leader is currently elected, or the leader is unreachable.
+`undefined`). Returns `yes` or `no` with the same meaning as in `register_name/2`.
 
 A call **timeout** (the member, or the leader behind it, did not answer within
 `register_timeout`, §8 — default 5000 ms) **exits** rather than answering `no`.

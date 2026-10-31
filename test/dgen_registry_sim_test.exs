@@ -1034,7 +1034,7 @@ defmodule DGen.RegistrySimTest do
   describe "membership join" do
     @tag timeout: 120_000
     test "a member joining mid-workload under loss onboards fully", %{tenant: tenant} do
-      # The continuing-leader join fast path (`onboard_joiner`/`{peer_joined}`)
+      # The continuing-leader join fast path (`cast_data_to_new_member`/`{peer_joined}`)
       # is explicitly outside the TLA+ model's scope, and until this test it was
       # exercised only by the `:cluster` suite (excluded on `dgen_mem`) — so a
       # regression here was visible to no formal layer at all. The join runs

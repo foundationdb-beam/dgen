@@ -8,10 +8,10 @@
 
 %% Fractional indexing for ordered sequences.
 %%
-%% Generates lexicographically-sortable binary strings using base-62 digits
-%% (0-9, A-Z, a-z in ASCII order). A new key can always be generated between
-%% any two existing keys, making this suitable for maintaining ordered lists
-%% in key-value stores without reindexing.
+%% Generates binary strings that sort lexicographically, using base-62 digits
+%% (0-9, A-Z, a-z in ASCII order). We can always generate a new key between any
+%% two existing keys, so an ordered list in a key-value store never needs
+%% reindexing.
 %%
 %% *This documentation is LLM-generated. See the AI disclosure in README.md.*
 
@@ -72,7 +72,7 @@ n_first(N) when is_integer(N), N > 0 ->
     n_between(<<>>, <<>>, N).
 
 -if(?DOCATTRS).
--doc "Returns `N` evenly-spaced keys between `A` and `B`. Use `<<>>` for unbounded start/end.".
+-doc "Returns `N` evenly-spaced keys between `A` and `B`. Pass `<<>>` to leave either end unbounded.".
 -endif.
 -spec n_between(binary(), binary(), non_neg_integer()) -> [key()].
 n_between(_A, _B, 0) ->

@@ -2,24 +2,22 @@
 %%
 %%     -include("../include/dgen_eta.hrl").
 %%
-%% Everything here hangs on the `DST` define, which the test build sets (see
-%% `erlc_options/1` in mix.exs) and a release build does not, so the
-%% instrumentation below can be left in the source of a module that ships.
+%% Everything here depends on the `DST` define. The test build sets it, in
+%% `erlc_options/1` in mix.exs, and a release build does not. That lets a module
+%% that ships keep the instrumentation below in its source.
 %%
 %% ## Why not include `eta/include/eta.hrl` directly
 %%
 %% `-include_lib` resolves through the code path, so `eta` would have to be
-%% findable in *every* compilation — which the library's own walkthrough handles by
-%% telling adopters to depend on it with `runtime: false`. dgen is a published
-%% package, and test tooling has no business becoming a package requirement for
-%% every consumer, so `eta` stays behind `only: :test` (pinned from Hex, ~> 0.1 —
-%% see mix.exs).
+%% available in every compilation. The eta walkthrough handles this by telling
+%% adopters to depend on it with `runtime: false`. But dgen is a published package,
+%% and its consumers shouldn't have to pull in our test tooling. So `eta` stays
+%% behind `only: :test`, pinned from Hex at ~> 0.1 in mix.exs.
 %%
-%% So `eta` stays test-only, the `-include_lib` sits behind `-ifdef(DST)` where the
-%% preprocessor never resolves it in a release build, and the `-else` branch below
-%% supplies the macros that branch would otherwise leave undefined. Without that
-%% branch, `?ETA_LOG` in shipped code is a compile error in the only build that
-%% matters.
+%% The `-include_lib` sits behind `-ifdef(DST)`, so the preprocessor never resolves
+%% it in a release build. The `-else` branch below defines the macros that the
+%% include would otherwise provide. Without it, `?ETA_LOG` in shipped code would be
+%% a compile error in the release build, which is the one that matters.
 %%
 %% *This documentation is LLM-generated. See the AI disclosure in README.md.*
 
@@ -28,13 +26,15 @@
 
 -ifdef(DST).
 
-%% Brings the parse transform and the real macros: timer and clock calls rewritten
-%% to `eta_time`, sends to `eta_net`, spawns to `eta_sched`, and `-eta_observe`
-%% fields published on every callback return. Inert unless a run is active.
+%% Brings in the parse transform and the real macros. The transform rewrites timer
+%% and clock calls to `eta_time`, sends to `eta_net` and spawns to `eta_sched`, and
+%% publishes `-eta_observe` fields on every callback return. None of it does
+%% anything unless a simulation run is active.
 -include_lib("eta/include/eta.hrl").
 
-%% Test-only (DST, OTP >= 28): turn off supervisor `hibernate_after`, a wall-clock timer
-%% that breaks seed determinism (elector_pid/1 calls into the supervisor).
+%% Turns off the supervisor's `hibernate_after` in DST builds on OTP 28 and later.
+%% It is a wall-clock timer, and elector_pid/1 calls into the supervisor, so it
+%% would make runs with the same seed diverge.
 -if(?OTP_RELEASE >= 28).
 -define(SUP_SIM_FLAGS, #{hibernate_after => infinity}).
 -else.
@@ -45,9 +45,9 @@
 
 -define(SUP_SIM_FLAGS, #{}).
 
-%% Release build. `Event` and `Label` are **not evaluated**, matching `eta.hrl`, so
-%% anything logged must be side-effect free and a variable used only inside one of
-%% these reads as unused.
+%% Release build. Like `eta.hrl`, these macros do not evaluate `Event` or `Label`.
+%% So anything logged must be free of side effects, and a variable used only inside
+%% one of these macros counts as unused.
 -define(ETA_LABEL(Label), ok).
 -define(ETA_LOG(Event), 0).
 

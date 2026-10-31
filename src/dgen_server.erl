@@ -9,15 +9,15 @@
 -moduledoc """
 A durable, distributed gen_server backed by a pluggable storage backend.
 
-A dgen_server is an abstract entity composed of durable state and operations on
-that state. The state lives in the configured backend (default: FoundationDB)
-and the operations are defined by a callback module implementing the
-`dgen_server` behaviour. This allows a gen_server to outlive any single Erlang
-process, node, or cluster.
+A dgen_server is an abstract entity made of durable state and the operations on
+that state. The state lives in the configured backend (default: FoundationDB),
+and a callback module implementing the `dgen_server` behaviour defines the
+operations. This lets a gen_server outlive any single Erlang process, node, or
+cluster.
 
-Zero or more Erlang processes may act on a dgen_server at any time. Processes
-with `consume` enabled consume messages from the durable queue and invoke
-callbacks; processes without it only publish messages.
+Zero or more Erlang processes may act on a dgen_server at any time. A process
+with `consume` enabled takes messages off the durable queue and invokes the
+callbacks. A process without it only publishes messages.
 
 ## Options
 
@@ -34,81 +34,82 @@ The following options may be passed via the `Opts` proplist:
   caller raises `{dead_letter, N}` (for `call` messages), and the optional
   `handle_dead_letter/2` callback is invoked. `infinity` (the default) disables
   dead-lettering entirely.
-- `consume_k` (default `1`) - the maximum number of queued messages a consumer
-  processes per transaction (the batch size). Each consume cycle peeks up to
-  `consume_k` messages, processes them one at a time while carrying the durable
-  state in memory, and commits the whole batch in a **single** transaction (the
-  state is read once and written once). It then immediately re-arms itself, so a
-  consumer that has work keeps draining batches.
+- `consume_k` (default `1`) - the batch size, meaning the maximum number of
+  queued messages a consumer processes per transaction. Each consume cycle peeks
+  up to `consume_k` messages and processes them one at a time, carrying the
+  durable state in memory. It then commits the whole batch in a **single**
+  transaction, so the state is read once and written once. The consumer then
+  starts the next cycle right away, so a consumer that has work keeps draining
+  batches.
 
-  Raising `consume_k` amortises the fixed per-transaction cost (read version,
-  state read/write, commit) across more messages, increasing throughput when the
-  per-message callback work is small. The cost is larger transactions and a
-  coarser unit of progress (a batch is all-or-nothing; on a conflict the whole
-  batch retries). Because a busy consumer keeps draining, a larger `consume_k`
-  also tends to keep a **single** node as the active consumer, which is useful
-  when the callback's identity matters — for example an election-style callback
-  where you want to minimise churn in who processes successive messages.
+  Raising `consume_k` spreads the fixed cost of a transaction (read version,
+  state read and write, commit) across more messages. That raises throughput when
+  each callback does little work. The cost is larger transactions and a coarser
+  unit of progress. A batch is all-or-nothing, so a conflict retries the whole
+  batch. Because a busy consumer keeps draining, a larger `consume_k` also tends
+  to keep a **single** node as the active consumer. That helps when it matters
+  which node runs the callback, for example in an election-style callback where
+  you want the same node to keep processing successive messages.
 
   See "consume_k and inlining" below for how `consume_k > 1` changes call
   handling.
 - `lock_timeout` (default `infinity`) - maximum number of milliseconds a
   distributed lock may be held before other consumers treat it as stale.  When
   a callback returns `{lock, State}`, `dgen_server` sets a timestamped lock key
-  in the backend that pauses all other consumers while `handle_locked/4` runs.
-  Under normal operation the lock holder clears the key itself before
-  `handle_locked` returns.  If the holder is killed (SIGKILL, VM abort) the
-  lock persists until another consumer detects staleness: it re-checks
-  `lock_timeout` ms after the lock was set and clears it if that deadline has
-  passed.  `infinity` (the default) disables stale-lock detection entirely —
-  a dead holder will permanently block all consumers.
+  in the backend. The key pauses all other consumers while `handle_locked/4`
+  runs. Normally the lock holder clears the key itself once `handle_locked`
+  returns.  If the holder is killed (SIGKILL, VM abort), the lock stays until
+  another consumer notices it is stale. That consumer re-checks the lock
+  `lock_timeout` ms after it was set and clears it if the deadline has passed.
+  We call this busting the lock.  `infinity` (the default) turns off stale-lock
+  detection entirely, so a dead holder blocks all consumers forever.
 
-  Busting is a time-based guess that the holder is dead, and nothing revokes a
-  holder that is merely slow, so the guess can be wrong.  The lock is **fenced**
-  against that: each acquisition stamps the key with a unique token, and a holder
-  may release the lock, and commit the result of `handle_locked/4`, only while the
-  key still carries its token.  A holder busted mid-run is therefore refused at
-  commit rather than overwriting what its successor has since written, and it
-  cannot release a successor's lock.
+  Busting is a guess, based only on time, that the holder is dead. Nothing stops
+  a holder that is merely slow, so the guess can be wrong.  The lock is
+  **fenced** against that. Each acquisition stamps the key with a unique token,
+  and a holder may release the lock or commit the result of `handle_locked/4`
+  only while the key still carries its token.  So if a holder is busted mid-run,
+  its commit is refused instead of overwriting what its successor has written
+  since, and it cannot release the successor's lock.
 
-  A fenced section is not lost.  The message that took the lock goes back on the
-  queue in the same transaction that refuses the commit, and the process exits with
-  `{lock_fenced, requeued}`; whichever consumer holds the lock next retries it.
-  Because `handle_locked/4` runs outside a transaction, its **external side effects
-  already happened and will happen again on the retry** — it must be safe to run
-  twice.
+  A fenced section is not lost.  The transaction that refuses the commit also
+  puts the message that took the lock back on the queue, and the process exits
+  with `{lock_fenced, requeued}`. Whichever consumer holds the lock next retries
+  the message. Because `handle_locked/4` runs outside a transaction, its
+  **external side effects have already happened and will happen again on the
+  retry**. It must be safe to run twice.
 
-  Since a wrong guess now costs a retry rather than silent data loss, set this for
-  the recovery time you want from a dead holder rather than above the worst-case
-  `handle_locked` duration.
+  A wrong guess now costs a retry rather than silent data loss. So set this to
+  how quickly you want to recover from a dead holder, rather than above the
+  worst-case `handle_locked` duration.
 
 ## consume_k and inlining
 
 A message can reach a callback by two routes:
 
-1. **Through the durable queue.** `cast/2` and (normally) `call/2` enqueue the
-   message; a consumer later peeks it as part of a `consume_k`-sized batch and
-   processes it inside the batch's single transaction. This is the ordered,
+1. **Through the durable queue.** `cast/2`, and usually `call/2`, enqueue the
+   message. A consumer later peeks it as part of a `consume_k`-sized batch and
+   processes it inside that batch's single transaction. This is the ordered,
    durable path, and the only path when `consume_k > 1`.
-2. **Inline.** As a latency optimisation, when `consume_k =:= 1` a `call/2` whose
-   queue is currently empty and unlocked is processed *immediately*, in the
-   caller's own request transaction, instead of being enqueued and waited on.
-   The result is identical to processing it through the queue; it just skips the
-   enqueue/await round-trip.
+2. **Inline.** To save latency when `consume_k =:= 1`, a `call/2` that finds
+   its queue empty and unlocked is processed *immediately*, in the caller's own
+   request transaction, instead of being enqueued and waited on. The result is
+   the same as going through the queue. It just skips the round-trip of
+   enqueueing and waiting.
 
-When **`consume_k > 1`, inlining is disabled**: every `call/2` goes through the
-queue and the batched consume loop, so `consume_k` is always in effect. Use this
-when you want all processing funnelled through the batched, single-consumer loop —
-for example to keep a stable consumer identity (an election-style callback that
-would otherwise see successive messages committed by different nodes). With the
-default `consume_k =:= 1`, inlining is enabled and a contention-free `call/2` is
-served on the fast path.
+When **`consume_k > 1`, inlining is disabled**. Every `call/2` goes through the
+queue and the batched consume loop, so `consume_k` always applies. Use this
+when you want all processing to go through the batched, single-consumer loop,
+for example to keep the same node as consumer. An election-style callback would
+otherwise see successive messages committed by different nodes. With the
+default `consume_k =:= 1`, inlining is enabled and a `call/2` with no
+contention takes the fast path.
 
-Independently of `consume_k`, `priority_call/2` and `priority_cast/2` **always**
-bypass the queue (and locks) and are handled immediately. They are an explicit
-escape hatch for urgent, usually read-only work; they trade away ordering with
-respect to queued messages, so prefer `call/2`/`cast/2` for anything that must be
-ordered with the rest of the stream.
+Whatever `consume_k` is, `priority_call/2` and `priority_cast/2` **always**
+bypass the queue and any lock, and are handled immediately. They are an
+explicit escape hatch for urgent, usually read-only work. They give up ordering
+relative to queued messages, so prefer `call/2` and `cast/2` for anything that
+must stay in order with the rest of the stream.
 
 ## Callbacks
 
@@ -121,25 +122,24 @@ ordered with the rest of the stream.
   Receives `(Msg, AttemptCount)`. Return value is ignored. Useful for custom
   alerting or metrics.
 
-`Actions` is a list of 1-arity funs executed after the transaction commits. The
-argument is the module state as committed by that transaction — note that under
-batched consumption (`consume_k > 1`) all of a batch's actions run after the
-batch's single commit and each receives the state as of the **end of the batch**,
-not the state at the message that produced the action.
+`Actions` is a list of 1-arity funs that run after the transaction commits.
+Each one receives the module state as that transaction committed it. Under
+batched consumption (`consume_k > 1`), all of a batch's actions run after its
+single commit. Each receives the state as of the **end of the batch**, not the
+state right after the message that produced the action.
 
 ## Module State
 
-The module that implements the `dgen_server` behaviour may define any term to
-serve as the State. `dgen_server` will encode this state for writing to the
-database. We encourage you to structure your state to fit in with this
-encoding scheme, which will yield performance benefits.
+The module that implements the `dgen_server` behaviour may use any term as its
+State. `dgen_server` encodes this state to write it to the database. If you
+shape your state to fit the encodings below, updates get cheaper.
 
 - **term** (fallback) - `term_to_binary`, chunked into 100KB values.
-- **assigns map** - map with all atom keys; each entry stored at a
-  separate DB key using `atom_to_binary(Key)` in the path.
-- **component list** - list of maps where every item has an atom `id`
-  key with a binary value; each item stored separately, ordered by a
-  fractional index embedded in the DB key.
+- **assigns map** - a map whose keys are all atoms. Each entry is stored at its
+  own DB key, with `atom_to_binary(Key)` in the path.
+- **component list** - a list of maps where every item has an atom `id` key
+  with a binary value. Each item is stored separately, ordered by a fractional
+  index embedded in the DB key.
 
 The encoding is applied recursively. For example, an assigns map whose value
 is a component list will nest both encodings in the key path.
@@ -174,16 +174,16 @@ is a component list will nest both encodings in the key path.
 -type noreply_ret() :: {noreply, state()} | {noreply, state(), [action()]}.
 -type stop_ret() :: {stop, term(), state()} | {stop, term(), state(), [action()]}.
 
-%% Passed as the first argument to `_tx` callback variants.
-%% `td` is the current backend transaction+directory pair; `tuid` is the server's
-%% tenant-unique identifier.  Both may be used to read or write arbitrary keys
-%% within the same atomic transaction as the callback.
+%% Passed as the first argument to the `_tx` callback variants.
+%% `td` is the current backend transaction and directory pair. `tuid` is the
+%% server's tenant-unique identifier. A callback can use them to read or write
+%% any keys in the same atomic transaction it runs in.
 -type tx_ctx() :: #{td := dgen_backend:tenant(), tuid := tuid()}.
 
 %% Passed as the first argument to `handle_locked/4`.
-%% `db` is the DB-level tenant (not a transaction); `tuid` is the server's
-%% tenant-unique identifier.  Use `dgen_backend:transactional/2` to open
-%% explicit transactions within the locked section.
+%% `db` is the DB-level tenant, not a transaction. `tuid` is the server's
+%% tenant-unique identifier. Use `dgen_backend:transactional/2` to open
+%% transactions inside the locked section.
 -type db_ctx() :: #{db := dgen_backend:tenant(), tuid := tuid()}.
 
 -callback init(Args :: term()) -> init_ret().
@@ -265,15 +265,15 @@ is a component list will nest both encodings in the key path.
     dead_letter_threshold = infinity :: pos_integer() | infinity,
     consume_k = 1 :: pos_integer(),
     lock_timeout = infinity :: pos_integer() | infinity,
-    %% Token of the lock this process currently holds, set by set_lock/2 within the
-    %% transaction that acquired it.  Identifies *which* acquisition is ours, so
-    %% releasing and committing can tell our own lock from a successor's.
+    %% The token of the lock this process holds. set_lock/2 sets it in the
+    %% transaction that takes the lock. It tells us *which* acquisition is ours,
+    %% so that releasing and committing can tell our lock from a successor's.
     %% See clear_lock_owned/2 and owns_lock/2.
     lock_token :: undefined | binary(),
-    %% The queue envelope of the message that took the lock, kept so a fenced
-    %% locked section can put it back rather than drop it (see consume_locked/5).
-    %% `undefined` for locks taken on the priority and inline paths, which have no
-    %% queued message behind them.
+    %% The queue envelope of the message that took the lock. We keep it so that
+    %% a fenced locked section can put the message back instead of dropping it
+    %% (see consume_locked/5). It is `undefined` for locks taken on the priority
+    %% and inline paths, because no queued message stands behind them.
     locked_envelope :: undefined | term()
 }).
 
@@ -531,14 +531,13 @@ inline_or_push(Td, Request, LocalFrom, WatchTo, Options, Tuid, State = #state{co
     Push = fun(Attempts) ->
         dgen:push_call(Td, Tuid, get_quid(Tuid), Request, WatchTo, Options, Attempts)
     end,
-    %% Inline handling — process the call immediately in this transaction instead of
-    %% enqueuing it and waiting for the consume loop — is attempted only when
-    %% consume_k =:= 1, and then only if the queue is empty and unlocked.  With
-    %% consume_k > 1 the server is configured for batched, single-consumer processing,
-    %% so inlining is disabled entirely: every call goes through the durable queue and
-    %% the consume loop, keeping consume_k always in effect.  See "consume_k and
-    %% inlining" in the moduledoc.  (`priority_call` always bypasses the queue,
-    %% independent of consume_k.)
+    %% Inlining means processing the call right here in this transaction, instead
+    %% of enqueueing it and waiting for the consume loop. We try it only when
+    %% `consume_k =:= 1`, and then only if the queue is empty and unlocked. With
+    %% `consume_k > 1` the server is set up for batched, single-consumer
+    %% processing, so we never inline. Every call goes through the durable queue
+    %% and the consume loop, so `consume_k` always applies. See "consume_k and
+    %% inlining" in the moduledoc. `priority_call` bypasses the queue regardless.
     InlineEligible = K =:= 1 andalso dgen_queue:length(Td, get_quid(Tuid)) =:= 0,
     case InlineEligible andalso not is_locked(Td, State) of
         true ->
@@ -610,9 +609,9 @@ handle_info({Ref, ready}, State = #state{watch = ?FUTURE(Ref)}) ->
 handle_info(consume_after_penalty, State) ->
     handle_cast(consume, State);
 handle_info(recheck_lock, State) ->
-    %% Fired by the timer scheduled in handle_consume when the lock was not yet
-    %% stale.  Re-enter the consume loop so check_lock is re-evaluated; if
-    %% the lock holder died without clearing the lock, it will now be stale.
+    %% handle_consume schedules this timer when it finds a lock that is not yet
+    %% stale. We re-enter the consume loop so check_lock runs again. If the
+    %% holder died without clearing the lock, the lock is now stale.
     handle_cast(consume, State);
 handle_info(Info, State = #state{tenant = Tenant}) ->
     Result = dgen_backend:transactional(Tenant, fun(Td) ->
@@ -628,10 +627,10 @@ terminate(_Reason, _State) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
-%% Dispatches a callback, preferring the `_tx` variant (which receives a
-%% `tx_ctx()` as its first argument) when the callback module exports it.
+%% Dispatches a callback. If the callback module exports the `_tx` variant, we
+%% call that one, with a `tx_ctx()` as its first argument.
 %%
-%% Resolution order for a callback named `handle_foo/N`:
+%% For a callback named `handle_foo/N`, we look for these in order:
 %%   1. `handle_foo_tx/(N+1)` — receives `#{td, tuid}` prepended to Args
 %%   2. `handle_foo/N`        — standard variant, no tx context
 invoke_tx_callback(Td, Callback, Args, State = #state{mod = Mod, tuid = Tuid}) ->
@@ -671,7 +670,8 @@ dispatch_callback(_Td, ModState, Mod, Fn, Args, _State) ->
     CallbackResult = erlang:apply(Mod, Fn, Args ++ [ModState]),
     {ok, ModState, CallbackResult}.
 
-%% Like invoke_tx_callback/4 but uses CurrentModState directly instead of reading from FDB.
+%% Like invoke_tx_callback/4, but uses `CurrentModState` instead of reading the
+%% state from the backend.
 invoke_tx_callback_batch(
     Td, Callback, Args, CurrentModState, State = #state{mod = Mod, tuid = Tuid}
 ) ->
@@ -812,10 +812,10 @@ handle_callback_result(
     {_, State1} = set_mod_state(Td, OrigModState, ModState, State),
     {{stop, Reason, Actions}, ModState, State1}.
 
-%% Batch variant of handle_callback_result: does NOT write mod state to the backend.
-%% consume_batch is responsible for a single set_mod_state call at each exit point.
-%% The lock case still sets the lock key within the transaction, as it must be
-%% atomic with the mod state write and queue consume.
+%% The batch variant of handle_callback_result. It does NOT write the mod state
+%% to the backend. Instead, consume_batch calls set_mod_state once at each exit
+%% point. The lock case still sets the lock key in this transaction, because it
+%% must commit atomically with the mod state write and the dequeue.
 handle_callback_result_batch(_Td, _EventType, _Msg, {noreply, ModState}, _OrigModState, State) ->
     {{noreply, []}, ModState, State};
 handle_callback_result_batch(
@@ -876,14 +876,15 @@ handle_consume(Tenant, K, Tuid, State = #state{dead_letter_threshold = Threshold
                 clear_lock(Td, State),
                 consume_queued(Td, K, Quid, Threshold, State);
             {live, Remaining} ->
-                %% Lock is held but not yet stale.  Set a queue watch
-                %% for the fast path (lock cleared normally fires
-                %% notify → push key changes → watch fires).  Also
-                %% schedule a timer so that if the lock holder is
-                %% killed without clearing the lock and no new messages
-                %% arrive, we still re-evaluate staleness after the
-                %% remaining timeout — guaranteeing recovery even on a
-                %% perfectly quiet queue.
+                %% The lock is held but not yet stale. We set a queue
+                %% watch for the fast path. When the holder clears the
+                %% lock normally, it notifies the queue, the push key
+                %% changes, and the watch fires. We also schedule a
+                %% timer for when the remaining timeout runs out. If
+                %% the holder is killed without clearing the lock and
+                %% no new messages arrive, the timer still makes us
+                %% re-check staleness, so we recover even on a
+                %% completely quiet queue.
                 Watch = dgen_queue:watch_push(Td, Quid),
                 Action = fun(_) ->
                     case Remaining of
@@ -962,14 +963,15 @@ consume_queued(Td, K, Quid, Threshold, State) ->
             end
     end.
 
-%% Processes peeked KVs one at a time, carrying mod state in memory.
-%% Mod state is read once (in consume_queued) and written once at each exit point,
-%% avoiding repeated FDB reads/writes due to set_versionstamped_value not being
-%% visible in read-your-own-writes within the same transaction.
+%% Processes the peeked KVs one at a time, carrying the mod state in memory.
+%% consume_queued reads the mod state once, and we write it once at each exit
+%% point. We can't read it back after each message, because a value written with
+%% set_versionstamped_value is not visible to later reads in the same
+%% transaction.
 %%
 %% Parameters:
-%%   8th — CurrentModState: mod state produced by the last successfully invoked callback
-%%   9th — InitModState: mod state at the start of the batch, used for diff-based writes
+%%   8th, CurrentModState: the mod state returned by the last callback that succeeded
+%%   9th, InitModState: the mod state at the start of the batch, used to write a diff
 consume_batch(Td, [], Quid, _Threshold, State, AccActions, AccKVs, CurrentModState, InitModState) ->
     {_, State1} = set_mod_state(Td, InitModState, CurrentModState, State),
     dgen_queue:consume_peeked(Td, lists:reverse(AccKVs), Quid),
@@ -1014,8 +1016,8 @@ consume_batch(
                     dgen_queue:consume_peeked(Td, AllKVs, Quid),
                     PriorActions = lists:append(lists:reverse(AccActions)),
                     %% This message leaves the queue here, in the transaction that
-                    %% takes the lock, so keep its envelope: if the locked section
-                    %% is later fenced, that is the only way to put it back.
+                    %% takes the lock. We keep its envelope, because if the locked
+                    %% section is later fenced, that is the only way to put it back.
                     State3 = State2#state{cache_misses = 0, locked_envelope = Envelope},
                     case PriorActions of
                         [] -> {{lock, EventType, Msg}, ModState, State3};
@@ -1033,8 +1035,8 @@ consume_batch(
                         [] ->
                             ok;
                         _ ->
-                            % Write mod state for successfully processed prior messages
-                            % before committing their dequeues.
+                            % Writes the mod state from the earlier messages that
+                            % succeeded, before committing their dequeues.
                             set_mod_state(Td, InitModState, CurrentModState, State),
                             dgen_queue:consume_peeked(Td, lists:reverse(AccKVs), Quid)
                     end,
@@ -1114,12 +1116,13 @@ consume_locked(EventType, Msg, ModState, IsLocalReply, State = #state{tenant = T
                 erlang:error(Reason);
             {ok, OrigModState, CallbackResult, State1} ->
                 dgen_backend:transactional(Tenant, fun(Td) ->
-                    %% Fence.  handle_locked/4 ran outside any transaction, so an
-                    %% arbitrary amount of time has passed since the lock was taken
-                    %% and another consumer may have judged this one dead and busted
-                    %% it.  CallbackResult was computed from the state read *before*
-                    %% the lock, so committing it now would overwrite whatever the
-                    %% successor has since done, silently.  Refuse instead.
+                    %% The fence. handle_locked/4 ran outside any transaction, so
+                    %% any amount of time may have passed since we took the lock.
+                    %% Another consumer may have decided we were dead and busted
+                    %% the lock. `CallbackResult` came from the state we read
+                    %% *before* the lock, so committing it now would silently
+                    %% overwrite whatever the successor has done since. We refuse
+                    %% instead.
                     case owns_lock(Td, State1) of
                         false ->
                             fence(Td, State1);
@@ -1158,28 +1161,28 @@ consume_locked(EventType, Msg, ModState, IsLocalReply, State = #state{tenant = T
 
     case Result of
         {fenced, Requeued} ->
-            %% Raised only after the fencing transaction has committed, so the
-            %% requeue is durable before this process goes down.  Crashing is the
-            %% same disposition a failing callback gets: the mod state was not
-            %% written, no actions run, and the in-memory cache dies with the
-            %% process rather than being carried forward past a missed write.
+            %% We raise only after the fencing transaction has committed, so the
+            %% requeue is durable before this process goes down. A failing
+            %% callback is handled the same way. The mod state was not written
+            %% and no actions run. The in-memory cache dies with the process, so
+            %% it is never carried forward past a write that didn't happen.
             erlang:error({lock_fenced, Requeued});
         _ ->
             finalize(Result)
     end.
 
-%% A fenced locked section: commit nothing of the callback's result, but put the
-%% message that took the lock back on the queue in the same transaction, so the
-%% refusal costs a retry rather than the message.  The retry is picked up by
-%% whichever consumer holds the lock now.
+%% Handles a fenced locked section. We commit none of the callback's result, but
+%% we put the message that took the lock back on the queue in the same
+%% transaction. That way the refusal costs a retry instead of the message.
+%% Whichever consumer holds the lock now picks up the retry.
 %%
-%% The envelope is re-pushed verbatim, so a call keeps its reply slot (the waiting
-%% caller is never told; it simply waits for the retry) and the attempt counter is
-%% carried over unchanged — being fenced is not the message's fault and must not
-%% walk it toward the dead-letter queue.
+%% We re-push the envelope unchanged. A call keeps its reply slot, so the waiting
+%% caller never hears about the fence and just waits for the retry. The attempt
+%% counter also stays the same. Being fenced is not the message's fault, so it
+%% must not move the message toward the dead-letter queue.
 %%
-%% Priority and inline locks have no queued message (`locked_envelope` is
-%% undefined); for those the caller receives the exit.
+%% Priority and inline locks have no queued message, so `locked_envelope` is
+%% `undefined`. For those, the caller receives the exit.
 fence(_Td, #state{locked_envelope = undefined}) ->
     {fenced, not_requeued};
 fence(Td, #state{locked_envelope = Envelope, tuid = Tuid}) ->
@@ -1202,7 +1205,7 @@ set_reply(Td, From, Reply) ->
 set_raise(Td, From, Class, Reason) ->
     write_reply_slot(Td, From, {raise, Class, Reason}).
 
-% Skip writing if the caller timed out and cleared the reply keys.
+% Skips the write if the caller timed out and cleared the reply keys.
 write_reply_slot({Tx, Dir}, From, Value) ->
     B = dgen_config:backend(),
     ReplySentinelKey = dgen_mod_state_codec:term_first_key(Dir, From),
@@ -1228,13 +1231,15 @@ resolve_version(State = #state{mod_state_cache = {VF, ModStateResult}}) ->
 resolve_version(State) ->
     State.
 
-%% A lock records the time it was set — so staleness can be computed — and a token
-%% unique to this acquisition.  The token is what makes releasing safe: a holder
-%% busted mid-run must not clear the lock its successor now holds (clear_lock_owned/2).
+%% Sets the lock key. The lock records the time it was set, so other consumers
+%% can tell when it is stale. It also records a token unique to this acquisition.
+%% The token is what makes releasing safe, because a holder busted mid-run must
+%% not clear the lock its successor now holds (see clear_lock_owned/2).
 %%
-%% Runs inside the acquiring transaction, so on a commit conflict the whole closure
-%% re-runs and mints a fresh token; only the committed attempt's State survives, so
-%% the token in the returned State is always the one that actually landed.
+%% This runs inside the transaction that takes the lock. On a commit conflict the
+%% whole closure runs again and mints a fresh token. Only the State from the
+%% attempt that committed survives, so the returned token is always the one that
+%% actually landed.
 set_lock({Tx, Dir}, State = #state{tuid = Tuid}) ->
     B = dgen_config:backend(),
     Token = crypto:strong_rand_bytes(8),
@@ -1242,22 +1247,25 @@ set_lock({Tx, Dir}, State = #state{tuid = Tuid}) ->
     B:set(Tx, B:dir_pack(Dir, get_lock_key(Tuid)), Value),
     State#state{lock_token = Token}.
 
-%% Single read of the lock key — returns not_locked | stale | {live, infinity | Ms}.
-%% Used by handle_consume to decide in one pass whether to clear, sleep, or proceed.
+%% Reads the lock key once and returns not_locked | stale | {live, infinity | Ms}.
+%% handle_consume uses it to decide in one pass whether to clear the lock, wait,
+%% or proceed.
 check_lock({Tx, Dir}, #state{tuid = Tuid, lock_timeout = Timeout}) ->
     B = dgen_config:backend(),
     case B:wait(B:get(Tx, B:dir_pack(Dir, get_lock_key(Tuid)))) of
         not_found ->
             not_locked;
         <<>> ->
-            %% backward compat: v0.2.0 used empty binary (no timestamp) — treat
-            %% as live with no timeout so we never falsely clear a legitimate lock.
+            %% Backward compatibility. v0.2.0 wrote an empty binary with no
+            %% timestamp. We treat it as live with no timeout, so we never clear
+            %% a legitimate lock by mistake.
             {live, infinity};
         Value ->
-            %% v0.3.0+ stores the set-time as a millisecond timestamp so we can
-            %% compute both staleness and the remaining wait in one decode; v0.4.1+
-            %% pairs it with an acquisition token.  Both shapes are read, so a node
-            %% running the older writer stays interoperable during an upgrade.
+            %% v0.3.0 and later store the time the lock was set, in milliseconds,
+            %% so one decode gives us both staleness and the remaining wait.
+            %% v0.4.1 and later pair the timestamp with an acquisition token. We
+            %% read both shapes, so a node still running the older writer keeps
+            %% working during an upgrade.
             case (catch binary_to_term(Value)) of
                 {Ts, _Token} when is_integer(Ts) ->
                     lock_liveness(Ts, Timeout);
@@ -1276,10 +1284,10 @@ lock_liveness(Ts, Timeout) ->
         _ -> {live, Timeout - Elapsed}
     end.
 
-%% Unconditional release, used when busting a lock judged stale.  Safe there
-%% without a token check because check_lock/2 read the key in the same
-%% transaction: the read conflict fences this against a concurrent acquisition,
-%% so the clear can only commit if the value judged stale is still the one there.
+%% Releases the lock unconditionally. We use it to bust a lock judged stale. That
+%% is safe without a token check, because check_lock/2 read the key in the same
+%% transaction. If another consumer takes the lock concurrently, that read
+%% conflicts, so the clear only commits if the stale value is still there.
 clear_lock(Td = {Tx, Dir}, #state{tuid = Tuid}) ->
     B = dgen_config:backend(),
     LockKey = B:dir_pack(Dir, get_lock_key(Tuid)),
@@ -1287,29 +1295,29 @@ clear_lock(Td = {Tx, Dir}, #state{tuid = Tuid}) ->
     B:clear_range(Tx, LockKey, LockEnd),
     dgen_queue:notify(Td, get_quid(Tuid)).
 
-%% Release for a holder letting go of a lock it acquired itself, which — unlike
-%% busting — happens in a *later* transaction than the one that took the lock.
-%% In between, a consumer that judged this holder stale may have busted it and
-%% taken the lock for its own locked section.  Clearing unconditionally would then
-%% release a lock this process does not hold, admitting a third consumer with no
-%% timeout elapsed and no fault: one late holder would unlock an arbitrarily long
-%% chain of successors.  So clear only a lock still carrying our own token.
+%% Releases a lock this process took itself. Unlike busting, this happens in a
+%% *later* transaction than the one that took the lock. In between, a consumer
+%% that judged us stale may have busted the lock and taken it for its own locked
+%% section. If we cleared unconditionally, we would release a lock we don't hold
+%% and let a third consumer in, with no timeout elapsed and no fault. One late
+%% holder could then unlock a long chain of successors. So we only clear a lock
+%% that still carries our own token.
 %%
-%% Declining to clear costs nothing.  A lock that really is this holder's leftover
-%% still carries its token and is cleared here; one that does not is a successor's
-%% live lock, which that successor will release, or the staleness path will bust.
+%% Declining to clear costs nothing. If the lock really is ours, it still carries
+%% our token and we clear it here. If it doesn't, it is a successor's live lock.
+%% That successor will release it, or the staleness check will bust it.
 clear_lock_owned(Td, State) ->
     case owns_lock(Td, State) of
         true -> clear_lock(Td, State);
         false -> ok
     end.
 
-%% Does the lock key still carry the token this process acquired?
+%% Returns whether the lock key still carries the token this process acquired.
 %%
-%% The read is what makes fencing work: performed inside the transaction that is
-%% about to write, it puts the lock key in that transaction's conflict set, so a
-%% bust racing the commit forces a retry rather than slipping between the check
-%% and the write.  There is no window.
+%% This read is what makes fencing work. We do it inside the transaction that is
+%% about to write, so the lock key joins that transaction's conflict set. If a
+%% bust races the commit, the transaction retries. The bust can't slip in between
+%% the check and the write.
 owns_lock({Tx, Dir}, #state{tuid = Tuid, lock_token = Token}) when Token =/= undefined ->
     B = dgen_config:backend(),
     case B:wait(B:get(Tx, B:dir_pack(Dir, get_lock_key(Tuid)))) of
@@ -1333,7 +1341,7 @@ is_locked(Td, State) ->
 get_quid(Tuple) ->
     dgen_key:extend(Tuple, <<"q">>).
 
-%% Arm a timer, and say so. See `dgen_registry_member:schedule_timer/2`.
+%% Arms a timer and logs an `arm` event for simulation traces. See `dgen_registry_member:schedule_timer/2`.
 arm(Delay, Msg) ->
     _ = ?ETA_LOG({arm, Msg, Delay}),
     erlang:send_after(Delay, self(), Msg).

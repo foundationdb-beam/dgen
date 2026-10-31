@@ -89,11 +89,6 @@ defmodule DGen.RegistryIntentsTest do
       assert {_t, [{:reply, ^from, :no}]} = Intents.on_reply(ref, {:register, :no, 10}, 10, t)
     end
 
-    test "a legacy yes binds the row itself", %{t: t, ref: ref, from: from, pid: pid} do
-      assert {_t, [{:reply, ^from, :yes}, {:insert_row, :name, ^pid, _}]} =
-               Intents.on_reply(ref, {:register, :yes, :legacy}, 0, t)
-    end
-
     test "a reply for an unknown reference is ignored", %{t: t} do
       assert {^t, []} = Intents.on_reply(make_ref(), {:register, :yes, 10}, 10, t)
     end

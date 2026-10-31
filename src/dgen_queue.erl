@@ -8,9 +8,9 @@
 -moduledoc """
 Durable FIFO queue backed by the configured dgen backend.
 
-Each dgen_server has its own queue keyed under `Quid`. Items are
-ordered by versionstamps, guaranteeing strict FIFO across transactions.
-Push and pop counts are tracked with atomic `add` operations for O(1) length.
+Each dgen_server has its own queue, keyed under `Quid`. Items are ordered
+by versionstamp, which keeps the queue strictly FIFO across transactions.
+We track push and pop counts with atomic `add` operations, so `length/2` is O(1).
 
 *This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
@@ -93,10 +93,11 @@ notify({Tx, Dir}, Quid) ->
 -doc """
 Reads up to `K` items from the queue without removing them.
 
-Returns `{ok, [{RawKey, RawBin}]}` where `RawBin` is the raw encoded value,
-or `{error, empty}` when the queue is empty. The items remain in the queue
-until `consume_peeked/3` is called. On failure `update_peeked/3` can overwrite a key
-in-place within the same transaction to update the embedded attempt counter.
+Returns `{ok, [{RawKey, RawBin}]}`, where `RawBin` is the encoded value, or
+`{error, empty}` when the queue is empty. The items stay in the queue until
+`consume_peeked/3` removes them. If the callback fails, `update_peeked/3` can
+overwrite a key in place, in the same transaction, to bump the attempt counter
+stored in the item.
 
 All three operations must be called within the same transaction so that the
 read, the callback invocation, and the delete-or-update are atomic.
@@ -137,8 +138,8 @@ consume_peeked({Tx, Dir}, KVs, Quid) ->
 Overwrites the value at `Key` within an existing transaction.
 
 Call this within the same transaction as `peek_k/3` when the callback fails,
-to update the embedded attempt counter before the transaction commits. The
-updated message will be visible to the next consumer.
+to update the attempt counter stored in the message before the transaction
+commits. The next consumer sees the updated message.
 """.
 -endif.
 -spec update_peeked(dgen_backend:tenant(), dgen_backend:key(), term()) -> ok.

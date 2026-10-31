@@ -2,9 +2,9 @@
 
 -define(DOCATTRS, ?OTP_RELEASE >= 27).
 
-%% Runs *inside the caller's process*, which under simulation is a scheduled one,
-%% so it needs the transform for exactly the reason the servers do -- see the note
-%% above the include in `dgen_registry`.
+%% This code runs inside the caller's process, which the simulator schedules like
+%% any other, so it needs the transform for the same reason the servers do. See the
+%% note above the include in `dgen_registry`.
 -include("../include/dgen_eta.hrl").
 
 -if(?DOCATTRS).
@@ -13,25 +13,25 @@
 
 %% Internal helpers for the dgen_server call/reply protocol.
 %%
-%% This module implements the client-side call flow: pushing a call request
-%% onto the durable queue, waiting for the reply via a watch, and
-%% cleaning up reply keys on timeout.
+%% This module implements the client side of a call. It pushes the call request
+%% onto the durable queue, waits on a watch for the reply, and cleans up the reply
+%% keys on timeout.
 %%
-%% Reply payloads are stored using the codec's chunked term encoding so that
-%% replies can exceed the single-value size limit. The watch is placed on
-%% the first chunk key; the client always reads via `get_range`.
+%% We store replies with the codec's chunked term encoding so that a reply can be
+%% larger than the backend allows for a single value. The watch sits on the first
+%% chunk key, and the client always reads the reply with `get_range`.
 %%
 %% ### Call Request Flow
 %%
 %% 1. The caller invokes `dgen_server:call/3` which delegates to `call/4`.
-%% 2. A call request is pushed onto the durable queue via `push_call/5`,
-%%    which writes `noreply` as a chunked term under the from-key and sets
-%%    a watch on the first chunk key.
+%% 2. `push_call/6` pushes the call request onto the durable queue. It also
+%%    writes `noreply` as a chunked term under the `From` key and sets a watch
+%%    on the first chunk key.
 %% 3. The caller blocks in `await_call_reply/4` until the watch fires or
 %%    the timeout expires.
 %% 4. A consumer processes the request and writes `{reply, Reply}` as a
 %%    chunked term under the from-key.
-%% 5. The watch fires, the caller reads and clears the chunked reply.
+%% 5. The watch fires, and the caller reads and clears the chunked reply.
 %% 6. On timeout the caller clears the chunked reply keys to avoid leaks.
 %%
 %% *This documentation is LLM-generated. See the AI disclosure in README.md.*
@@ -61,10 +61,10 @@ push_call(Td, Tuid, Quid, Request, WatchTo, Options) ->
 
 -if(?DOCATTRS).
 -doc """
-Like `push_call/6` but records `Attempts` as the initial attempt count in the
+Like `push_call/6`, but records `Attempts` as the initial attempt count in the
 message envelope. Pass a non-zero value when the call has already failed at
-least once (e.g. after an inline execution attempt) so the dead-letter
-threshold accounts for all failures.
+least once, for example in an inline execution attempt, so that the dead-letter
+threshold counts every failure.
 """.
 -endif.
 -spec push_call(term(), tuid(), dgen_queue:quid(), term(), pid(), list(), non_neg_integer()) ->
@@ -90,8 +90,8 @@ get_waiting_key(Tuple) ->
 -doc """
 Builds a from-key tuple from a waiting key and a unique ref.
 
-The key includes a system-time timestamp (seconds) so that abandoned
-call keys can be garbage-collected using a time-based heuristic.
+The key includes the system time in seconds, so that abandoned call keys can
+be garbage-collected by age.
 Key structure: `{WaitingKey..., Timestamp, term_to_binary(Ref)}`.
 """.
 -endif.
@@ -120,9 +120,9 @@ call(Module, Server, Request, Timeout) ->
         catch
             error:{timeout, _} ->
                 % gen_server:call timed out before returning. If push_call
-                % committed, the reply keys are abandoned (we don't have From).
-                % They will be cleaned up when the dgen_server is killed,
-                % which clears the entire waiting-key range.
+                % committed, its reply keys are abandoned, because we never got
+                % `From` back. They are cleaned up when the dgen_server is
+                % killed, which clears the whole waiting-key range.
                 {noreply, {undefined, undefined, undefined}}
         end,
 
