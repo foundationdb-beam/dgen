@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.5.0 (TBD)
+## v0.5.0 (2026-11-01)
 
 ### Bug fixes
 

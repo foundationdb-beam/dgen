@@ -401,6 +401,10 @@ handle_event(info, {dgen_transaction, Ref, Reply}, _State, Data = #data{pipeline
 %% monitor. If we no longer lead, the new leader monitors the pid itself and removes
 %% the name.
 handle_event(info, {{down, LogicalName}, Ref, process, _Pid, _Reason}, _State, Data) ->
+    % {down, LogicalName} comes from a custom tag on the monitor:
+    %
+    %     erlang:monitor(process, Pid, [{tag, {down, Name}}]).
+    %
     {keep_state, enqueue_op({down, LogicalName, Ref}, Data)};
 handle_event(info, {'DOWN', Ref, process, _Pid, _Reason}, _State, Data) ->
     #data{
