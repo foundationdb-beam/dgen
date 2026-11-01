@@ -1,0 +1,89 @@
+<svg viewBox="0 0 798 586" width="798" role="img" aria-label="Each batch names the version it follows. A follower that sees a gap applies nothing and asks the leader for a snapshot. The heartbeat exposes a lost tail, and a batch from a later epoch always counts as a gap." xmlns="http://www.w3.org/2000/svg"><style>
+:root{--surface:#ffffff;--fg:#1a2226;--muted:#5a676d;--rule:#c9d2d5;--lane:#e6ecee;
+--accent:#0a6a86;--durable:#8c5a06;--warn:#b0281f;--note:#f8f4e6;--note-rule:#c9b98a}
+@media (prefers-color-scheme: dark){:root{--surface:#172024;--fg:#e1e8ea;--muted:#97a5ab;
+--rule:#33424a;--lane:#1e2a30;--accent:#56c2df;--durable:#e2ab52;--warn:#ff8074;
+--note:#23241d;--note-rule:#6d6440}}
+.bg{fill:var(--surface)}
+.leg-t{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:12px;fill:var(--fg)}
+.life{stroke:var(--rule);stroke-width:1;stroke-dasharray:3 4}
+.lane-head{fill:var(--lane);stroke:var(--rule)}
+.lane-n{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-weight:600;font-size:13.5px;fill:var(--fg)}
+.lane-s,.lbl,.phase-t,.num{font-family:ui-monospace,"SF Mono",Menlo,Consolas,"DejaVu Sans Mono",monospace}
+.lane-s{font-size:10.5px;fill:var(--muted)}
+.ln{stroke-width:1.4;fill:none}
+.lbl{font-size:11px;paint-order:stroke;stroke-width:4px;stroke-linejoin:round}
+.m-cast,.m-call{stroke:var(--fg);fill:var(--fg)}
+.m-reply{stroke:var(--muted);fill:var(--muted)}
+.ln.m-reply{stroke-dasharray:5 4}
+.m-db{stroke:var(--durable);fill:var(--durable)}
+.ln.m-db{stroke-dasharray:1.5 3;stroke-width:1.8;stroke-linecap:round}
+.m-signal{stroke:var(--warn);fill:var(--warn)}
+.accent{stroke:var(--accent);fill:var(--accent)}
+.ln.accent{stroke-width:2.2}
+.lbl{stroke:var(--surface)}
+.lbl.accent{font-weight:600}
+.head,.dot{stroke:none}
+.lost{stroke:var(--warn);stroke-width:2;fill:none;stroke-linecap:round}
+.act{fill:var(--surface);stroke:var(--rule)}
+.act.warn{stroke:var(--warn)}
+.act-t,.note-t{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:11.5px;fill:var(--fg)}
+.act-t.warn{fill:var(--warn)}
+.note{fill:var(--note);stroke:var(--note-rule);stroke-dasharray:4 3}
+.note-t{font-style:italic}
+.phase-ln{stroke:var(--rule);stroke-width:1}
+.phase-bg{fill:var(--surface)}
+.phase-t{font-size:10.5px;letter-spacing:.08em;fill:var(--muted)}
+.num-dot{fill:none;stroke:var(--rule)}
+.num{font-size:10px;fill:var(--muted)}
+</style><rect class="bg" width="100%" height="100%"/>
+<line class="life" x1="165.0" y1="52" x2="165.0" y2="580"/>
+<rect class="lane-head" x="48.0" y="4" width="234" height="46" rx="6"/><text class="lane-n" x="165.0" y="24" text-anchor="middle">Leader</text><text class="lane-s" x="165.0" y="40" text-anchor="middle">member</text>
+<line class="life" x1="415.0" y1="52" x2="415.0" y2="580"/>
+<rect class="lane-head" x="298.0" y="4" width="234" height="46" rx="6"/><text class="lane-n" x="415.0" y="24" text-anchor="middle">Follower</text><text class="lane-s" x="415.0" y="40" text-anchor="middle">member</text>
+<line class="life" x1="665.0" y1="52" x2="665.0" y2="580"/>
+<rect class="lane-head" x="548.0" y="4" width="234" height="46" rx="6"/><text class="lane-n" x="665.0" y="24" text-anchor="middle">New leader</text><text class="lane-s" x="665.0" y="40" text-anchor="middle">member</text>
+<line class="ln m-cast" x1="165.0" y1="94" x2="407.0" y2="94"/>
+<polygon class="head m-cast" points="415.0,94.0 407.0,89.5 407.0,98.5"/>
+<text class="lbl m-cast" x="290.0" y="87" text-anchor="middle">{names_batch, Ops1, E, 10, 20, L}</text>
+<circle class="num-dot" cx="18" cy="90.0" r="9"/><text class="num" x="18" y="93.5" text-anchor="middle">1</text>
+<line class="ln m-cast" x1="165.0" y1="128" x2="320.0" y2="128"/>
+<path class="lost" d="M315.0,123 L325.0,133 M325.0,123 L315.0,133"/>
+<text class="lbl m-cast" x="242.5" y="121" text-anchor="middle">{names_batch, Ops2, E, 20, 30, L}</text>
+<circle class="num-dot" cx="18" cy="124.0" r="9"/><text class="num" x="18" y="127.5" text-anchor="middle">2</text>
+<line class="ln m-cast" x1="165.0" y1="162" x2="407.0" y2="162"/>
+<polygon class="head m-cast" points="415.0,162.0 407.0,157.5 407.0,166.5"/>
+<text class="lbl m-cast" x="290.0" y="155" text-anchor="middle">{names_batch, Ops3, E, 30, 40, L}</text>
+<circle class="num-dot" cx="18" cy="158.0" r="9"/><text class="num" x="18" y="161.5" text-anchor="middle">3</text>
+<rect class="act warn" x="213.0" y="180" width="404.0" height="25" rx="5"/>
+<text class="act-t warn" x="415.0" y="196" text-anchor="middle">PrevV 30 doesn&#x27;t match applied 20. A gap, so it applies nothing.</text>
+<line class="ln m-cast accent" x1="415.0" y1="231" x2="173.0" y2="231"/>
+<polygon class="head m-cast accent" points="165.0,231.0 173.0,226.5 173.0,235.5"/>
+<text class="lbl m-cast accent" x="290.0" y="224" text-anchor="middle">{resync_req, F}</text>
+<circle class="num-dot" cx="18" cy="227.0" r="9"/><text class="num" x="18" y="230.5" text-anchor="middle">4</text>
+<rect class="act " x="336.0" y="249" width="158.0" height="25" rx="5"/>
+<text class="act-t " x="415.0" y="265" text-anchor="middle">Won&#x27;t ask again for 2 s</text>
+<line class="ln m-cast accent" x1="165.0" y1="300" x2="407.0" y2="300"/>
+<polygon class="head m-cast accent" points="415.0,300.0 407.0,295.5 407.0,304.5"/>
+<text class="lbl m-cast accent" x="290.0" y="293" text-anchor="middle">{apply_names_snapshot, Records, L, [], #{}, E, 40}</text>
+<circle class="num-dot" cx="18" cy="296.0" r="9"/><text class="num" x="18" y="299.5" text-anchor="middle">5</text>
+<rect class="act " x="336.0" y="318" width="158.0" height="25" rx="5"/>
+<text class="act-t " x="415.0" y="334" text-anchor="middle">Re-baselined at (E, 40)</text>
+<line class="phase-ln" x1="10" y1="367" x2="794" y2="367"/>
+<rect class="phase-bg" x="10" y="358" width="236.8" height="18"/><text class="phase-t" x="16" y="371">A LOST TAIL WITH NO LATER WRITES</text>
+<line class="ln m-cast" x1="165.0" y1="403" x2="407.0" y2="403"/>
+<polygon class="head m-cast" points="415.0,403.0 407.0,398.5 407.0,407.5"/>
+<text class="lbl m-cast" x="290.0" y="396" text-anchor="middle">heartbeat {names_batch, [], E, 50, 50, L}</text>
+<circle class="num-dot" cx="18" cy="399.0" r="9"/><text class="num" x="18" y="402.5" text-anchor="middle">6</text>
+<rect class="act " x="222.0" y="421" width="386.0" height="25" rx="5"/>
+<text class="act-t " x="415.0" y="437" text-anchor="middle">The heartbeat is ahead of its version, so it resyncs as above</text>
+<line class="phase-ln" x1="10" y1="470" x2="794" y2="470"/>
+<rect class="phase-bg" x="10" y="461" width="195.4" height="18"/><text class="phase-t" x="16" y="474">A BATCH FROM A LATER EPOCH</text>
+<line class="ln m-cast" x1="665.0" y1="506" x2="423.0" y2="506"/>
+<polygon class="head m-cast" points="415.0,506.0 423.0,501.5 423.0,510.5"/>
+<text class="lbl m-cast" x="540.0" y="499" text-anchor="middle">{names_batch, Ops, E+1, PrevV, V, N}</text>
+<circle class="num-dot" cx="18" cy="502.0" r="9"/><text class="num" x="18" y="505.5" text-anchor="middle">7</text>
+<rect class="act warn" x="204.0" y="524" width="422.0" height="40" rx="5"/>
+<text class="act-t warn" x="415.0" y="540" text-anchor="middle">A gap even if PrevV matches. Only a snapshot moves a replica into a</text>
+<text class="act-t warn" x="415.0" y="555" text-anchor="middle">new epoch.</text>
+</svg>

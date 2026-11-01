@@ -24,6 +24,9 @@ This document is the source of truth for what the registry does. The
 behaviour that contradicts a guarantee is a bug, and behaviour listed as a non-goal
 is intentional.
 
+[dgen_registry Message Flows](dgen_registry_message_flows.md) shows the messages
+behind each operation as swimlane diagrams.
+
 **This document is LLM generated.**
 
 ## 1. The one-minute model

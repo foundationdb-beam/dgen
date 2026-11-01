@@ -1,12 +1,12 @@
 # dgen_registry Formal Model
 
 A TLA+ model of the replication protocol in
-[`src/dgen_registry_member.erl`](../src/dgen_registry_member.erl) (design:
-[`docs/design/dgen_registry_design.md`](../docs/design/dgen_registry_design.md)
+[`src/dgen_registry/dgen_registry_member.erl`](../src/dgen_registry/dgen_registry_member.erl)
+(design: [`docs/design/dgen_registry_design.md`](../docs/design/dgen_registry_design.md)
 §4.5, §5). TLC checks its safety properties against every interleaving of a
 small bounded cluster. Tests can only sample interleavings; the
-[simulation harness](../test/support/sim/README.md) covers the other side: it checks
-that the real code implements this protocol.
+[simulation harness](../test/support/sim/dgen_registry_simulation.md) covers the
+other side: it checks that the real code implements this protocol.
 
 ## What it models
 

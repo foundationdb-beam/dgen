@@ -1,0 +1,95 @@
+<svg viewBox="0 0 978 633" width="978" role="img" aria-label="A joining member announces itself through the elector&#x27;s durable queue. The elector keeps the sticky leader, and the leader onboards the joiner with one snapshot while existing followers only start monitoring it." xmlns="http://www.w3.org/2000/svg"><style>
+:root{--surface:#ffffff;--fg:#1a2226;--muted:#5a676d;--rule:#c9d2d5;--lane:#e6ecee;
+--accent:#0a6a86;--durable:#8c5a06;--warn:#b0281f;--note:#f8f4e6;--note-rule:#c9b98a}
+@media (prefers-color-scheme: dark){:root{--surface:#172024;--fg:#e1e8ea;--muted:#97a5ab;
+--rule:#33424a;--lane:#1e2a30;--accent:#56c2df;--durable:#e2ab52;--warn:#ff8074;
+--note:#23241d;--note-rule:#6d6440}}
+.bg{fill:var(--surface)}
+.leg-t{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:12px;fill:var(--fg)}
+.life{stroke:var(--rule);stroke-width:1;stroke-dasharray:3 4}
+.lane-head{fill:var(--lane);stroke:var(--rule)}
+.lane-n{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-weight:600;font-size:13.5px;fill:var(--fg)}
+.lane-s,.lbl,.phase-t,.num{font-family:ui-monospace,"SF Mono",Menlo,Consolas,"DejaVu Sans Mono",monospace}
+.lane-s{font-size:10.5px;fill:var(--muted)}
+.ln{stroke-width:1.4;fill:none}
+.lbl{font-size:11px;paint-order:stroke;stroke-width:4px;stroke-linejoin:round}
+.m-cast,.m-call{stroke:var(--fg);fill:var(--fg)}
+.m-reply{stroke:var(--muted);fill:var(--muted)}
+.ln.m-reply{stroke-dasharray:5 4}
+.m-db{stroke:var(--durable);fill:var(--durable)}
+.ln.m-db{stroke-dasharray:1.5 3;stroke-width:1.8;stroke-linecap:round}
+.m-signal{stroke:var(--warn);fill:var(--warn)}
+.accent{stroke:var(--accent);fill:var(--accent)}
+.ln.accent{stroke-width:2.2}
+.lbl{stroke:var(--surface)}
+.lbl.accent{font-weight:600}
+.head,.dot{stroke:none}
+.lost{stroke:var(--warn);stroke-width:2;fill:none;stroke-linecap:round}
+.act{fill:var(--surface);stroke:var(--rule)}
+.act.warn{stroke:var(--warn)}
+.act-t,.note-t{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:11.5px;fill:var(--fg)}
+.act-t.warn{fill:var(--warn)}
+.note{fill:var(--note);stroke:var(--note-rule);stroke-dasharray:4 3}
+.note-t{font-style:italic}
+.phase-ln{stroke:var(--rule);stroke-width:1}
+.phase-bg{fill:var(--surface)}
+.phase-t{font-size:10.5px;letter-spacing:.08em;fill:var(--muted)}
+.num-dot{fill:none;stroke:var(--rule)}
+.num{font-size:10px;fill:var(--muted)}
+</style><rect class="bg" width="100%" height="100%"/>
+<line class="life" x1="133.0" y1="52" x2="133.0" y2="627"/>
+<rect class="lane-head" x="48.0" y="4" width="170" height="46" rx="6"/><text class="lane-n" x="133.0" y="24" text-anchor="middle">Joining member</text><text class="lane-s" x="133.0" y="40" text-anchor="middle">new node</text>
+<line class="life" x1="319.0" y1="52" x2="319.0" y2="627"/>
+<rect class="lane-head" x="234.0" y="4" width="170" height="46" rx="6"/><text class="lane-n" x="319.0" y="24" text-anchor="middle">Elector</text><text class="lane-s" x="319.0" y="40" text-anchor="middle">dgen_server</text>
+<line class="life" x1="505.0" y1="52" x2="505.0" y2="627"/>
+<rect class="lane-head" x="420.0" y="4" width="170" height="46" rx="6"/><text class="lane-n" x="505.0" y="24" text-anchor="middle">Backend</text><text class="lane-s" x="505.0" y="40" text-anchor="middle">FDB keys</text>
+<line class="life" x1="691.0" y1="52" x2="691.0" y2="627"/>
+<rect class="lane-head" x="606.0" y="4" width="170" height="46" rx="6"/><text class="lane-n" x="691.0" y="24" text-anchor="middle">Leader</text><text class="lane-s" x="691.0" y="40" text-anchor="middle">member</text>
+<line class="life" x1="877.0" y1="52" x2="877.0" y2="627"/>
+<rect class="lane-head" x="792.0" y="4" width="170" height="46" rx="6"/><text class="lane-n" x="877.0" y="24" text-anchor="middle">Follower</text><text class="lane-s" x="877.0" y="40" text-anchor="middle">member</text>
+<line class="ln m-db" x1="133.0" y1="94" x2="311.0" y2="94"/>
+<polygon class="head m-db" points="319.0,94.0 311.0,89.5 311.0,98.5"/>
+<text class="lbl m-db" x="226.0" y="87" text-anchor="middle">{join, J, Token, Fresh = true}</text>
+<circle class="num-dot" cx="18" cy="90.0" r="9"/><text class="num" x="18" y="93.5" text-anchor="middle">1</text>
+<rect class="act " x="159.0" y="112" width="320.0" height="40" rx="5"/>
+<text class="act-t " x="319.0" y="128" text-anchor="middle">In one transaction, adds J and keeps leader L. The</text>
+<text class="act-t " x="319.0" y="143" text-anchor="middle">epoch stays E.</text>
+<line class="ln m-db" x1="319.0" y1="178" x2="497.0" y2="178"/>
+<polygon class="head m-db" points="505.0,178.0 497.0,173.5 497.0,182.5"/>
+<text class="lbl m-db" x="412.0" y="171" text-anchor="middle">commit state and leader key {L, E}</text>
+<circle class="num-dot" cx="18" cy="174.0" r="9"/><text class="num" x="18" y="177.5" text-anchor="middle">2</text>
+<rect class="act " x="228.0" y="196" width="182.0" height="25" rx="5"/>
+<text class="act-t " x="319.0" y="212" text-anchor="middle">Runs the post-commit action</text>
+<line class="ln m-call" x1="319.0" y1="247" x2="683.0" y2="247"/>
+<circle class="dot m-call" cx="319.0" cy="247" r="3.2"/>
+<polygon class="head m-call" points="691.0,247.0 683.0,242.5 683.0,251.5"/>
+<text class="lbl m-call" x="505.0" y="240" text-anchor="middle">{elector_assume_and_distribute, J, …, E}</text>
+<circle class="num-dot" cx="18" cy="243.0" r="9"/><text class="num" x="18" y="246.5" text-anchor="middle">3</text>
+<rect class="act " x="534.0" y="265" width="314.0" height="40" rx="5"/>
+<text class="act-t " x="691.0" y="281" text-anchor="middle">Same epoch and synced, so it takes the fast path.</text>
+<text class="act-t " x="691.0" y="296" text-anchor="middle">Monitors J.</text>
+<line class="ln m-reply" x1="691.0" y1="331" x2="327.0" y2="331"/>
+<polygon class="head m-reply" points="319.0,331.0 327.0,326.5 327.0,335.5"/>
+<text class="lbl m-reply" x="505.0" y="324" text-anchor="middle">ok</text>
+<circle class="num-dot" cx="18" cy="327.0" r="9"/><text class="num" x="18" y="330.5" text-anchor="middle">4</text>
+<line class="ln m-cast accent" x1="691.0" y1="365" x2="141.0" y2="365"/>
+<polygon class="head m-cast accent" points="133.0,365.0 141.0,360.5 141.0,369.5"/>
+<text class="lbl m-cast accent" x="412.0" y="358" text-anchor="middle">{apply_names_snapshot, Records, L, AllIds, Tokens, E, V}</text>
+<circle class="num-dot" cx="18" cy="361.0" r="9"/><text class="num" x="18" y="364.5" text-anchor="middle">5</text>
+<rect class="act " x="4.0" y="383" width="325.5" height="25" rx="5"/>
+<text class="act-t " x="166.8" y="399" text-anchor="middle">Adopts the replica at (E, V) and becomes a follower</text>
+<line class="ln m-cast" x1="691.0" y1="434" x2="869.0" y2="434"/>
+<polygon class="head m-cast" points="877.0,434.0 869.0,429.5 869.0,438.5"/>
+<text class="lbl m-cast" x="784.0" y="427" text-anchor="middle">{peer_joined, J, Tokens}</text>
+<circle class="num-dot" cx="18" cy="430.0" r="9"/><text class="num" x="18" y="433.5" text-anchor="middle">6</text>
+<rect class="act " x="732.0" y="452" width="242.0" height="25" rx="5"/>
+<text class="act-t " x="853.0" y="468" text-anchor="middle">Monitors J. Its replica is untouched.</text>
+<line class="phase-ln" x1="10" y1="501" x2="974" y2="501"/>
+<rect class="phase-bg" x="10" y="492" width="271.3" height="18"/><text class="phase-t" x="16" y="505">J SYNCED BEFORE, AS AFTER A PARTITION</text>
+<rect class="act " x="528.2" y="521" width="325.5" height="40" rx="5"/>
+<text class="act-t " x="691.0" y="537" text-anchor="middle">A helper fetches J&#x27;s replica and probes conflicting</text>
+<text class="act-t " x="691.0" y="552" text-anchor="middle">pids, then sends {joiner_gathered, …}</text>
+<rect class="act " x="534.0" y="571" width="314.0" height="40" rx="5"/>
+<text class="act-t " x="691.0" y="587" text-anchor="middle">Repairs conflicts (§5.6), then sends the snapshot</text>
+<text class="act-t " x="691.0" y="602" text-anchor="middle">as above</text>
+</svg>

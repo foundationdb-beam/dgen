@@ -19,7 +19,7 @@ defmodule DGen.RegistrySimTest do
   run is reproducible at the fault level rather than bit-for-bit. That is enough to
   re-run a seed and usually see the same failure, and enough to read the trace and
   understand it — it is not enough to guarantee it. Getting the rest requires
-  virtualising the backend and the commit worker; see `test/support/sim/README.md`.
+  virtualising the backend and the commit worker; see `test/support/sim/dgen_registry_simulation.md`.
 
   Only inter-member protocol traffic is faulted. The elector's durable
   membership/election queue is untouched, so elections still make progress and the
@@ -662,8 +662,8 @@ defmodule DGen.RegistrySimTest do
   # a version discontinuity that the existing resync repairs. When it was one
   # message per name a member could hold a strict subset while reporting the
   # batch's version — undetectable, because gap detection compares versions and the
-  # versions matched. Finding 1 in README.md has the mechanism; these tests pin the
-  # fix from both directions.
+  # versions matched. Finding 1 in dgen_registry_simulation.md has the mechanism; these
+  # tests pin the fix from both directions.
   # ---------------------------------------------------------------------------
 
   describe "batch atomicity" do

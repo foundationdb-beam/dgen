@@ -47,22 +47,26 @@ defmodule Dgen.MixProject do
     [
       main: "readme",
       source_url: "https://github.com/foundationdb-beam/dgen",
+      assets: %{"docs/design/assets" => "assets"},
       extras: [
         "README.md",
         "CHANGELOG.md",
         "LICENSE.md",
         "docs/design/dgen_server_design.md",
         "docs/design/dgen_registry_design.md",
+        "docs/design/dgen_registry_message_flows.md",
         "docs/getting_started/dgen-intro.livemd",
         "docs/getting_started/dgen-registry-intro.livemd",
         "docs/getting_started/presence-demo.livemd",
         {"formal/README.md",
-         [filename: "dgen_registry_formal", title: "dgen_registry Formal Model"]}
+         [filename: "dgen_registry_formal", title: "dgen_registry Formal Model"]},
+        {"test/support/sim/dgen_registry_simulation.md",
+         [filename: "dgen_registry_simulation", title: "dgen_registry Simulation Harness"]}
       ],
       groups_for_extras: [
         "Getting Started": ~r/getting_started/,
         Design: ~r/design/,
-        "Formal Methods": ~r/formal/
+        "Formal Methods": ["formal/README.md", "test/support/sim/dgen_registry_simulation.md"]
       ]
     ]
   end

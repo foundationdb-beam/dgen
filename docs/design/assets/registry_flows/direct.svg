@@ -1,0 +1,93 @@
+<svg viewBox="0 0 832 571" width="832" role="img" aria-label="A registration made on the leader&#x27;s own node commits, then waits for register_replicas followers to confirm they hold the batch before the caller gets yes." xmlns="http://www.w3.org/2000/svg"><style>
+:root{--surface:#ffffff;--fg:#1a2226;--muted:#5a676d;--rule:#c9d2d5;--lane:#e6ecee;
+--accent:#0a6a86;--durable:#8c5a06;--warn:#b0281f;--note:#f8f4e6;--note-rule:#c9b98a}
+@media (prefers-color-scheme: dark){:root{--surface:#172024;--fg:#e1e8ea;--muted:#97a5ab;
+--rule:#33424a;--lane:#1e2a30;--accent:#56c2df;--durable:#e2ab52;--warn:#ff8074;
+--note:#23241d;--note-rule:#6d6440}}
+.bg{fill:var(--surface)}
+.leg-t{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:12px;fill:var(--fg)}
+.life{stroke:var(--rule);stroke-width:1;stroke-dasharray:3 4}
+.lane-head{fill:var(--lane);stroke:var(--rule)}
+.lane-n{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-weight:600;font-size:13.5px;fill:var(--fg)}
+.lane-s,.lbl,.phase-t,.num{font-family:ui-monospace,"SF Mono",Menlo,Consolas,"DejaVu Sans Mono",monospace}
+.lane-s{font-size:10.5px;fill:var(--muted)}
+.ln{stroke-width:1.4;fill:none}
+.lbl{font-size:11px;paint-order:stroke;stroke-width:4px;stroke-linejoin:round}
+.m-cast,.m-call{stroke:var(--fg);fill:var(--fg)}
+.m-reply{stroke:var(--muted);fill:var(--muted)}
+.ln.m-reply{stroke-dasharray:5 4}
+.m-db{stroke:var(--durable);fill:var(--durable)}
+.ln.m-db{stroke-dasharray:1.5 3;stroke-width:1.8;stroke-linecap:round}
+.m-signal{stroke:var(--warn);fill:var(--warn)}
+.accent{stroke:var(--accent);fill:var(--accent)}
+.ln.accent{stroke-width:2.2}
+.lbl{stroke:var(--surface)}
+.lbl.accent{font-weight:600}
+.head,.dot{stroke:none}
+.lost{stroke:var(--warn);stroke-width:2;fill:none;stroke-linecap:round}
+.act{fill:var(--surface);stroke:var(--rule)}
+.act.warn{stroke:var(--warn)}
+.act-t,.note-t{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:11.5px;fill:var(--fg)}
+.act-t.warn{fill:var(--warn)}
+.note{fill:var(--note);stroke:var(--note-rule);stroke-dasharray:4 3}
+.note-t{font-style:italic}
+.phase-ln{stroke:var(--rule);stroke-width:1}
+.phase-bg{fill:var(--surface)}
+.phase-t{font-size:10.5px;letter-spacing:.08em;fill:var(--muted)}
+.num-dot{fill:none;stroke:var(--rule)}
+.num{font-size:10px;fill:var(--muted)}
+</style><rect class="bg" width="100%" height="100%"/>
+<line class="life" x1="138.0" y1="52" x2="138.0" y2="565"/>
+<rect class="lane-head" x="48.0" y="4" width="180" height="46" rx="6"/><text class="lane-n" x="138.0" y="24" text-anchor="middle">Caller</text><text class="lane-s" x="138.0" y="40" text-anchor="middle">any process</text>
+<line class="life" x1="334.0" y1="52" x2="334.0" y2="565"/>
+<rect class="lane-head" x="244.0" y="4" width="180" height="46" rx="6"/><text class="lane-n" x="334.0" y="24" text-anchor="middle">Leader</text><text class="lane-s" x="334.0" y="40" text-anchor="middle">member</text>
+<line class="life" x1="530.0" y1="52" x2="530.0" y2="565"/>
+<rect class="lane-head" x="440.0" y="4" width="180" height="46" rx="6"/><text class="lane-n" x="530.0" y="24" text-anchor="middle">Commit worker</text><text class="lane-s" x="530.0" y="40" text-anchor="middle">dgen_transaction</text>
+<line class="life" x1="726.0" y1="52" x2="726.0" y2="565"/>
+<rect class="lane-head" x="636.0" y="4" width="180" height="46" rx="6"/><text class="lane-n" x="726.0" y="24" text-anchor="middle">Follower</text><text class="lane-s" x="726.0" y="40" text-anchor="middle">member</text>
+<line class="ln m-call" x1="138.0" y1="94" x2="326.0" y2="94"/>
+<circle class="dot m-call" cx="138.0" cy="94" r="3.2"/>
+<polygon class="head m-call" points="334.0,94.0 326.0,89.5 326.0,98.5"/>
+<text class="lbl m-call" x="236.0" y="87" text-anchor="middle">{register, Name, Pid, Meta}</text>
+<circle class="num-dot" cx="18" cy="90.0" r="9"/><text class="num" x="18" y="93.5" text-anchor="middle">1</text>
+<rect class="act " x="228.0" y="112" width="212.0" height="25" rx="5"/>
+<text class="act-t " x="334.0" y="128" text-anchor="middle">Enqueues {add, …, {local, From}}</text>
+<line class="ln m-cast" x1="334.0" y1="163" x2="522.0" y2="163"/>
+<polygon class="head m-cast" points="530.0,163.0 522.0,158.5 522.0,167.5"/>
+<text class="lbl m-cast" x="432.0" y="156" text-anchor="middle">commit batch, fenced on {L, E}</text>
+<circle class="num-dot" cx="18" cy="159.0" r="9"/><text class="num" x="18" y="162.5" text-anchor="middle">2</text>
+<line class="ln m-cast" x1="530.0" y1="197" x2="342.0" y2="197"/>
+<polygon class="head m-cast" points="334.0,197.0 342.0,192.5 342.0,201.5"/>
+<text class="lbl m-cast" x="432.0" y="190" text-anchor="middle">{dgen_transaction, Ref, {committed, V}}</text>
+<circle class="num-dot" cx="18" cy="193.0" r="9"/><text class="num" x="18" y="196.5" text-anchor="middle">3</text>
+<line class="ln m-cast" x1="334.0" y1="231" x2="718.0" y2="231"/>
+<polygon class="head m-cast" points="726.0,231.0 718.0,226.5 718.0,235.5"/>
+<text class="lbl m-cast" x="530.0" y="224" text-anchor="middle">{names_batch, Ops, E, PrevV, V, L}</text>
+<circle class="num-dot" cx="18" cy="227.0" r="9"/><text class="num" x="18" y="230.5" text-anchor="middle">4</text>
+<line class="ln m-cast accent" x1="334.0" y1="265" x2="718.0" y2="265"/>
+<polygon class="head m-cast accent" points="726.0,265.0 718.0,260.5 718.0,269.5"/>
+<text class="lbl m-cast accent" x="530.0" y="258" text-anchor="middle">{replicate_sync, BatchRef, L, V}</text>
+<circle class="num-dot" cx="18" cy="261.0" r="9"/><text class="num" x="18" y="264.5" text-anchor="middle">5</text>
+<rect class="act " x="222.0" y="283" width="224.0" height="25" rx="5"/>
+<text class="act-t " x="334.0" y="299" text-anchor="middle">Starts the replicate_timeout timer</text>
+<rect class="act " x="532.0" y="318" width="296.0" height="25" rx="5"/>
+<text class="act-t " x="680.0" y="334" text-anchor="middle">Acks only if its applied version is at least V</text>
+<line class="ln m-cast accent" x1="726.0" y1="369" x2="342.0" y2="369"/>
+<polygon class="head m-cast accent" points="334.0,369.0 342.0,364.5 342.0,373.5"/>
+<text class="lbl m-cast accent" x="530.0" y="362" text-anchor="middle">{replicate_ack, BatchRef, F}</text>
+<circle class="num-dot" cx="18" cy="365.0" r="9"/><text class="num" x="18" y="368.5" text-anchor="middle">6</text>
+<rect class="act " x="171.0" y="387" width="326.0" height="25" rx="5"/>
+<text class="act-t " x="334.0" y="403" text-anchor="middle">Enough distinct followers acked. Cancels the timer.</text>
+<line class="ln m-reply" x1="334.0" y1="438" x2="146.0" y2="438"/>
+<polygon class="head m-reply" points="138.0,438.0 146.0,433.5 146.0,442.5"/>
+<text class="lbl m-reply" x="236.0" y="431" text-anchor="middle">yes</text>
+<circle class="num-dot" cx="18" cy="434.0" r="9"/><text class="num" x="18" y="437.5" text-anchor="middle">7</text>
+<line class="phase-ln" x1="10" y1="470" x2="828" y2="470"/>
+<rect class="phase-bg" x="10" y="461" width="223.0" height="18"/><text class="phase-t" x="16" y="474">IF TOO FEW ACKS ARRIVE IN TIME</text>
+<rect class="act warn" x="237.0" y="490" width="194.0" height="25" rx="5"/>
+<text class="act-t warn" x="334.0" y="506" text-anchor="middle">{replicate_timeout, BatchRef}</text>
+<line class="ln m-reply" x1="334.0" y1="541" x2="146.0" y2="541"/>
+<polygon class="head m-reply" points="138.0,541.0 146.0,536.5 146.0,545.5"/>
+<text class="lbl m-reply" x="236.0" y="534" text-anchor="middle">yes (degrade-open), or no plus a retract under strict_replication</text>
+<circle class="num-dot" cx="18" cy="537.0" r="9"/><text class="num" x="18" y="540.5" text-anchor="middle">8</text>
+</svg>

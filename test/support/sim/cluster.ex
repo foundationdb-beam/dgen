@@ -711,7 +711,7 @@ defmodule DGen.Sim.Cluster do
   keeps a timeout here meaning "did not converge *despite* traffic".
 
   (That quiescent-divergence window is itself worth knowing about, and is written
-  up in `test/support/sim/README.md`.)
+  up in `test/support/sim/dgen_registry_simulation.md`.)
   """
   def converge(%__MODULE__{} = c, timeout \\ 15_000) do
     :ok = heal_everything(c.net)
