@@ -20,10 +20,11 @@
 %%
 %%   awaiting_leader           No leader is reachable yet.
 %%   {forwarded, L}            We sent it to leader L and are waiting for a reply.
-%%   {awaiting_version, V, L}  L committed it at version V. We are waiting for our
-%%                             replica to reach V.
+%%   {awaiting_version, V, E, L}
+%%                             L committed it at version V in epoch E. We are waiting
+%%                             for our replica to reach V in that same epoch.
 %%
-%% Three events move it forward: on_reply/4 (the leader answered), on_version/2
+%% Three events move it forward: on_reply/5 (the leader answered), on_version/2
 %% (our replica advanced), and redrive/5 (leadership may have changed).
 %%
 %% When leadership changes, each kind is re-sent only as far as re-sending is safe:
@@ -40,9 +41,9 @@
 %%
 %% *This documentation is LLM-generated. See the AI disclosure in README.md.*
 
--export([new/0, submit/5, on_reply/4, on_version/2, redrive/5, prune/3]).
+-export([new/0, submit/5, on_reply/5, on_version/2, redrive/5, prune/3]).
 
--export_type([t/0, kind/0, phase/0, route/0, scope/0, effect/0]).
+-export_type([t/0, kind/0, phase/0, route/0, scope/0, position/0, effect/0]).
 
 -type member_id() :: dgen_registry_elector:member_id().
 -type from() :: gen_server:from().
@@ -55,7 +56,7 @@
 -type phase() ::
     awaiting_leader
     | {forwarded, member_id()}
-    | {awaiting_version, non_neg_integer(), member_id()}.
+    | {awaiting_version, non_neg_integer(), non_neg_integer(), member_id()}.
 
 -type t() :: #intents{}.
 
@@ -63,6 +64,9 @@
 -type route() :: self | {remote, member_id()} | none.
 
 -type scope() :: moved | all.
+
+%% Our replica's epoch and applied version.
+-type position() :: {Epoch :: non_neg_integer(), Applied :: non_neg_integer()}.
 
 -type effect() ::
     {reply, from(), term()}
@@ -105,50 +109,82 @@ submit(Kind, From, Now, Route, T = #intents{next_seq = Seq}) ->
 %% The three events
 %% ---------------------------------------------------------------------------
 
-%% Handles the leader's reply to the forward sent under `Ref`. `Applied` is our
-%% replica's version. We hold a register `yes` until our replica reaches the
-%% version that committed it (§5.5). Otherwise a leadership handoff could gather
-%% our replica without the name and lose it. We don't write the row here, because
-%% the same batch may also have cleared the name.
--spec on_reply(reference(), term(), non_neg_integer(), t()) -> {t(), [effect()]}.
-on_reply(Ref, Reply, Applied, T = #intents{all = All}) ->
+%% Handles the leader's reply to the forward sent under `Ref`. We hold a register
+%% `yes` until our replica reaches the version that committed it (§5.5). Otherwise a
+%% leadership handoff could gather our replica without the name and lose it. We
+%% don't write the row here, because the same batch may also have cleared the name.
+%%
+%% The version only counts in the epoch that committed it. A later leader may have
+%% taken over without that commit (a degraded handoff, §5.7), so if our replica has
+%% already moved to a later epoch, we send the register again along `Route`.
+-spec on_reply(reference(), term(), position(), route(), t()) -> {t(), [effect()]}.
+on_reply(Ref, Reply, Pos, Route, T = #intents{all = All}) ->
     case All of
         #{Ref := I = #intent{phase = {forwarded, Leader}}} ->
-            resolve_reply(Ref, I, Leader, Reply, Applied, delete_intent(Ref, T));
+            resolve_reply(Ref, I, Leader, Reply, Pos, Route, delete_intent(Ref, T));
         _ ->
             {T, []}
     end.
 
 resolve_reply(
-    Ref, I = #intent{kind = {register, _, _, _}, from = From}, L, {register, yes, V}, A, T
+    Ref, I = #intent{kind = {register, _, _, _}}, L, {register, yes, V, E}, Pos, Route, T
 ) ->
-    case V =< A of
-        true -> {T, [{reply, From, yes}]};
-        false -> {put_intent(Ref, I#intent{phase = {awaiting_version, V, L}}, T), [{resync, L}]}
+    #intent{from = From} = I,
+    case Pos of
+        {E, A} when V =< A ->
+            {T, [{reply, From, yes}]};
+        {CurE, _A} when CurE > E ->
+            dispatch(make_ref(), I#intent{phase = awaiting_leader}, Route, T);
+        _ ->
+            {put_intent(Ref, I#intent{phase = {awaiting_version, V, E, L}}, T), [{resync, L}]}
     end;
-resolve_reply(_Ref, #intent{kind = {register, _, _, _}, from = From}, _L, {register, no, _}, _A, T) ->
+resolve_reply(
+    _Ref,
+    #intent{kind = {register, _, _, _}, from = From},
+    _L,
+    {register, no, _, _},
+    _Pos,
+    _Route,
+    T
+) ->
     {T, [{reply, From, no}]};
 resolve_reply(
-    _Ref, #intent{kind = {set_meta, _, _, _}, from = From}, _L, {set_meta, Result}, _A, T
+    _Ref, #intent{kind = {set_meta, _, _, _}, from = From}, _L, {set_meta, Result}, _Pos, _Route, T
 ) ->
     {T, [{reply, From, Result}]};
-resolve_reply(_Ref, #intent{kind = {unregister, _, _}, from = From}, _L, unregister, _A, T) ->
+resolve_reply(
+    _Ref, #intent{kind = {unregister, _, _}, from = From}, _L, unregister, _Pos, _Route, T
+) ->
     {T, maybe_reply(From, ok)};
-resolve_reply(Ref, I, _Leader, _Mismatched, _Applied, T) ->
+resolve_reply(Ref, I, _Leader, _Mismatched, _Pos, _Route, T) ->
     %% The reply doesn't match the request's kind, so keep waiting.
     {put_intent(Ref, I, T), []}.
 
-%% Answers every held `yes` whose version our replica has now reached.
--spec on_version(non_neg_integer(), t()) -> {t(), [effect()]}.
-on_version(_Applied, T = #intents{deferred = D}) when map_size(D) =:= 0 ->
+%% Answers every held `yes` whose version our replica has now reached in the same
+%% epoch. A held `yes` from an earlier epoch goes back to `awaiting_leader`, because
+%% our replica may no longer contain its commit. The caller must re-drive after any
+%% change that can move the epoch.
+-spec on_version(position(), t()) -> {t(), [effect()]}.
+on_version(_Pos, T = #intents{deferred = D}) when map_size(D) =:= 0 ->
     {T, []};
-on_version(Applied, T = #intents{all = All, deferred = D}) ->
-    Due = sort_by_arrival([{Ref, maps:get(Ref, All)} || {Ref, V} <- maps:to_list(D), V =< Applied]),
+on_version({Epoch, Applied}, T = #intents{all = All, deferred = D}) ->
+    Due = sort_by_arrival([
+        {Ref, maps:get(Ref, All)}
+     || {Ref, {V, E}} <- maps:to_list(D), E =:= Epoch, V =< Applied
+    ]),
+    Stale = [Ref || {Ref, {_V, E}} <- maps:to_list(D), E < Epoch],
+    T1 = lists:foldl(
+        fun(Ref, Acc) ->
+            put_intent(Ref, (maps:get(Ref, All))#intent{phase = awaiting_leader}, Acc)
+        end,
+        T,
+        Stale
+    ),
     lists:foldl(
         fun({Ref, #intent{from = From}}, {Acc, Effs}) ->
             {delete_intent(Ref, Acc), Effs ++ [{reply, From, yes}]}
         end,
-        {T, []},
+        {T1, []},
         Due
     ).
 
@@ -173,7 +209,7 @@ redrive(Route, Scope, Now, TTL, T = #intents{all = All}) ->
 redrive_one(Ref, I = #intent{kind = {register, _, _, _}, at = At}, Route, Scope, Now, TTL, T) ->
     case {Now - At >= TTL, I#intent.phase, Route} of
         {true, _, _} -> {T, []};
-        {false, {awaiting_version, _V, L}, {remote, L}} -> {put_intent(Ref, I, T), []};
+        {false, {awaiting_version, _V, _E, L}, {remote, L}} -> {put_intent(Ref, I, T), []};
         {false, {forwarded, L}, {remote, L}} when Scope =:= moved -> {put_intent(Ref, I, T), []};
         {false, _, _} -> dispatch(make_ref(), I#intent{phase = awaiting_leader}, Route, T)
     end;
@@ -230,9 +266,9 @@ maybe_reply(answered, _Value) -> [];
 maybe_reply(From, Value) -> [{reply, From, Value}].
 
 put_intent(
-    Ref, I = #intent{phase = {awaiting_version, V, _L}}, T = #intents{all = A, deferred = D}
+    Ref, I = #intent{phase = {awaiting_version, V, E, _L}}, T = #intents{all = A, deferred = D}
 ) ->
-    T#intents{all = A#{Ref => I}, deferred = D#{Ref => V}};
+    T#intents{all = A#{Ref => I}, deferred = D#{Ref => {V, E}}};
 put_intent(Ref, I, T = #intents{all = A, deferred = D}) ->
     T#intents{all = A#{Ref => I}, deferred = maps:remove(Ref, D)}.
 

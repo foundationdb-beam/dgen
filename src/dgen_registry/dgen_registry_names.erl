@@ -69,7 +69,7 @@ function shifts off the batch bytes to recover the commit version. Each registry
 commit is its own transaction with a single versionstamp write, so the batch order is
 always 0, but the shift is correct either way.
 
-The leadership-handoff fence uses this in `dgen_registry_member:gather_until_caught_up/6`.
+The leadership-handoff fence uses this in `dgen_registry_member:gather_until_caught_up/7`.
 If a new leader's gathered `MaxVersion` is behind this frontier, its reconstruction is
 incomplete, and it gathers again before assuming leadership. That is the fix for the
 handoff-gather race found in formal/DgenRegistryReplication.tla. Returns `0` if no

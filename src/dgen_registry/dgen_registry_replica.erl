@@ -99,6 +99,11 @@ get_epoch(#replica{epoch = E}) -> E.
 %% replica stays a prefix of the leader's stream. On `gap` we apply nothing, and the
 %% caller requests a snapshot. Each batch is one message, so a lost batch always leaves
 %% a gap. The leader's heartbeat is an empty batch at `{V, V}`.
+%%
+%% A batch from a later epoch is also a gap. It means we missed the new leader's
+%% snapshot, and only a snapshot moves us into a new epoch. Applying the batch would
+%% let a held `yes` from the old epoch be answered by the new leader's versions, even
+%% if the new leader took over without that commit.
 -spec offer_batch(non_neg_integer(), non_neg_integer(), non_neg_integer(), [bcast_op()], t()) ->
     {applied, t()} | stale_epoch | duplicate | gap.
 %% MUTATION_PARTIAL_BATCH is for tests only and never in a release. It accepts
@@ -108,6 +113,7 @@ get_epoch(#replica{epoch = E}) -> E.
 offer_batch(Epoch, PrevV, V, Ops, R = #replica{epoch = CurEpoch, version = Applied}) ->
     if
         Epoch < CurEpoch -> stale_epoch;
+        Epoch > CurEpoch -> gap;
         PrevV =:= Applied -> {applied, apply_ops(Ops, R#replica{version = max(Applied, V)})};
         V =:= Applied -> {applied, apply_ops(Ops, R)};
         V =< Applied -> duplicate;
@@ -117,6 +123,7 @@ offer_batch(Epoch, PrevV, V, Ops, R = #replica{epoch = CurEpoch, version = Appli
 offer_batch(Epoch, PrevV, V, Ops, R = #replica{epoch = CurEpoch, version = Applied}) ->
     if
         Epoch < CurEpoch -> stale_epoch;
+        Epoch > CurEpoch -> gap;
         PrevV =:= Applied -> {applied, apply_ops(Ops, R#replica{version = max(Applied, V)})};
         V =< Applied -> duplicate;
         true -> gap

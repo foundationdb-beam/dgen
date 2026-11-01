@@ -4,7 +4,7 @@ defmodule DGen.RegistryIntentsTest do
 
   `dgen_registry_intents` is pure: every call returns the new intents and the
   effects for the member to carry out. These tests drive it through its three
-  events (`on_reply/4`, `on_version/2`, `redrive/5`) and pin the re-drive rule:
+  events (`on_reply/5`, `on_version/2`, `redrive/5`) and pin the re-drive rule:
   re-drive what is idempotent (register, unregister-as-retract), and answer
   `{:error, :no_leader}` for what is not (set_meta).
   """
@@ -63,14 +63,15 @@ defmodule DGen.RegistryIntentsTest do
     end
   end
 
-  describe "on_reply/4 — a register's verdict" do
+  describe "on_reply/5 — a register's verdict" do
     setup %{pid: pid, from: from} do
       {t, effects} = Intents.submit(register(pid), from, 0, {:remote, @l1}, Intents.new())
       {:ok, t: t, ref: forwarded_ref(effects)}
     end
 
     test "yes at or behind our version is answered", %{t: t, ref: ref, from: from} do
-      assert {_t, [{:reply, ^from, :yes}]} = Intents.on_reply(ref, {:register, :yes, 10}, 10, t)
+      assert {_t, [{:reply, ^from, :yes}]} =
+               Intents.on_reply(ref, {:register, :yes, 10, 1}, {1, 10}, {:remote, @l1}, t)
     end
 
     test "yes ahead of our version waits for the replica and asks for a resync", %{
@@ -78,19 +79,54 @@ defmodule DGen.RegistryIntentsTest do
       ref: ref,
       from: from
     } do
-      {t, effects} = Intents.on_reply(ref, {:register, :yes, 20}, 10, t)
+      {t, effects} = Intents.on_reply(ref, {:register, :yes, 20, 1}, {1, 10}, {:remote, @l1}, t)
       assert effects == [{:resync, @l1}]
 
-      assert {_t, []} = Intents.on_version(15, t)
-      assert {_t, [{:reply, ^from, :yes}]} = Intents.on_version(20, t)
+      assert {_t, []} = Intents.on_version({1, 15}, t)
+      assert {_t, [{:reply, ^from, :yes}]} = Intents.on_version({1, 20}, t)
+    end
+
+    test "a held yes is re-sent once our replica moves to a later epoch", %{
+      t: t,
+      ref: ref,
+      from: from
+    } do
+      {t, _} = Intents.on_reply(ref, {:register, :yes, 20, 1}, {1, 10}, {:remote, @l1}, t)
+
+      # A later leader's snapshot passes the version, but it may lack the commit.
+      assert {t, []} = Intents.on_version({2, 30}, t)
+
+      assert {_t, [{:forward, @l2, _ref, _kind}]} =
+               Intents.redrive({:remote, @l2}, :moved, 0, @ttl, t)
+
+      refute_received {:reply, ^from, _}
+    end
+
+    test "a yes from an epoch we have already left is re-sent, not answered", %{t: t, ref: ref} do
+      assert {_t, [{:forward, @l2, _ref, _kind}]} =
+               Intents.on_reply(ref, {:register, :yes, 10, 1}, {2, 30}, {:remote, @l2}, t)
+    end
+
+    test "a yes from an epoch we haven't reached waits for that epoch", %{
+      t: t,
+      ref: ref,
+      from: from
+    } do
+      {t, [{:resync, @l1}]} =
+        Intents.on_reply(ref, {:register, :yes, 10, 2}, {1, 30}, {:remote, @l1}, t)
+
+      assert {t, []} = Intents.on_version({1, 40}, t)
+      assert {_t, [{:reply, ^from, :yes}]} = Intents.on_version({2, 10}, t)
     end
 
     test "no is answered no", %{t: t, ref: ref, from: from} do
-      assert {_t, [{:reply, ^from, :no}]} = Intents.on_reply(ref, {:register, :no, 10}, 10, t)
+      assert {_t, [{:reply, ^from, :no}]} =
+               Intents.on_reply(ref, {:register, :no, 10, 1}, {1, 10}, {:remote, @l1}, t)
     end
 
     test "a reply for an unknown reference is ignored", %{t: t} do
-      assert {^t, []} = Intents.on_reply(make_ref(), {:register, :yes, 10}, 10, t)
+      assert {^t, []} =
+               Intents.on_reply(make_ref(), {:register, :yes, 10, 1}, {1, 10}, {:remote, @l1}, t)
     end
   end
 
@@ -107,7 +143,8 @@ defmodule DGen.RegistryIntentsTest do
       assert new_ref != old_ref
 
       # The deposed leader's late answer no longer finds anyone to answer.
-      assert {_t, []} = Intents.on_reply(old_ref, {:register, :no, 10}, 10, t)
+      assert {_t, []} =
+               Intents.on_reply(old_ref, {:register, :no, 10, 1}, {1, 10}, {:remote, @l1}, t)
     end
 
     test "a forward to the leader that is still current is kept on a new view", %{
@@ -120,7 +157,9 @@ defmodule DGen.RegistryIntentsTest do
       # A snapshot from the same leader: it received the forward (or postponed it
       # through its assume window), so re-sending would only commit it twice.
       assert {t, []} = Intents.redrive({:remote, @l1}, :moved, 0, @ttl, t)
-      assert {_t, [{:reply, ^from, :yes}]} = Intents.on_reply(ref, {:register, :yes, 1}, 1, t)
+
+      assert {_t, [{:reply, ^from, :yes}]} =
+               Intents.on_reply(ref, {:register, :yes, 1, 1}, {1, 1}, {:remote, @l1}, t)
     end
 
     test "a restored link re-sends a forward to the same leader (the cast may be lost)", %{
@@ -138,7 +177,15 @@ defmodule DGen.RegistryIntentsTest do
       from: from
     } do
       {t, effects} = Intents.submit(register(pid), from, 0, {:remote, @l1}, Intents.new())
-      {t, _} = Intents.on_reply(forwarded_ref(effects), {:register, :yes, 20}, 10, t)
+
+      {t, _} =
+        Intents.on_reply(
+          forwarded_ref(effects),
+          {:register, :yes, 20, 1},
+          {1, 10},
+          {:remote, @l1},
+          t
+        )
 
       # Same leader: still waiting on our replica, nothing to send.
       assert {_t, []} = Intents.redrive({:remote, @l1}, :moved, 0, @ttl, t)

@@ -398,6 +398,11 @@ When `register_name/2` returns `yes`, the binding is normally held by **two memb
   that batch. If the follower is in the middle of a resync, it holds the answer until
   the resync finishes. This way the second copy is always visible to the handoff reconstruction
   (§5.7).
+  The commit version only counts in the epoch that committed it. A later leader may
+  have taken over without that commit, so the follower never releases the answer on a
+  later leader's versions. If its replica moves to a later epoch first, it sends the
+  registration again. For the same reason a follower treats a batch from a later epoch
+  as a gap, so only a snapshot moves it into a new epoch.
 - A registration made **on the leader's node** waits for `register_replicas` follower
   confirmations (§8) before answering `yes`. If none arrive within
   `replicate_timeout`, the default policy **degrades open**. It answers `yes` with a
@@ -470,6 +475,13 @@ member during the gather. Two guards keep the handoff sound in that case:
   until its freshest replica reaches the key. Past that bound it proceeds anyway, and
   the handoff is **degraded**. A degraded handoff stopped short of the version key and
   may be missing committed bindings. `reject_when_degraded` (§8) acts on this.
+
+  Waiting only helps while a broadcast can still arrive. If the deposed leader died
+  after a commit but before broadcasting it, no live member will ever reach the key.
+  Erlang delivers a process's messages before its DOWN, so each member reports whether
+  it has handled the DOWN for the leader it followed. Once the new leader and every
+  peer have, nothing more can arrive, and the new leader proceeds degraded without
+  waiting out the bound.
 - Every wholesale replacement of a replica, whether a handoff snapshot or a resync, is
   **version-monotonic**. A member rejects one older than what it holds, so a handoff
   never rolls a replica back.

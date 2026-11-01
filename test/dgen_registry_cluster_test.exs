@@ -111,7 +111,7 @@ defmodule DGen.RegistryClusterTest do
   # The peer member's current applied version (via the same snapshot call the
   # handoff gather uses), so a test can craft version-contiguous broadcasts.
   defp peer_applied_version(peer_node, peer_member) do
-    {_records, version, _released} =
+    {_records, version, _released, _leader_down} =
       :erpc.call(peer_node, GenServer, :call, [peer_member, :get_names_snapshot])
 
     version
@@ -1149,7 +1149,7 @@ defmodule DGen.RegistryClusterTest do
       member = :dgen_registry.member_name(reg)
       epoch = :dgen_registry.get_epoch(reg)
       leader = :dgen_registry.get_leader(reg)
-      {_records, v, _released} = GenServer.call(member, :get_names_snapshot)
+      {_records, v, _released, _leader_down} = GenServer.call(member, :get_names_snapshot)
 
       GenServer.cast(
         member,
@@ -1408,7 +1408,7 @@ defmodule DGen.RegistryClusterTest do
       assert :undefined == remote_whereis(peer_node, reg, :gap_ghost)
 
       # The resync snapshot re-baselines the peer to the leader's version...
-      {_records, leader_v, _released} =
+      {_records, leader_v, _released, _leader_down} =
         GenServer.call(:dgen_registry.member_name(reg), :get_names_snapshot)
 
       assert eventually(fn ->

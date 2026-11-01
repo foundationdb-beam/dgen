@@ -22,6 +22,10 @@
     tenant :: dgen_backend:tenant(),
     tuid :: dgen_server:tuid(),
     leader :: dgen_registry_elector:member_id() | undefined,
+    %% Whether we have handled the DOWN for `leader`. Erlang delivers a process's
+    %% messages before its DOWN, so once this is true we have every broadcast that
+    %% leader sent us. Every write of `leader` resets it.
+    leader_down = false :: boolean(),
     %% The local replica: ETS rows, inverted index, applied version and epoch.
     replica :: dgen_registry_replica:t(),
     %% Leader only (§4.9). Maps `SubId` to `{Watch, Notify}`. It is loaded at assume
@@ -122,9 +126,9 @@
 
 -record(intents, {
     all = #{} :: #{reference() => #intent{}},
-    %% Maps `Ref` to `V` for the intents in `awaiting_version`. When the replica
+    %% Maps `Ref` to `{V, E}` for the intents in `awaiting_version`. When the replica
     %% advances, we only scan these.
-    deferred = #{} :: #{reference() => non_neg_integer()},
+    deferred = #{} :: #{reference() => {non_neg_integer(), non_neg_integer()}},
     next_seq = 0 :: non_neg_integer()
 }).
 

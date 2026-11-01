@@ -12,6 +12,13 @@
   probes; they run off its loop.
 - `whereis_name/1` and `get_metadata/1` no longer briefly read a bound name as
   `undefined` while a member re-baselines its replica (a resync or handoff).
+- A leader that dies after a commit but before broadcasting it no longer stalls
+  the next leader's handoff for 2 seconds. The new leader proceeds as soon as
+  every member has seen the old leader go down.
+- A follower could answer `yes` to a forwarded registration that a degraded handoff
+  had lost. It held the answer until its replica reached the commit version, but the
+  new leader's versions could get it there without that commit. A held `yes` now
+  counts only in the epoch that committed it, and is otherwise sent again.
 
 ### Enhancements
 
@@ -23,6 +30,8 @@
 
 - Some internal legacy behavior has been removed. It may affect systems during
   a rolling upgrade from 0.4.x to 0.5.x.
+- The handoff gather's peer reply changed shape. A 0.5.x leader skips a 0.4.x
+  member's replica, and the reverse, so don't run the two in one cluster.
 
 ## v0.4.2 (2026-10-04)
 

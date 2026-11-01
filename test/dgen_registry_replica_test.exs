@@ -45,12 +45,14 @@ defmodule DGen.RegistryReplicaTest do
       assert pids(r) == %{}
     end
 
-    test "a newer epoch's contiguous batch applies but does not raise the epoch", %{p1: p1} do
+    test "a newer epoch's batch is a gap, even when contiguous", %{p1: p1} do
+      # Only the new leader's snapshot moves us into its epoch. Applying its batch
+      # would let a held `yes` from our epoch be released by the new leader's
+      # versions.
       r = replica(1, 10)
 
-      assert {:applied, r} = Replica.offer_batch(2, 10, 20, [reg(:a, p1)], r)
-      assert Replica.get_epoch(r) == 1
-      assert Replica.get_version(r) == 20
+      assert :gap = Replica.offer_batch(2, 10, 20, [reg(:a, p1)], r)
+      assert :gap = Replica.offer_batch(2, 10, 10, [], r)
     end
 
     test "the heartbeat (an empty batch at {V, V}) is a no-op on a caught-up replica" do

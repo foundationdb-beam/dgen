@@ -243,12 +243,13 @@ handle_event({call, From}, {query, Constraints}, _State, #data{replica = R}) ->
 %%
 %% Answers the handoff gather, on any member. We return our records, applied version
 %% and release trail. A new leader uses them to rebuild the names from the freshest
-%% replica (§5.7, §4.4) and to merge trails (§5.6).
+%% replica (§5.7, §4.4) and to merge trails (§5.6). We also say whether the leader we
+%% followed is gone, which tells the new leader our replica can't catch up any further.
 handle_event({call, From}, get_names_snapshot, _State, Data) ->
     #data{replica = R = #replica{version = Version}, conflicts = #conflicts{trail = Released}} =
         Data,
     %% We send the records as an off-heap binary. See dgen_registry_replica:encode/1.
-    Reply = {dgen_registry_replica:encode(R), Version, Released},
+    Reply = {dgen_registry_replica:encode(R), Version, Released, Data#data.leader_down},
     {keep_state_and_data, [{reply, From, Reply}]};
 %% -- casts ------------------------------------------------------------------
 
@@ -261,17 +262,18 @@ handle_event(cast, {unregister_reply, Ref}, _State, Data) ->
 handle_event(cast, {set_meta_reply, Ref, Result}, _State, Data) ->
     {keep_state, apply_intent_reply(Ref, {set_meta, Result}, Data)};
 %% Follower: the leader's answer to a registration we forwarded, committed at
-%% `Version`. We only pass a `yes` on once our replica has applied `Version` (§5.5).
-%% That makes us a second holder the handoff gather (§5.7) is sure to see. Usually
-%% FIFO has already delivered the batch. If we refused the batch because of a gap, the
-%% `yes` waits for the resync. See dgen_registry_intents.
-handle_event(cast, {register_reply, Ref, Result, Version}, _State, Data) ->
-    {keep_state, apply_intent_reply(Ref, {register, Result, Version}, Data)};
+%% `Version` in `Epoch`. We only pass a `yes` on once our replica has applied
+%% `Version` in that epoch (§5.5). That makes us a second holder the handoff gather
+%% (§5.7) is sure to see. Usually FIFO has already delivered the batch. If we refused
+%% the batch because of a gap, the `yes` waits for the resync. See
+%% dgen_registry_intents.
+handle_event(cast, {register_reply, Ref, Result, Version, Epoch}, _State, Data) ->
+    {keep_state, apply_intent_reply(Ref, {register, Result, Version, Epoch}, Data)};
 %% Follower: the leader refused a registration we forwarded without committing
 %% anything, so there is no version. Only a `no` arrives without a version. A `yes`
 %% always carries one.
 handle_event(cast, {register_reply, Ref, no}, _State, Data) ->
-    {keep_state, apply_intent_reply(Ref, {register, no, undefined}, Data)};
+    {keep_state, apply_intent_reply(Ref, {register, no, undefined, undefined}, Data)};
 %% Follower: confirms to the leader that we hold a batch's bindings. FIFO delivers its
 %% {names_batch} first. If we haven't applied that version, because of a gap or a stale
 %% epoch, we must not claim to hold them.
@@ -335,8 +337,8 @@ handle_event(
             %% timers don't fire on a follower.
             Data1 =
                 case OldLeader =:= Self andalso NewLeader =/= Self of
-                    true -> fail_pending_acks(Data0#data{leader = NewLeader});
-                    false -> Data0#data{leader = NewLeader}
+                    true -> fail_pending_acks(Data0#data{leader = NewLeader, leader_down = false});
+                    false -> Data0#data{leader = NewLeader, leader_down = false}
                 end,
             %% The snapshot replaces any assume gather still in flight.
             Data2 = Data1#data{assume_ref = undefined},
@@ -404,7 +406,9 @@ handle_event(info, {'DOWN', Ref, process, _Pid, _Reason}, _State, Data) ->
     #data{
         monitors = Monitors,
         elector = Elector,
-        member_id = Self
+        member_id = Self,
+        leader = Leader,
+        leader_down = LeaderDown
     } = Data,
     case maps:get(Ref, Monitors, undefined) of
         undefined ->
@@ -427,7 +431,9 @@ handle_event(info, {'DOWN', Ref, process, _Pid, _Reason}, _State, Data) ->
             %% `{elector_assume_and_distribute}` call into this member.
             Cached = maps:get(DeadMemberId, Data#data.peer_tokens, undefined),
             spawn_member_down(Elector, DeadMemberId, Cached),
-            {keep_state, remove_member(DeadMemberId, Data)}
+            %% If it was our leader, nothing more from it can reach us now.
+            Data1 = Data#data{leader_down = LeaderDown orelse DeadMemberId =:= Leader},
+            {keep_state, remove_member(DeadMemberId, Data1)}
     end;
 handle_event(info, {nodeup, _Node}, _State, Data) ->
     #data{elector = Elector, member_id = Self} = Data,
@@ -732,6 +738,7 @@ assuming(
     Data2 = Data0#data{
         replica = dgen_registry_replica:adopt(Epoch, MaxVersion, Records, Data0#data.replica),
         leader = Self,
+        leader_down = false,
         conflicts = dgen_registry_conflicts:set_degraded(Degraded, Data0#data.conflicts),
         assume_ref = undefined,
         subs = Subs
@@ -893,7 +900,7 @@ prepare_to_assume_leadership(MemberId, AllIds, Tokens, FreshIds, Epoch, Data) ->
     spawn_leadership_gather(
         {MemberId, AllIds, Tokens, FreshIds, Epoch, Ref},
         SelfRecords,
-        Applied,
+        {Applied, Data#data.leader_down},
         OtherIds,
         Elector,
         self(),
@@ -903,7 +910,7 @@ prepare_to_assume_leadership(MemberId, AllIds, Tokens, FreshIds, Epoch, Data) ->
     ),
     %% We have no leader until the gather finishes. Writes wait as intents and are
     %% re-driven once it does, instead of going to the old leader, which may be dead.
-    Data#data{assume_ref = Ref, leader = undefined}.
+    Data#data{assume_ref = Ref, leader = undefined, leader_down = false}.
 
 apply_presence_update({subscribe, SubId, Watch, Notify}, Data = #data{subs = Subs}) ->
     seed_subscription(SubId, Data#data{subs = Subs#{SubId => {Watch, Notify}}});
@@ -982,10 +989,11 @@ rebuild_sub_matches(Data) ->
 %% are totally ordered and FIFO, and every replica is a prefix of the stream. So the
 %% replica with the highest applied_version has the latest binding for every name, and
 %% two replicas at the same version have the same content. We also return the peer
-%% snapshots for conflict detection (§5.6) and the trail merge. The peer calls run in
-%% parallel.
+%% snapshots for conflict detection (§5.6) and the trail merge, and whether every peer
+%% answered with its leader gone. The peer calls run in parallel.
 gather_maps(SelfNames, SelfVersion, OtherIds) ->
-    PeerResults = gather_peer_snapshots(OtherIds),
+    {PeerResults, GoneIds} = gather_peer_snapshots(OtherIds),
+    PeersSettled = lists:sort(GoneIds) =:= lists:sort(OtherIds),
     {FreshestNames, MaxVersion} = maps:fold(
         fun(_Id, {Names, Version, _Released}, {_BestNames, BestVersion} = Best) ->
             case Version > BestVersion of
@@ -996,7 +1004,7 @@ gather_maps(SelfNames, SelfVersion, OtherIds) ->
         {SelfNames, SelfVersion},
         PeerResults
     ),
-    {FreshestNames, MaxVersion, PeerResults}.
+    {FreshestNames, MaxVersion, PeerResults, PeersSettled}.
 
 %% Onboards a joiner on the fast path. We send the joiner our snapshot and the member
 %% list. We tell the existing followers to monitor it with {peer_joined}, and leave
@@ -1023,7 +1031,7 @@ spawn_member_gather(MemberId, AllIds, Tokens, Epoch, Data) ->
     _ = spawn(fun() ->
         Result =
             case get_peer_snapshot(MemberId) of
-                {ok, {Records, _Version, Released} = Snapshot} ->
+                {ok, {Records, _Version, Released} = Snapshot, _LeaderGone} ->
                     #conflicts{trail = Trail} = dgen_registry_conflicts:merge([Released], C),
                     %% Our table goes away if we die. Then there is no one to report
                     %% to anyway.
@@ -1049,12 +1057,12 @@ spawn_member_gather(MemberId, AllIds, Tokens, Epoch, Data) ->
 %% helper also fetches the durable subscriptions (§4.9) and runs the liveness probes
 %% (§5.6). A synchronous call to the elector from the member loop could deadlock
 %% against the elector's own assume call into this member.
-spawn_leadership_gather(Ctx, SelfRecords, SelfVersion, OtherIds, Elector, Owner, Tenant, Tuid, C) ->
+spawn_leadership_gather(Ctx, SelfRecords, SelfState, OtherIds, Elector, Owner, Tenant, Tuid, C) ->
     _ = spawn(fun() ->
         %% If the gather throws, gather_until_caught_up/5 falls back to our own records,
         %% so we always send {assume_gathered, …}.
         {FreshestRecords, MaxVersion, PeerResults, Frontier} =
-            gather_until_caught_up(SelfRecords, SelfVersion, OtherIds, Tenant, Tuid),
+            gather_until_caught_up(SelfRecords, SelfState, OtherIds, Tenant, Tuid),
         Subs = fetch_subscriptions(Elector),
         Peers = maps:values(PeerResults),
         #conflicts{trail = Merged} =
@@ -1075,16 +1083,27 @@ spawn_leadership_gather(Ctx, SelfRecords, SelfVersion, OtherIds, Elector, Owner,
 %% was still queued in some peer's mailbox when we gathered. Sending out that stale map
 %% would lose a registration we already acked. After the deadline we go ahead anyway,
 %% and the {assume_gathered} handler marks the leader `degraded`.
-gather_until_caught_up(SelfRecords, SelfVersion, OtherIds, Tenant, Tuid) ->
+%%
+%% We stop early when waiting can't help. The old leader may have died after a commit
+%% but before broadcasting it, and then no live member will ever reach the frontier.
+%% Erlang delivers a process's messages before its DOWN. So once we and every peer have
+%% handled the old leader's DOWN, nothing more from it can arrive, and we go ahead
+%% `degraded` without waiting out the deadline. `SelfLeaderGone` is our own answer,
+%% taken when we captured our records.
+gather_until_caught_up(SelfRecords, {SelfVersion, SelfLeaderGone}, OtherIds, Tenant, Tuid) ->
     Deadline = erlang:monotonic_time(millisecond) + ?GATHER_TIMEOUT,
-    gather_until_caught_up(SelfRecords, SelfVersion, OtherIds, Tenant, Tuid, Deadline).
+    gather_until_caught_up(
+        SelfRecords, SelfVersion, SelfLeaderGone, OtherIds, Tenant, Tuid, Deadline
+    ).
 
-gather_until_caught_up(SelfRecords, SelfVersion, OtherIds, Tenant, Tuid, Deadline) ->
-    {FreshestRecords, MaxVersion, PeerResults} =
+gather_until_caught_up(
+    SelfRecords, SelfVersion, SelfLeaderGone, OtherIds, Tenant, Tuid, Deadline
+) ->
+    {FreshestRecords, MaxVersion, PeerResults, PeersSettled} =
         try
             gather_maps(SelfRecords, SelfVersion, OtherIds)
         catch
-            _:_ -> {SelfRecords, SelfVersion, #{}}
+            _:_ -> {SelfRecords, SelfVersion, #{}, false}
         end,
     %% This read is best-effort, and it returns a value on the applied_version scale.
     %% If it fails, for example on a backend hiccup or with a test double, we get
@@ -1097,13 +1116,16 @@ gather_until_caught_up(SelfRecords, SelfVersion, OtherIds, Tenant, Tuid, Deadlin
         end,
     case
         Frontier =:= unknown orelse MaxVersion >= Frontier orelse
+            (SelfLeaderGone andalso PeersSettled) orelse
             erlang:monotonic_time(millisecond) >= Deadline
     of
         true ->
             {FreshestRecords, MaxVersion, PeerResults, Frontier};
         false ->
             timer:sleep(?ASSUME_CATCHUP_INTERVAL),
-            gather_until_caught_up(SelfRecords, SelfVersion, OtherIds, Tenant, Tuid, Deadline)
+            gather_until_caught_up(
+                SelfRecords, SelfVersion, SelfLeaderGone, OtherIds, Tenant, Tuid, Deadline
+            )
     end.
 
 %% Pulls the subscriptions from the elector, with a short timeout. Only call it from
@@ -1122,7 +1144,7 @@ fetch_subscriptions(_Elector) ->
 %% Spawns one get_peer_snapshot/1 helper per peer, all under one deadline. Answers
 %% that arrive late are dropped by unhandled/3.
 gather_peer_snapshots([]) ->
-    #{};
+    {#{}, []};
 gather_peer_snapshots(OtherIds) ->
     Ref = make_ref(),
     Parent = self(),
@@ -1133,18 +1155,23 @@ gather_peer_snapshots(OtherIds) ->
         OtherIds
     ),
     Deadline = erlang:monotonic_time(millisecond) + ?GATHER_TIMEOUT + 500,
-    collect_gather(Ref, OtherIds, Deadline, #{}).
+    collect_gather(Ref, OtherIds, Deadline, {#{}, []}).
 
+%% Collects `{PeerResults, GoneIds}`. `GoneIds` lists the peers whose leader is gone.
 collect_gather(_Ref, [], _Deadline, Acc) ->
     Acc;
-collect_gather(Ref, Waiting, Deadline, Acc) ->
+collect_gather(Ref, Waiting, Deadline, {Results, GoneIds} = Acc) ->
     Timeout = max(0, Deadline - erlang:monotonic_time(millisecond)),
     _ = ?ETA_LOG({gather_wait, length(Waiting), Timeout}),
     receive
-        {Ref, MemberId, {ok, Snapshot}} ->
-            collect_gather(Ref, lists:delete(MemberId, Waiting), Deadline, Acc#{
-                MemberId => Snapshot
-            });
+        {Ref, MemberId, {ok, Snapshot, LeaderGone}} ->
+            Results1 = Results#{MemberId => Snapshot},
+            GoneIds1 =
+                case LeaderGone of
+                    true -> [MemberId | GoneIds];
+                    false -> GoneIds
+                end,
+            collect_gather(Ref, lists:delete(MemberId, Waiting), Deadline, {Results1, GoneIds1});
         {Ref, MemberId, error} ->
             collect_gather(Ref, lists:delete(MemberId, Waiting), Deadline, Acc)
     after Timeout ->
@@ -1234,21 +1261,24 @@ is_pid_alive(Pid) ->
             end
     end.
 
-%% Reads a peer's records, version and trail, with a timeout. Returns `error` if the
-%% peer is disconnected or too slow. This gather then goes ahead without its bindings.
+%% Reads a peer's records, version and trail, and whether its leader is gone, with a
+%% timeout. Returns `error` if the peer is disconnected or too slow. This gather then
+%% goes ahead without its bindings.
 get_peer_snapshot({Node, Name}) ->
-    case lists:member(Node, nodes()) of
+    case dgen_utils:node_reachable(Node) of
         false ->
             error;
         true ->
             %% Everything is inside the `try`, because decode_records/1 can fail on a
             %% corrupt payload.
             try
-                {Payload, Version, Released} =
+                {Payload, Version, Released, LeaderGone} =
                     gen_statem:call({Name, Node}, get_names_snapshot, ?GATHER_TIMEOUT),
                 Names = dgen_registry_replica:decode_records(Payload),
-                true = is_map(Names) andalso is_integer(Version) andalso is_map(Released),
-                {ok, {Names, Version, Released}}
+                true =
+                    is_map(Names) andalso is_integer(Version) andalso is_map(Released) andalso
+                        is_boolean(LeaderGone),
+                {ok, {Names, Version, Released}, LeaderGone}
             catch
                 _:_ -> error
             end
@@ -1322,13 +1352,14 @@ submit_intent(Kind, From, Data = #data{intents = I}) ->
     apply_intents(dgen_registry_intents:submit(Kind, From, Now, get_intent_route(Data), I), Data).
 
 apply_intent_reply(Ref, Reply, Data) ->
-    #data{intents = I, replica = #replica{version = Applied}} = Data,
-    apply_intents(dgen_registry_intents:on_reply(Ref, Reply, Applied, I), Data).
+    #data{intents = I, replica = #replica{epoch = Epoch, version = Applied}} = Data,
+    Route = get_intent_route(Data),
+    apply_intents(dgen_registry_intents:on_reply(Ref, Reply, {Epoch, Applied}, Route, I), Data).
 
 %% Our replica advanced. Releases the held `yes` replies whose version it now covers.
 release_deferred_acks(Data) ->
-    #data{intents = I, replica = #replica{version = Applied}} = Data,
-    apply_intents(dgen_registry_intents:on_version(Applied, I), Data).
+    #data{intents = I, replica = #replica{epoch = Epoch, version = Applied}} = Data,
+    apply_intents(dgen_registry_intents:on_version({Epoch, Applied}, I), Data).
 
 %% Re-drives unresolved intents. `Scope` is `moved` when the leader changed, and `all`
 %% when a connection came back. See dgen_registry_intents:redrive/5.
@@ -1456,7 +1487,7 @@ apply_committed_plan(Plan, Version, Data) ->
         member_id = Self,
         name_to_ref = NTR0,
         members = Members,
-        replica = R0 = #replica{version = PrevVersion}
+        replica = R0 = #replica{version = PrevVersion, epoch = Epoch}
     } = Data,
     %% We only touch the names in `DBOp`. An optimistic unregister of some other name
     %% that happened meanwhile is left alone.
@@ -1486,7 +1517,8 @@ apply_committed_plan(Plan, Version, Data) ->
         lists:reverse(RepliesRev)
     ),
     lists:foreach(
-        fun({Origin, Result}) -> deliver_committed_reply(Origin, Result, Version) end, Immediate
+        fun({Origin, Result}) -> deliver_committed_reply(Origin, Result, Version, Epoch) end,
+        Immediate
     ),
     %% We keep `{Name, Pid}` so `strict_replication` can roll a direct binding back.
     EnrichedDirect = [
@@ -1683,12 +1715,12 @@ deliver_reply({forward_meta, MemberId, Ref}, Result) ->
 deliver_reply({forward_unreg, MemberId, Ref}, _Result) ->
     cast_to_member(MemberId, {unregister_reply, Ref}).
 
-%% The reply to a forwarded registration carries the commit version. The follower
-%% holds a `yes` until its replica reaches that version. See the
-%% {register_reply, _, _, _} handler.
-deliver_committed_reply({forward, MemberId, Ref}, Result, Version) ->
-    cast_to_member(MemberId, {register_reply, Ref, Result, Version});
-deliver_committed_reply(Origin, Result, _Version) ->
+%% The reply to a forwarded registration carries the commit version and our epoch.
+%% The follower holds a `yes` until its replica reaches that version in that epoch.
+%% See the {register_reply, _, _, _, _} handler.
+deliver_committed_reply({forward, MemberId, Ref}, Result, Version, Epoch) ->
+    cast_to_member(MemberId, {register_reply, Ref, Result, Version, Epoch});
+deliver_committed_reply(Origin, Result, _Version, _Epoch) ->
     deliver_reply(Origin, Result).
 
 %% Folds the ops, in order, into a plan. The plan holds the batch overlay, the net

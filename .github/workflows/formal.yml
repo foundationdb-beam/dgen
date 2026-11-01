@@ -53,6 +53,17 @@ jobs:
             expect: pass
           - cfg: DgenRegistryReplicationDegradedReachable
             expect: fail
+          # The gather stops waiting once the old leader's DOWN has reached every
+          # live member. Every invariant holds there, and the canary proves the
+          # exit is taken.
+          - cfg: DgenRegistryReplicationLeaderGoneAssume
+            expect: pass
+          - cfg: DgenRegistryReplicationLeaderGoneReachable
+            expect: fail
+          # A held forwarded ack released by a later epoch's versions: the false
+          # `yes` the epoch fence closes.
+          - cfg: DgenRegistryReplicationNoEpochFence
+            expect: fail
     steps:
       - uses: actions/checkout@v3
       - uses: actions/setup-java@v4

@@ -1015,8 +1015,13 @@ defmodule DGen.RegistryTest do
   # The member's current applied version, read through the same snapshot call the
   # handoff gather uses, so tests can craft contiguous (or gapped) broadcasts.
   defp applied_version(member) do
-    {_records, version, _released} = GenServer.call(member, :get_names_snapshot)
+    {_records, version, _released, _leader_down} = GenServer.call(member, :get_names_snapshot)
     version
+  end
+
+  defp leader_down?(member) do
+    {_records, _version, _released, leader_down} = GenServer.call(member, :get_names_snapshot)
+    leader_down
   end
 
   # A replication broadcast in the shape the leader actually sends: one
@@ -1326,8 +1331,8 @@ defmodule DGen.RegistryTest do
       assert Task.yield(caller, 100) == nil
 
       # Leader 1's late `no` finds no one to answer; leader 2's `yes` decides it.
-      GenServer.cast(member, {:register_reply, ref1, :no, v})
-      GenServer.cast(member, {:register_reply, ref2, :yes, v})
+      GenServer.cast(member, {:register_reply, ref1, :no, v, epoch + 1})
+      GenServer.cast(member, {:register_reply, ref2, :yes, v, epoch + 2})
       assert :yes == Task.await(caller)
     end
 
@@ -1349,7 +1354,45 @@ defmodule DGen.RegistryTest do
       follow(member, l1, epoch + 1, v)
       refute_receive {:"$gen_cast", {:register_req, _, _, _, _, _}}, 100
 
-      GenServer.cast(member, {:register_reply, ref1, :yes, v})
+      GenServer.cast(member, {:register_reply, ref1, :yes, v, epoch + 1})
+      assert :yes == Task.await(caller)
+    end
+
+    test "a held yes is not answered by a later leader that lacks its commit", %{reg: reg} do
+      member = :dgen_registry.member_name(reg)
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+
+      epoch = :dgen_registry.get_epoch(reg)
+      v = applied_version(member)
+      l1 = fake_leader()
+      follow(member, l1, epoch + 1, v)
+
+      caller = Task.async(fn -> :dgen_registry.register_name({reg, :lost}, pid) end)
+      {ref1, :lost, ^pid} = await_forward()
+
+      # Leader 1 commits at v + 1 and answers, but dies before its batch reaches us.
+      # The member holds the `yes` and asks leader 1 for a resync.
+      GenServer.cast(member, {:register_reply, ref1, :yes, v + 1, epoch + 1})
+      assert_receive {:"$gen_cast", {:resync_req, _}}
+      Process.unregister(elem(l1, 1))
+
+      # Leader 2 took over at v without that commit, and its snapshot to us was lost.
+      # Its next batch starts at our version, but it comes from a later epoch, so it
+      # is a gap and must not release the held `yes`.
+      l2 = fake_leader()
+      GenServer.cast(member, names_batch([], epoch + 2, v, v + 2, l2))
+      :sys.get_state(member)
+      assert Task.yield(caller, 100) == nil, "the held yes was answered by leader 2's batch"
+
+      # Leader 2's resync snapshot doesn't hold the name, so the register is re-sent.
+      follow(member, l2, epoch + 2, v + 2)
+      {ref2, :lost, ^pid} = await_forward()
+      assert ref2 != ref1
+      assert Task.yield(caller, 0) == nil
+
+      GenServer.cast(member, {:register_reply, ref2, :yes, v + 3, epoch + 2})
+      GenServer.cast(member, names_batch([], epoch + 2, v + 2, v + 3, l2))
       assert :yes == Task.await(caller)
     end
 
@@ -1370,7 +1413,7 @@ defmodule DGen.RegistryTest do
       :sys.get_state(member)
 
       refute_receive {:"$gen_cast", {:register_reply, ^ref, _}}, 200
-      refute_receive {:"$gen_cast", {:register_reply, ^ref, _, _}}
+      refute_receive {:"$gen_cast", {:register_reply, ^ref, _, _, _}}
     end
   end
 
@@ -1470,7 +1513,7 @@ defmodule DGen.RegistryTest do
                      "the in-flight registration was not re-sent to the new leader"
 
       assert Task.yield(register, 0) == nil, "the in-flight registration was answered early"
-      GenServer.cast(member, {:register_reply, ref, :yes, v})
+      GenServer.cast(member, {:register_reply, ref, :yes, v, epoch + 2})
       assert :yes == Task.await(register)
     end
   end
@@ -1505,15 +1548,18 @@ defmodule DGen.RegistryTest do
       fake_name = :"degr_fake_#{:erlang.unique_integer([:positive])}"
       Process.register(fake, fake_name)
 
+      # The member monitors the fake leader, as a follower monitors a real one.
+      fake_id = {node(), fake_name}
+
       GenServer.cast(
         member,
-        {:apply_names_snapshot, :dgen_registry_replica.encode_records(%{}), {node(), fake_name},
-         [], %{}, epoch, v}
+        {:apply_names_snapshot, :dgen_registry_replica.encode_records(%{}), fake_id, [fake_id],
+         %{}, epoch, v}
       )
 
       {:follower, _} = :sys.get_state(member)
 
-      %{reg: reg, member: member, self_id: self_id, epoch: epoch}
+      %{reg: reg, member: member, self_id: self_id, epoch: epoch, fake: fake}
     end
 
     defp reassume(member, self_id, all_ids, epoch) do
@@ -1564,7 +1610,36 @@ defmodule DGen.RegistryTest do
       assert_receive {:dgen_transaction, ^ref, {:committed, _}}, 5_000
 
       # The gather retries toward the key until ?GATHER_TIMEOUT, then assumes degraded.
-      reassume(member, self_id, [self_id], epoch)
+      {elapsed_us, _} = :timer.tc(fn -> reassume(member, self_id, [self_id], epoch) end)
+      # The fake leader is alive, so a late broadcast could still come. We wait it out.
+      assert elapsed_us >= 2_000_000
+
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+      assert :no == :dgen_registry.register_name({reg, :new_name}, pid)
+    end
+
+    test "a leader that died before broadcasting its last commit doesn't stall the handoff",
+         %{reg: reg, member: member, self_id: self_id, epoch: epoch, tenant: tenant, fake: fake} do
+      # The same missing commit, but now its leader is dead and we have handled its
+      # DOWN. Nothing more can arrive from it, so the gather stops waiting at once.
+      tuid = {"dgen_registry.", Atom.to_string(reg)}
+      ref = make_ref()
+
+      {:ok, _} =
+        :dgen_registry_names.start_commit(tenant, tuid, self_id, %{
+          owner: self(),
+          ref: ref,
+          epoch: epoch
+        })
+
+      assert_receive {:dgen_transaction, ^ref, {:committed, _}}, 5_000
+
+      Process.exit(fake, :kill)
+      assert eventually(fn -> leader_down?(member) end, 5_000)
+
+      {elapsed_us, _} = :timer.tc(fn -> reassume(member, self_id, [self_id], epoch) end)
+      assert elapsed_us < 1_000_000
 
       pid = spawn(fn -> Process.sleep(:infinity) end)
       on_exit(fn -> Process.exit(pid, :kill) end)

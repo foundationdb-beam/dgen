@@ -35,6 +35,11 @@ CONSTANTS
                         \* pre-fix epoch-only guard (a stale snapshot can rewind)
     DegradedAssume,     \* TRUE = the gather may also give up waiting for the durable
                         \* version key (the code's deadline) and assume degraded
+    LeaderGoneAssume,   \* TRUE = the gather also stops waiting once every live
+                        \* member has handled its old leader's DOWN
+    EpochFencedAck,     \* TRUE = a held forwarded ack is released only in the
+                        \* epoch that committed it, and a broadcast from a later
+                        \* epoch is a gap; FALSE = the pre-fix false ack (mutation)
     NoPid, NoMember     \* model values
 
 ASSUME NoPid \notin Pids
@@ -58,7 +63,8 @@ VARIABLES
     epoch,       \* [Members -> Nat]: last epoch learned (set by snapshots/assume)
     leaderView,  \* [Members -> Members \cup {NoMember}]: believed leader;
                  \* leaderView[m] = m  <=>  m believes it is the leader
-    deferred,    \* [Members -> SUBSET (Names \X Pids \X Nat)]: intents awaiting_version
+    deferred,    \* [Members -> SUBSET (Names \X Pids \X Nat \X Nat)]: intents
+                 \* awaiting_version, with the epoch that committed them
     pendingAcks, \* [Members -> SUBSET (Names \X Pids \X Nat)]: leader-side
                  \* direct registrations awaiting a replicate_ack
     resyncReq,   \* [Members -> Members \cup {NoMember}]: outstanding resync
@@ -68,12 +74,17 @@ VARIABLES
                  \* "gathered max version < durable version key" (§5.6)
     complete,    \* [Members -> BOOLEAN]: the reconstruction it adopted was the
                  \* true committed map, histMap[dbVersion]
+    \* ---- per-member: the code's `leader_down` ----
+    leaderDown,  \* [Members -> BOOLEAN]: m has handled the DOWN for leaderView[m].
+                 \* Reset whenever leaderView[m] changes, as the code resets it on
+                 \* every write of `leader`.
     \* ---- the network ----
     chan         \* [Members -> [Members -> Seq(Msg)]]: per-ordered-pair FIFO
 
 vars == <<dbLeader, dbEpoch, dbVersion, histMap, acked, crashes,
           alive, rep, appliedVer, epoch, leaderView,
-          deferred, pendingAcks, resyncReq, chan, degraded, complete>>
+          deferred, pendingAcks, resyncReq, chan, degraded, complete,
+          leaderDown>>
 
 (***************************************************************************)
 (* Basic definitions                                                       *)
@@ -84,21 +95,30 @@ Live     == {m \in Members : alive[m]}
 PidOpt   == Pids \cup {NoPid}
 Versions == 0..MaxVersion
 Regs     == Names \X Pids \X Versions
+Held     == Names \X Pids \X Versions \X (0..MaxEpoch)
+
+\* The registration a held ack answers, without its epoch.
+Reg(d) == <<d[1], d[2], d[3]>>
 
 MaxOf(S) == CHOOSE x \in S : \A y \in S : x >= y
 
 \* Message shapes.  bcast/reply mirror the stamped {name_registered}
-\* broadcast and {register_reply, Ref, yes, Version} cast; sync/ack mirror
+\* broadcast and {register_reply, Ref, yes, Version, Epoch} cast; sync/ack mirror
 \* {replicate_sync}/{replicate_ack}; snap mirrors {apply_names_snapshot}.
 Msg ==
        [type : {"bcast"}, name : Names, pid : Pids,
         epoch : 0..MaxEpoch, prev : Versions, ver : Versions]
   \cup [type : {"hb"},    epoch : 0..MaxEpoch, ver : Versions]
-  \cup [type : {"reply"}, name : Names, pid : Pids, ver : Versions]
+  \cup [type : {"reply"}, name : Names, pid : Pids, ver : Versions,
+        epoch : 0..MaxEpoch]
   \cup [type : {"sync"},  ver : Versions]
   \cup [type : {"ack"},   ver : Versions]
   \cup [type : {"snap"},  rep : [Names -> PidOpt], epoch : 0..MaxEpoch,
         ver : Versions, ldr : Members]
+
+\* With EpochFencedAck, a broadcast from a later epoch than f's is a gap: f missed
+\* the new leader's snapshot, and only a snapshot moves f into a new epoch.
+Later(m, f) == EpochFencedAck /\ m.epoch > epoch[f]
 
 HeadIs(s, r, t) == /\ chan[s][r] # <<>>
                    /\ Head(chan[s][r]).type = t
@@ -124,6 +144,7 @@ Init ==
     /\ chan = [s \in Members |-> [r \in Members |-> <<>>]]
     /\ degraded = [m \in Members |-> FALSE]
     /\ complete = [m \in Members |-> TRUE]
+    /\ leaderDown = [m \in Members |-> FALSE]
 
 (***************************************************************************)
 (* Elections and handoff                                                   *)
@@ -168,12 +189,20 @@ Elect(m) ==
 \* then records the code's `degraded` flag (maxV < dbVersion) and, as ghost
 \* state, whether the adopted map really was the committed one — which
 \* DegradedFlagSound checks the flag against.
+\*
+\* With LeaderGoneAssume the gather also stops waiting, degraded, once every live
+\* member (m included) has handled the DOWN for the leader it followed.  Erlang
+\* delivers a process's messages before its DOWN (ObserveDown below), so by then
+\* nothing more from the old leader can arrive and waiting cannot help.  This is
+\* the code's `SelfLeaderGone andalso PeersSettled` exit in gather_until_caught_up.
 AssumeGather(m) ==
     /\ alive[m]
     /\ dbLeader = m
     /\ epoch[m] < dbEpoch
     /\ LET maxV == MaxOf({appliedVer[x] : x \in Live})
-       IN /\ (SafeAssumeGather => (maxV >= dbVersion \/ DegradedAssume))
+           allDown == \A x \in Live : leaderDown[x]
+       IN /\ (SafeAssumeGather =>
+                (maxV >= dbVersion \/ DegradedAssume \/ (LeaderGoneAssume /\ allDown)))
           /\ degraded' = [degraded EXCEPT ![m] = (maxV < dbVersion)]
           /\ \E src \in Live :
             /\ appliedVer[src] = maxV
@@ -226,7 +255,8 @@ RegisterForward(f, l, n, p) ==
            newRep == [rep[l] EXCEPT ![n] = p]
            b == [type |-> "bcast", name |-> n, pid |-> p,
                  epoch |-> epoch[l], prev |-> appliedVer[l], ver |-> v]
-           r == [type |-> "reply", name |-> n, pid |-> p, ver |-> v]
+           r == [type |-> "reply", name |-> n, pid |-> p, ver |-> v,
+                 epoch |-> epoch[l]]
        IN /\ dbVersion' = v
           /\ histMap' = [histMap EXCEPT ![v] = newRep]
           /\ rep' = [rep EXCEPT ![l] = newRep]
@@ -280,13 +310,15 @@ RecvBcastApply(s, f) ==
     /\ HeadIs(s, f, "bcast")
     /\ LET m == Head(chan[s][f]) IN
        /\ m.epoch >= epoch[f]
+       /\ ~Later(m, f)
        /\ m.prev = appliedVer[f]
        /\ LET newV    == m.ver
-              flushed == {d \in deferred[f] : d[3] <= newV}
+              flushed == {d \in deferred[f] :
+                            d[3] <= newV /\ (EpochFencedAck => d[4] = epoch[f])}
           IN /\ rep' = [rep EXCEPT ![f][m.name] = m.pid]
              /\ appliedVer' = [appliedVer EXCEPT ![f] = newV]
              /\ deferred' = [deferred EXCEPT ![f] = @ \ flushed]
-             /\ acked' = acked \cup flushed
+             /\ acked' = acked \cup {Reg(d) : d \in flushed}
              /\ resyncReq' = [resyncReq EXCEPT ![f] = NoMember]
              /\ chan' = Consume(s, f)
     /\ UNCHANGED <<dbLeader, dbEpoch, dbVersion, histMap, crashes, alive,
@@ -300,6 +332,7 @@ RecvBcastDrop(s, f) ==
     /\ LET m == Head(chan[s][f]) IN
        \/ m.epoch < epoch[f]
        \/ /\ m.epoch >= epoch[f]
+          /\ ~Later(m, f)
           /\ m.prev # appliedVer[f]
           /\ m.ver <= appliedVer[f]
     /\ chan' = Consume(s, f)
@@ -308,14 +341,16 @@ RecvBcastDrop(s, f) ==
                    pendingAcks, resyncReq>>
 
 \* A gap: we missed a batch.  Refuse the broadcast (do NOT apply past the
-\* hole) and flag a resync request to the stream's sender.
+\* hole) and flag a resync request to the stream's sender.  A broadcast from a
+\* later epoch is a gap too (Later).
 RecvBcastGap(s, f) ==
     /\ alive[f]
     /\ HeadIs(s, f, "bcast")
     /\ LET m == Head(chan[s][f]) IN
-       /\ m.epoch >= epoch[f]
-       /\ m.prev # appliedVer[f]
-       /\ m.ver > appliedVer[f]
+       \/ Later(m, f)
+       \/ /\ m.epoch >= epoch[f]
+          /\ m.prev # appliedVer[f]
+          /\ m.ver > appliedVer[f]
     /\ chan' = Consume(s, f)
     /\ resyncReq' = [resyncReq EXCEPT ![f] =
                        IF @ = NoMember THEN s ELSE @]
@@ -368,9 +403,9 @@ RecvHeartbeat(s, f) ==
     /\ HeadIs(s, f, "hb")
     /\ LET m == Head(chan[s][f]) IN
        /\ chan' = Consume(s, f)
-       /\ IF m.epoch >= epoch[f] /\ m.ver = appliedVer[f]
+       /\ IF m.epoch >= epoch[f] /\ ~Later(m, f) /\ m.ver = appliedVer[f]
           THEN resyncReq' = [resyncReq EXCEPT ![f] = NoMember]
-          ELSE IF m.epoch >= epoch[f] /\ m.ver > appliedVer[f]
+          ELSE IF m.epoch >= epoch[f] /\ (Later(m, f) \/ m.ver > appliedVer[f])
           THEN resyncReq' = [resyncReq EXCEPT ![f] =
                                IF @ = NoMember THEN s ELSE @]
           ELSE UNCHANGED resyncReq
@@ -387,6 +422,9 @@ RecvHeartbeat(s, f) ==
 \* applied >= ver  -> ack now (the broadcast/snapshot already delivered the
 \*                    row; the follower is a version-visible second holder);
 \* gapped + guard  -> defer (awaiting_version), released by on_version;
+\* With EpochFencedAck the version only counts in the epoch that committed it.
+\* A reply from an epoch f has already left is dropped (the code re-sends it as
+\* a fresh forward), and one from an epoch f hasn't reached yet is deferred.
 \* gapped, no guard-> the pre-guard bug: optimistic row write + immediate
 \*                    ack.  The row exists but at a version the freshest-wins
 \*                    gather ignores — the silent-loss window.
@@ -395,14 +433,15 @@ RecvReply(s, f) ==
     /\ HeadIs(s, f, "reply")
     /\ LET m == Head(chan[s][f])
            t == <<m.name, m.pid, m.ver>>
+           h == <<m.name, m.pid, m.ver, m.epoch>>
        IN /\ chan' = Consume(s, f)
-          /\ IF leaderView[f] # s
+          /\ IF leaderView[f] # s \/ (EpochFencedAck /\ m.epoch < epoch[f])
              THEN UNCHANGED <<rep, deferred, acked>>
-             ELSE IF appliedVer[f] >= m.ver
+             ELSE IF appliedVer[f] >= m.ver /\ (EpochFencedAck => m.epoch = epoch[f])
              THEN /\ acked' = acked \cup {t}
                   /\ UNCHANGED <<rep, deferred>>
              ELSE IF VersionGuardedAck
-             THEN /\ deferred' = [deferred EXCEPT ![f] = @ \cup {t}]
+             THEN /\ deferred' = [deferred EXCEPT ![f] = @ \cup {h}]
                   /\ UNCHANGED <<rep, acked>>
              ELSE /\ rep' = [rep EXCEPT ![f][m.name] = m.pid]
                   /\ acked' = acked \cup {t}
@@ -470,7 +509,9 @@ DegradeTimeout(l) ==
 \* Epoch-guarded (Epoch >= CurrentEpoch) wholesale re-baseline.  On a
 \* leadership change the deferred acks are rejected (the apply_names_snapshot handler);
 \* on a same-leader snapshot (a resync) the version advance releases them
-\* (flush_deferred).  A member that believed it led relinquishes.
+\* (flush_deferred).  A member that believed it led relinquishes.  With
+\* EpochFencedAck only acks held in the snapshot's own epoch are released, and
+\* acks held from an earlier epoch are dropped (the code re-sends them).
 \*
 \* THE FIX, second half (SafeAssumeSnap): the re-baseline must be version-monotonic
 \* — a snapshot may not move a follower BACKWARD in applied_version.  The pre-fix
@@ -492,16 +533,23 @@ RecvSnap(s, f) ==
        /\ chan' = Consume(s, f)
        /\ IF m.epoch >= epoch[f] /\ (SafeAssumeSnap => m.ver >= appliedVer[f])
           THEN LET changed == leaderView[f] # m.ldr
-                   flushed == IF changed THEN {}
-                              ELSE {d \in deferred[f] : d[3] <= m.ver}
+                   flushed ==
+                     IF EpochFencedAck
+                     THEN {d \in deferred[f] : d[4] = m.epoch /\ d[3] <= m.ver}
+                     ELSE IF changed THEN {}
+                     ELSE {d \in deferred[f] : d[3] <= m.ver}
+                   kept ==
+                     IF changed THEN {}
+                     ELSE IF EpochFencedAck
+                     THEN {d \in deferred[f] \ flushed : d[4] >= m.epoch}
+                     ELSE deferred[f] \ flushed
                IN /\ rep' = [rep EXCEPT ![f] = m.rep]
                   /\ appliedVer' = [appliedVer EXCEPT ![f] = m.ver]
                   /\ epoch' = [epoch EXCEPT ![f] = m.epoch]
                   /\ leaderView' = [leaderView EXCEPT ![f] = m.ldr]
                   /\ resyncReq' = [resyncReq EXCEPT ![f] = NoMember]
-                  /\ deferred' = [deferred EXCEPT ![f] =
-                                    IF changed THEN {} ELSE @ \ flushed]
-                  /\ acked' = acked \cup flushed
+                  /\ deferred' = [deferred EXCEPT ![f] = kept]
+                  /\ acked' = acked \cup {Reg(d) : d \in flushed}
                   /\ pendingAcks' = [pendingAcks EXCEPT ![f] =
                                        IF m.ldr # f THEN {} ELSE @]
           ELSE UNCHANGED <<rep, appliedVer, epoch, leaderView, resyncReq,
@@ -563,6 +611,23 @@ DropMsg(s, r) ==
                    alive, rep, appliedVer, epoch, leaderView, deferred,
                    pendingAcks, resyncReq>>
 
+\* A member handles the DOWN for the leader it follows.  Erlang delivers every
+\* message a process sent before its DOWN, so the DOWN can only come once the
+\* dead leader's channel to f is empty: each message was delivered or lost.  Only
+\* enabled under LeaderGoneAssume, so the other configs' state spaces are unchanged.
+ObserveDown(f) ==
+    /\ LeaderGoneAssume
+    /\ alive[f]
+    /\ ~leaderDown[f]
+    /\ LET l == leaderView[f]
+       IN /\ l \in Members /\ l # f
+          /\ ~alive[l]
+          /\ chan[l][f] = <<>>
+    /\ leaderDown' = [leaderDown EXCEPT ![f] = TRUE]
+    /\ UNCHANGED <<dbLeader, dbEpoch, dbVersion, histMap, acked, crashes,
+                   alive, rep, appliedVer, epoch, leaderView, deferred,
+                   pendingAcks, resyncReq, chan, degraded, complete>>
+
 (***************************************************************************)
 (* Next / Spec                                                             *)
 (***************************************************************************)
@@ -581,9 +646,15 @@ Step ==
          \/ RecvReply(s, r) \/ RecvSync(s, r) \/ RecvAck(s, r)
          \/ RecvSnap(s, r) \/ ServeResync(s, r) \/ DropMsg(s, r)
 
+\* `leader_down` resets whenever a member's view of its leader changes.
+ResetLeaderDown ==
+    leaderDown' = [x \in Members |->
+                     IF leaderView'[x] # leaderView[x] THEN FALSE ELSE leaderDown[x]]
+
 Next ==
-    \/ \E m \in Members : AssumeGather(m)
-    \/ Step /\ UNCHANGED <<degraded, complete>>
+    \/ \E m \in Members : AssumeGather(m) /\ ResetLeaderDown
+    \/ \E m \in Members : ObserveDown(m)
+    \/ Step /\ UNCHANGED <<degraded, complete>> /\ ResetLeaderDown
 
 Spec == Init /\ [][Next]_vars
 
@@ -601,13 +672,14 @@ TypeOK ==
     /\ appliedVer \in [Members -> Versions]
     /\ epoch \in [Members -> 0..MaxEpoch]
     /\ leaderView \in [Members -> Members \cup {NoMember}]
-    /\ deferred \in [Members -> SUBSET Regs]
+    /\ deferred \in [Members -> SUBSET Held]
     /\ pendingAcks \in [Members -> SUBSET Regs]
     /\ resyncReq \in [Members -> Members \cup {NoMember}]
     /\ acked \subseteq Regs
     /\ crashes \in 0..MaxCrashes
     /\ degraded \in [Members -> BOOLEAN]
     /\ complete \in [Members -> BOOLEAN]
+    /\ leaderDown \in [Members -> BOOLEAN]
     /\ \A s \in Members : \A r \in Members :
          \A i \in 1..Len(chan[s][r]) : chan[s][r][i] \in Msg
 
