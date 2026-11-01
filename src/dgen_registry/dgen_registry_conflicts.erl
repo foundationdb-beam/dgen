@@ -2,44 +2,53 @@
 
 -define(DOCATTRS, ?OTP_RELEASE >= 27).
 
+-include("dgen_registry_member.hrl").
+
 -if(?DOCATTRS).
 -moduledoc false.
 -endif.
 
-%% Conflict repair (§5.6; `§N.N` is docs/design/dgen_registry_design.md). Pids are never
-%% durable, so if every holder of a binding is lost the name can be re-issued while the
-%% original lives on; on reconnection two live pids hold one name.
+%% Detects and repairs conflicting name bindings (§5.6). `§N.N` refers to
+%% docs/design/dgen_registry_design.md.
 %%
-%% Evidence: a trail of explicit releases, `{Name, Pid} => ms`, recorded at commit or
-%% from the broadcast and merged at handoff; a witness binding on it is lag, not a
-%% conflict. Keyed by pair, so one release never masks another name. Not pruned while a
-%% member is disconnected or within a TTL of a departure: its stale rows may resurface.
+%% Pids are never durable. If every member holding a binding is lost, the leader can
+%% hand the name out again while the original pid is still alive. When the lost
+%% members reconnect, two live pids hold the same name.
 %%
-%% Verdict: the authority (freshest reconstruction) binds a name to a live pid and a
-%% witness to a different live pid off the trail. A name the authority lacks is no
-%% conflict. Liveness is probed off the leader's loop: conflict_pids/3 lists what to
-%% probe, detect/4 decides.
+%% Evidence. We keep a trail of explicit releases as `{Name, Pid} => ms`. The leader
+%% records them at commit, followers record them from the broadcast, and a handoff
+%% merges them. If a witness still binds a released pair, that is replication lag, not
+%% a conflict. The trail is keyed by name and pid together, so a release of one name
+%% never hides a conflict on another. We don't prune it while a member is disconnected
+%% or within a TTL of a departure, because that member's stale rows may come back.
 %%
-%% Remedy: resolve/5 kills the authority and all divergent pids and drops the name,
-%% unless `terminate_on_conflict` is off (alarm only) or the per-name, per-term
-%% `conflict_kill_budget` is spent (alarm and stop: escalate rather than loop). Kills
-%% and alarms are returned as effects; nothing here probes, sends or kills.
+%% Verdict. A conflict exists when the authority binds a name to a live pid and a
+%% witness binds it to a different live pid that isn't on the trail. The authority is
+%% the freshest reconstruction. If the authority doesn't hold the name at all, there is
+%% no conflict. The leader probes liveness outside its own loop. get_conflict_pids/3
+%% lists the pids to probe, and detect/4 makes the decision.
 %%
-%% Prevention: with `reject_when_degraded`, a leader whose reconstruction may lack a
-%% committed binding refuses names it does not hold (degraded/5).
+%% Remedy. resolve/5 kills the authority pid and every divergent pid, and drops the
+%% name. There are two exceptions. With `terminate_on_conflict` off, we only raise an
+%% alarm. When the `conflict_kill_budget` for that name is spent, we raise an alarm and
+%% stop killing, so a recurring conflict escalates instead of looping. This module
+%% returns kills and alarms as effects. It never probes, sends or kills anything itself.
+%%
+%% Prevention. With `reject_when_degraded`, a leader whose reconstruction may be
+%% missing a committed binding refuses names it doesn't already hold. See
+%% is_reconstruction_degraded/5.
 %%
 %% *This documentation is LLM-generated. See the AI disclosure in README.md.*
 
--export([new/0, trail/1, released/3, merge/2, departed/2, prune/4]).
--export([conflict_pids/3, detect/4, resolve/5]).
--export([degraded/1, set_degraded/2, degraded/5]).
+-export([new/0, get_trail/1, record_releases/3, merge/2, record_departure/2, prune/4]).
+-export([get_conflict_pids/3, detect/4, resolve/5]).
+-export([is_degraded/1, set_degraded/2, is_reconstruction_degraded/5]).
 
 -export_type([t/0, trail/0, conflict/0, effect/0]).
 
 -type records() :: dgen_registry_replica:records().
 
-%% Bare-pid keys come from pre-upgrade members during a rolling upgrade.
--type trail() :: #{{term(), pid()} | pid() => integer()}.
+-type trail() :: #{{term(), pid()} => integer()}.
 
 -type conflict() :: {Name :: term(), Authority :: pid(), Divergent :: [pid()]}.
 
@@ -47,17 +56,7 @@
     {kill, pid()}
     | {alarm, conflict(), terminated | detect_only | budget_exhausted}.
 
--record(conflicts, {
-    trail = #{} :: trail(),
-    %% Leader-only: name => recent kill times (ms), for `conflict_kill_budget`.
-    kill_budget = #{} :: #{term() => [integer()]},
-    %% Last member departure seen; suspends trail pruning for a TTL.
-    last_departure = 0 :: integer(),
-    %% Leader-only: may the last reconstruction lack a committed binding?
-    degraded = false :: boolean()
-}).
-
--opaque t() :: #conflicts{}.
+-type t() :: #conflicts{}.
 
 -spec new() -> t().
 new() -> #conflicts{}.
@@ -66,25 +65,31 @@ new() -> #conflicts{}.
 %% Evidence: the release trail
 %% ---------------------------------------------------------------------------
 
--spec trail(t()) -> trail().
-trail(#conflicts{trail = T}) -> T.
+-spec get_trail(t()) -> trail().
+get_trail(#conflicts{trail = T}) -> T.
 
-%% Record explicit releases of live pids at `Now`.
--spec released([{term(), pid()}], integer(), t()) -> t().
-released([], _Now, C) ->
+%% Records explicit releases of live pids at time `Now`.
+-spec record_releases([{term(), pid()}], integer(), t()) -> t().
+record_releases([], _Now, C) ->
     C;
-released(Pairs, Now, C = #conflicts{trail = T}) ->
+record_releases(Pairs, Now, C = #conflicts{trail = T}) ->
     C#conflicts{trail = lists:foldl(fun(Pair, Acc) -> Acc#{Pair => Now} end, T, Pairs)}.
 
-%% Merge gathered trails, keeping each entry's latest release time.
+%% Merges the trails gathered at handoff, keeping the latest release time for each entry.
 -spec merge([trail()], t()) -> t().
 merge(Trails, C = #conflicts{trail = T}) ->
-    C#conflicts{trail = merge_trails(T, Trails)}.
+    Merged = lists:foldl(
+        fun(Other, Acc) -> maps:merge_with(fun(_K, A, B) -> max(A, B) end, Acc, Other) end,
+        T,
+        Trails
+    ),
+    C#conflicts{trail = Merged}.
 
--spec departed(integer(), t()) -> t().
-departed(Now, C) -> C#conflicts{last_departure = Now}.
+-spec record_departure(integer(), t()) -> t().
+record_departure(Now, C) -> C#conflicts{last_departure = Now}.
 
-%% Trail entries expire only if every member is connected and none departed in the TTL.
+%% Expires old trail entries, but only when every member is connected and none has
+%% departed within the TTL. Also drops kill-budget timestamps older than the window.
 -spec prune(integer(), boolean(), dgen_config:config(), t()) -> t().
 prune(Now, AllConnected, Config, C = #conflicts{trail = T, kill_budget = KB}) ->
     TTL = dgen_config:conflict_release_ttl(Config),
@@ -105,25 +110,29 @@ prune(Now, AllConnected, Config, C = #conflicts{trail = T, kill_budget = KB}) ->
 %% Verdict
 %% ---------------------------------------------------------------------------
 
-%% Every pid a conflict could turn on, to probe off the leader's loop before detect/4.
--spec conflict_pids(records(), [records()], trail()) -> [pid()].
-conflict_pids(Authority, Witnesses, Trail) ->
+%% Returns every pid a conflict could involve. The leader probes these outside its
+%% loop before calling detect/4.
+-spec get_conflict_pids(records(), [records()], trail()) -> [pid()].
+get_conflict_pids(Authority, Witnesses, Trail) ->
     lists:usort(
         maps:fold(
             fun(Name, PidSet, Acc) ->
-                [P || P <- [authority(Name, Authority) | maps:keys(PidSet)], is_pid(P)] ++ Acc
+                [P || P <- [get_authority_pid(Name, Authority) | maps:keys(PidSet)], is_pid(P)] ++
+                    Acc
             end,
             [],
-            candidates(Authority, Witnesses, Trail)
+            get_divergent_bindings(Authority, Witnesses, Trail)
         )
     ).
 
-%% The authority's records may be among the witnesses: an entry agrees with itself.
+%% Returns the conflicts among the divergent bindings, using `Alive` to test pids. The
+%% authority's records may also appear among the witnesses, which is fine because an
+%% entry always agrees with itself.
 -spec detect(records(), [records()], trail(), fun((pid()) -> boolean())) -> [conflict()].
 detect(Authority, Witnesses, Trail, Alive) ->
     maps:fold(
         fun(Name, PidSet, Acc) ->
-            APid = authority(Name, Authority),
+            APid = get_authority_pid(Name, Authority),
             Others = [P || P <- maps:keys(PidSet), P =/= APid],
             case Others =:= [] orelse not (is_pid(APid) andalso Alive(APid)) of
                 true ->
@@ -136,11 +145,12 @@ detect(Authority, Witnesses, Trail, Alive) ->
             end
         end,
         [],
-        candidates(Authority, Witnesses, Trail)
+        get_divergent_bindings(Authority, Witnesses, Trail)
     ).
 
-%% Differing witness bindings off the trail: `#{Name => #{Pid => true}}`.
-candidates(Authority, Witnesses, Trail) ->
+%% Returns the witness bindings that differ from the authority and aren't on the
+%% trail, as `#{Name => #{Pid => true}}`.
+get_divergent_bindings(Authority, Witnesses, Trail) ->
     lists:foldl(
         fun(Map, Acc0) ->
             maps:fold(
@@ -149,7 +159,7 @@ candidates(Authority, Witnesses, Trail) ->
                         {Pid, _, _} ->
                             Acc;
                         _AbsentOrDifferent ->
-                            case on_trail(Name, Pid, Trail) of
+                            case maps:is_key({Name, Pid}, Trail) of
                                 true ->
                                     Acc;
                                 false ->
@@ -166,20 +176,18 @@ candidates(Authority, Witnesses, Trail) ->
         Witnesses
     ).
 
-authority(Name, Authority) ->
+get_authority_pid(Name, Authority) ->
     case maps:get(Name, Authority, undefined) of
         {Pid, _Index, _Data} -> Pid;
         undefined -> undefined
     end.
 
-on_trail(Name, Pid, Trail) ->
-    maps:is_key({Name, Pid}, Trail) orelse maps:is_key(Pid, Trail).
-
 %% ---------------------------------------------------------------------------
 %% Remedy
 %% ---------------------------------------------------------------------------
 
-%% `Records` only loses names, so with no conflicts it passes through by reference.
+%% Applies the remedy to each conflict. Resolving only ever removes names from
+%% `Records`, so with no conflicts we return it unchanged without copying.
 -spec resolve([conflict()], records(), dgen_config:config(), integer(), t()) ->
     {records(), t(), [effect()]}.
 resolve([], Records, _Config, _Now, C) ->
@@ -188,26 +196,27 @@ resolve(Conflicts, Records, Config, Now, C) ->
     Terminate = dgen_config:terminate_on_conflict(Config),
     Budget = dgen_config:conflict_kill_budget(Config),
     {Records1, C1, EffsRev} = lists:foldl(
-        fun(Conflict, Acc) -> resolve_one(Conflict, Terminate, Budget, Now, Acc) end,
+        fun(Conflict, Acc) -> resolve_conflict(Conflict, Terminate, Budget, Now, Acc) end,
         {Records, C, []},
         Conflicts
     ),
     {Records1, C1, lists:reverse(EffsRev)}.
 
-resolve_one(Conflict, false, _Budget, _Now, {Records, C, Effs}) ->
-    %% Detect-only: alarm, and keep the authority's binding.
+resolve_conflict(Conflict, false, _Budget, _Now, {Records, C, Effs}) ->
+    %% Detect-only mode. Raise an alarm and keep the authority's binding.
     {Records, C, [{alarm, Conflict, detect_only} | Effs]};
-resolve_one(
+resolve_conflict(
     {Name, Authority, Divergent} = Conflict, true, {Count, Window}, Now, {Records, C, Effs}
 ) ->
     KB = C#conflicts.kill_budget,
     Recent = [Ts || Ts <- maps:get(Name, KB, []), Ts >= Now - Window],
     case length(Recent) < Count of
         false ->
-            %% Exhausted: escalate, stop killing this name, keep it served.
+            %% The budget is spent. Escalate with an alarm, stop killing for this name, and
+            %% keep serving it.
             {Records, C, [{alarm, Conflict, budget_exhausted} | Effs]};
         true ->
-            %% A pid that died since detection ignores the kill.
+            %% A pid that died since detection simply ignores the kill.
             Kills = [{kill, P} || P <- [Authority | Divergent]],
             {
                 maps:remove(Name, Records),
@@ -220,30 +229,24 @@ resolve_one(
 %% Prevention
 %% ---------------------------------------------------------------------------
 
--spec degraded(t()) -> boolean().
-degraded(#conflicts{degraded = D}) -> D.
+-spec is_degraded(t()) -> boolean().
+is_degraded(#conflicts{degraded = D}) -> D.
 
 -spec set_degraded(boolean(), t()) -> t().
 set_degraded(D, C) -> C#conflicts{degraded = D}.
 
-%% Degraded exactly when the reconstruction stopped short of the durable version key
-%% (`Frontier`): replicas are stream prefixes, so the freshest at the key is the
-%% committed map (TLA+ DegradedFlagSound). With the key unreadable, fall back to
-%% reachability: degraded if a member not marked fresh did not answer the gather.
--spec degraded(
+%% Returns true when the reconstruction stopped short of `Frontier`, the durable
+%% version key. Every replica is a prefix of the same stream, so a replica that reached
+%% the key holds the committed map (TLA+ DegradedFlagSound). If we couldn't read the
+%% key, we fall back to reachability. The reconstruction is degraded if any member not
+%% marked fresh failed to answer the gather.
+-spec is_reconstruction_degraded(
     non_neg_integer(), non_neg_integer() | unknown, [term()], [term()], #{term() => term()}
 ) -> boolean().
-degraded(MaxVersion, Frontier, _OtherIds, _FreshIds, _PeerResults) when is_integer(Frontier) ->
+is_reconstruction_degraded(MaxVersion, Frontier, _OtherIds, _FreshIds, _PeerResults) when
+    is_integer(Frontier)
+->
     MaxVersion < Frontier;
-degraded(_MaxVersion, unknown, OtherIds, FreshIds, PeerResults) ->
+is_reconstruction_degraded(_MaxVersion, unknown, OtherIds, FreshIds, PeerResults) ->
     Unreachable = OtherIds -- maps:keys(PeerResults),
     lists:any(fun(Id) -> not lists:member(Id, FreshIds) end, Unreachable).
-
-%% ---------------------------------------------------------------------------
-%% Internal
-%% ---------------------------------------------------------------------------
-
-merge_trails(Trail, Others) ->
-    lists:foldl(
-        fun(T, Acc) -> maps:merge_with(fun(_K, A, B) -> max(A, B) end, Acc, T) end, Trail, Others
-    ).

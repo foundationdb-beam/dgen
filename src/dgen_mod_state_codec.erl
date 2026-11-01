@@ -6,20 +6,20 @@
 -moduledoc false.
 -endif.
 
-%% Encoder/decoder for dgen_server mod_state.
+%% Encodes and decodes the mod_state of a dgen_server.
 %%
-%% Stores structured Erlang terms across FDB key-value pairs using a recursive
-%% encoding scheme. Three encoding types are supported:
+%% Spreads a structured Erlang term across many FDB key-value pairs, using one of
+%% three encodings:
 %%
-%% - **term** (fallback) - `term_to_binary`, chunked into 100KB values.
-%% - **assigns map** - map with all atom keys; each entry stored at a
-%%   separate FDB key using `atom_to_binary(Key)` in the path.
-%% - **component list** - list of maps where every item has an atom `id`
-%%   key with a binary value; each item stored separately, ordered by a
-%%   fractional index embedded in the FDB key.
+%% - **term** (the fallback) - `term_to_binary`, split into 100KB chunks.
+%% - **assigns map** - a map whose keys are all atoms. Each entry gets its own
+%%   FDB key, with `atom_to_binary(Key)` in the path.
+%% - **component list** - a list of maps where every item has an `id` key with a
+%%   binary value. Each item is stored separately, and a fractional index in its
+%%   FDB key keeps the items in order.
 %%
-%% The encoding is applied recursively. For example, an assigns map whose value
-%% is a component list will nest both encodings in the key path.
+%% The encoding applies recursively. For example, if a value in an assigns map
+%% is a component list, both encodings nest in the key path.
 %%
 %% ### Key structure
 %%
@@ -84,9 +84,9 @@ set(Tenant, BaseKey, OldModState, ModState) ->
 
 -if(?DOCATTRS).
 -doc """
-Diff-based partial write. Compares `OldModState` and `NewModState` and
-only writes changed keys. Falls back to a full rewrite when the encoding
-type changes or both values are plain terms.
+Writes only the keys that differ between `OldModState` and `NewModState`.
+Falls back to a full rewrite when the encoding type changes or when both
+values use the term encoding.
 
 When `OldModState` is `undefined`, existing data is cleared first.
 """.
@@ -202,7 +202,7 @@ term_first_key(Dir, BaseKey) ->
 
 -type encoding_type() :: term | map | list.
 
-%% Classify a term into its encoding type.
+%% Returns the encoding type for a term.
 %% - map  : map with all atom keys (assigns map)
 %% - list : list of maps each with a binary id key (component list)
 %% - term : everything else (fallback)
@@ -371,9 +371,9 @@ decode_list(B, Dir, BaseKey, KVs) ->
         [] ->
             {ok, []};
         _ ->
-            %% Group by FracIndex (BaseSize+2). Each frac index maps to one item.
-            %% FDB returns keys sorted by (FracIndex, Id, ...), so groups are
-            %% already in the correct list order -- no sort needed.
+            %% Group by FracIndex at position BaseSize+2. Each fractional index
+            %% belongs to one item. FDB returns keys sorted by (FracIndex, Id, ...),
+            %% so the groups are already in list order and we don't need to sort.
             Groups = group_by_pos(BaseSize + 2, DataKVs),
             Items = [
                 begin
@@ -426,7 +426,7 @@ diff_map(Td, BaseKey, OldMap, NewMap) ->
     ),
     ok.
 
-%% Internal diff-set that operates on an already-transactional tenant
+%% Does the same diff as set/5, inside a transaction the caller already holds.
 set_tx(_Td, _BaseKey, Same, Same) ->
     ok;
 set_tx(Td, BaseKey, OldModState, NewModState) ->
@@ -511,8 +511,8 @@ diff_list({Tx, Dir} = Td, BaseKey, OldList, NewList) ->
 
     ok.
 
-%% Walk the new list in order and assign fractional indices to newly added
-%% items, placing each between its neighbours' existing indices.
+%% Walks the new list in order and gives each added item a fractional index
+%% between the indices of its neighbours.
 -spec assign_new_indices(list(), [binary()], map()) -> map().
 assign_new_indices(NewList, AddedIds, OrderMap) ->
     AddedSet = sets:from_list(AddedIds),
@@ -557,8 +557,9 @@ find_next_defined([{_Id, FI} | _Rest]) ->
 %% Helpers
 %%
 
-%% Group a sorted list of pre-unpacked KVs by the element at Pos.
-%% Relies on FDB key ordering to keep groups contiguous.
+%% Groups a sorted list of already-unpacked KVs by the tuple element at Pos.
+%% FDB key order keeps each group contiguous, so we only compare with the
+%% previous group.
 -spec group_by_pos(pos_integer(), [{tuple(), binary(), binary()}]) ->
     [{term(), [{tuple(), binary(), binary()}]}].
 group_by_pos(Pos, UnpackedKVs) ->

@@ -1,0 +1,110 @@
+<svg viewBox="0 0 1080 717" width="1080" role="img" aria-label="A follower forwards the registration to the leader, which commits it, broadcasts the batch, then replies. FIFO puts the batch ahead of the reply, so the follower already holds the binding when it answers yes." xmlns="http://www.w3.org/2000/svg"><style>
+:root{--surface:#ffffff;--fg:#1a2226;--muted:#5a676d;--rule:#c9d2d5;--lane:#e6ecee;
+--accent:#0a6a86;--durable:#8c5a06;--warn:#b0281f;--note:#f8f4e6;--note-rule:#c9b98a}
+@media (prefers-color-scheme: dark){:root{--surface:#172024;--fg:#e1e8ea;--muted:#97a5ab;
+--rule:#33424a;--lane:#1e2a30;--accent:#56c2df;--durable:#e2ab52;--warn:#ff8074;
+--note:#23241d;--note-rule:#6d6440}}
+.bg{fill:var(--surface)}
+.leg-t{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:12px;fill:var(--fg)}
+.life{stroke:var(--rule);stroke-width:1;stroke-dasharray:3 4}
+.lane-head{fill:var(--lane);stroke:var(--rule)}
+.lane-n{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-weight:600;font-size:13.5px;fill:var(--fg)}
+.lane-s,.lbl,.phase-t,.num{font-family:ui-monospace,"SF Mono",Menlo,Consolas,"DejaVu Sans Mono",monospace}
+.lane-s{font-size:10.5px;fill:var(--muted)}
+.ln{stroke-width:1.4;fill:none}
+.lbl{font-size:11px;paint-order:stroke;stroke-width:4px;stroke-linejoin:round}
+.m-cast,.m-call{stroke:var(--fg);fill:var(--fg)}
+.m-reply{stroke:var(--muted);fill:var(--muted)}
+.ln.m-reply{stroke-dasharray:5 4}
+.m-db{stroke:var(--durable);fill:var(--durable)}
+.ln.m-db{stroke-dasharray:1.5 3;stroke-width:1.8;stroke-linecap:round}
+.m-signal{stroke:var(--warn);fill:var(--warn)}
+.accent{stroke:var(--accent);fill:var(--accent)}
+.ln.accent{stroke-width:2.2}
+.lbl{stroke:var(--surface)}
+.lbl.accent{font-weight:600}
+.head,.dot{stroke:none}
+.lost{stroke:var(--warn);stroke-width:2;fill:none;stroke-linecap:round}
+.act{fill:var(--surface);stroke:var(--rule)}
+.act.warn{stroke:var(--warn)}
+.act-t,.note-t{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:11.5px;fill:var(--fg)}
+.act-t.warn{fill:var(--warn)}
+.note{fill:var(--note);stroke:var(--note-rule);stroke-dasharray:4 3}
+.note-t{font-style:italic}
+.phase-ln{stroke:var(--rule);stroke-width:1}
+.phase-bg{fill:var(--surface)}
+.phase-t{font-size:10.5px;letter-spacing:.08em;fill:var(--muted)}
+.num-dot{fill:none;stroke:var(--rule)}
+.num{font-size:10px;fill:var(--muted)}
+</style><rect class="bg" width="100%" height="100%"/>
+<line class="life" x1="126.0" y1="52" x2="126.0" y2="711"/>
+<rect class="lane-head" x="48.0" y="4" width="156" height="46" rx="6"/><text class="lane-n" x="126.0" y="24" text-anchor="middle">Caller</text><text class="lane-s" x="126.0" y="40" text-anchor="middle">any process</text>
+<line class="life" x1="298.0" y1="52" x2="298.0" y2="711"/>
+<rect class="lane-head" x="220.0" y="4" width="156" height="46" rx="6"/><text class="lane-n" x="298.0" y="24" text-anchor="middle">Follower</text><text class="lane-s" x="298.0" y="40" text-anchor="middle">member</text>
+<line class="life" x1="470.0" y1="52" x2="470.0" y2="711"/>
+<rect class="lane-head" x="392.0" y="4" width="156" height="46" rx="6"/><text class="lane-n" x="470.0" y="24" text-anchor="middle">Leader</text><text class="lane-s" x="470.0" y="40" text-anchor="middle">member</text>
+<line class="life" x1="642.0" y1="52" x2="642.0" y2="711"/>
+<rect class="lane-head" x="564.0" y="4" width="156" height="46" rx="6"/><text class="lane-n" x="642.0" y="24" text-anchor="middle">Commit worker</text><text class="lane-s" x="642.0" y="40" text-anchor="middle">dgen_transaction</text>
+<line class="life" x1="814.0" y1="52" x2="814.0" y2="711"/>
+<rect class="lane-head" x="736.0" y="4" width="156" height="46" rx="6"/><text class="lane-n" x="814.0" y="24" text-anchor="middle">Backend</text><text class="lane-s" x="814.0" y="40" text-anchor="middle">FDB keys</text>
+<line class="life" x1="986.0" y1="52" x2="986.0" y2="711"/>
+<rect class="lane-head" x="908.0" y="4" width="156" height="46" rx="6"/><text class="lane-n" x="986.0" y="24" text-anchor="middle">Other followers</text><text class="lane-s" x="986.0" y="40" text-anchor="middle">members</text>
+<line class="ln m-call" x1="126.0" y1="94" x2="290.0" y2="94"/>
+<circle class="dot m-call" cx="126.0" cy="94" r="3.2"/>
+<polygon class="head m-call" points="298.0,94.0 290.0,89.5 290.0,98.5"/>
+<text class="lbl m-call" x="212.0" y="87" text-anchor="middle">{register, Name, Pid, Meta}</text>
+<circle class="num-dot" cx="18" cy="90.0" r="9"/><text class="num" x="18" y="93.5" text-anchor="middle">1</text>
+<rect class="act " x="159.0" y="112" width="278.0" height="40" rx="5"/>
+<text class="act-t " x="298.0" y="128" text-anchor="middle">Stores an intent under Ref. It can&#x27;t decide</text>
+<text class="act-t " x="298.0" y="143" text-anchor="middle">alone.</text>
+<line class="ln m-cast" x1="298.0" y1="178" x2="462.0" y2="178"/>
+<polygon class="head m-cast" points="470.0,178.0 462.0,173.5 462.0,182.5"/>
+<text class="lbl m-cast" x="384.0" y="171" text-anchor="middle">{register_req, Ref, F, Name, Pid, Meta}</text>
+<circle class="num-dot" cx="18" cy="174.0" r="9"/><text class="num" x="18" y="177.5" text-anchor="middle">2</text>
+<rect class="act " x="322.0" y="196" width="296.0" height="40" rx="5"/>
+<text class="act-t " x="470.0" y="212" text-anchor="middle">Enqueues {add, …, {forward, F, Ref}}. Ops that</text>
+<text class="act-t " x="470.0" y="227" text-anchor="middle">arrive during a commit join the next batch.</text>
+<line class="ln m-cast" x1="470.0" y1="262" x2="634.0" y2="262"/>
+<polygon class="head m-cast" points="642.0,262.0 634.0,257.5 634.0,266.5"/>
+<text class="lbl m-cast" x="556.0" y="255" text-anchor="middle">start_commit(epoch E)</text>
+<circle class="num-dot" cx="18" cy="258.0" r="9"/><text class="num" x="18" y="261.5" text-anchor="middle">3</text>
+<line class="ln m-db" x1="642.0" y1="296" x2="806.0" y2="296"/>
+<polygon class="head m-db" points="814.0,296.0 806.0,291.5 806.0,300.5"/>
+<text class="lbl m-db" x="728.0" y="289" text-anchor="middle">fence on leader key {L, E}, bump version</text>
+<circle class="num-dot" cx="18" cy="292.0" r="9"/><text class="num" x="18" y="295.5" text-anchor="middle">4</text>
+<line class="ln m-reply" x1="814.0" y1="330" x2="650.0" y2="330"/>
+<polygon class="head m-reply" points="642.0,330.0 650.0,325.5 650.0,334.5"/>
+<text class="lbl m-reply" x="728.0" y="323" text-anchor="middle">commit version V</text>
+<circle class="num-dot" cx="18" cy="326.0" r="9"/><text class="num" x="18" y="329.5" text-anchor="middle">5</text>
+<line class="ln m-cast" x1="642.0" y1="364" x2="478.0" y2="364"/>
+<polygon class="head m-cast" points="470.0,364.0 478.0,359.5 478.0,368.5"/>
+<text class="lbl m-cast" x="556.0" y="357" text-anchor="middle">{dgen_transaction, Ref, {committed, V}}</text>
+<circle class="num-dot" cx="18" cy="360.0" r="9"/><text class="num" x="18" y="363.5" text-anchor="middle">6</text>
+<rect class="act " x="322.0" y="382" width="296.0" height="40" rx="5"/>
+<text class="act-t " x="470.0" y="398" text-anchor="middle">Applies the batch to its replica. Monitors Pid</text>
+<text class="act-t " x="470.0" y="413" text-anchor="middle">with tag {down, Name}.</text>
+<line class="ln m-cast accent" x1="470.0" y1="448" x2="306.0" y2="448"/>
+<line class="ln m-cast accent" x1="470.0" y1="448" x2="978.0" y2="448"/>
+<polygon class="head m-cast accent" points="298.0,448.0 306.0,443.5 306.0,452.5"/>
+<polygon class="head m-cast accent" points="986.0,448.0 978.0,443.5 978.0,452.5"/>
+<text class="lbl m-cast accent" x="384.0" y="441" text-anchor="middle">{names_batch, Ops, E, PrevV, V, L}</text>
+<circle class="num-dot" cx="18" cy="444.0" r="9"/><text class="num" x="18" y="447.5" text-anchor="middle">7</text>
+<rect class="act " x="153.0" y="466" width="290.0" height="40" rx="5"/>
+<text class="act-t " x="298.0" y="482" text-anchor="middle">PrevV matches its version, so the whole batch</text>
+<text class="act-t " x="298.0" y="497" text-anchor="middle">applies. Replica is at (E, V).</text>
+<line class="ln m-cast accent" x1="470.0" y1="532" x2="306.0" y2="532"/>
+<polygon class="head m-cast accent" points="298.0,532.0 306.0,527.5 306.0,536.5"/>
+<text class="lbl m-cast accent" x="384.0" y="525" text-anchor="middle">{register_reply, Ref, yes, V, E}</text>
+<circle class="num-dot" cx="18" cy="528.0" r="9"/><text class="num" x="18" y="531.5" text-anchor="middle">8</text>
+<rect class="act " x="165.0" y="550" width="266.0" height="40" rx="5"/>
+<text class="act-t " x="298.0" y="566" text-anchor="middle">Replica holds V in epoch E, so the yes is</text>
+<text class="act-t " x="298.0" y="581" text-anchor="middle">released.</text>
+<line class="ln m-reply" x1="298.0" y1="616" x2="134.0" y2="616"/>
+<polygon class="head m-reply" points="126.0,616.0 134.0,611.5 134.0,620.5"/>
+<text class="lbl m-reply" x="212.0" y="609" text-anchor="middle">yes</text>
+<circle class="num-dot" cx="18" cy="612.0" r="9"/><text class="num" x="18" y="615.5" text-anchor="middle">9</text>
+<rect class="note" x="222.0" y="636" width="324.0" height="57" rx="4"/>
+<text class="note-t" x="234.0" y="653">If the batch was refused as a gap, F holds the yes</text>
+<text class="note-t" x="234.0" y="668">as {awaiting_version, V, E, L} and asks L for a</text>
+<text class="note-t" x="234.0" y="683">resync. A yes from another epoch never counts.</text>
+</svg>

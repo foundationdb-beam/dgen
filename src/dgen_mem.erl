@@ -1,9 +1,9 @@
 -module(dgen_mem).
 -behaviour(dgen_backend).
 
-%% Simulation build only: rewrites the `erlang:monotonic_time/1` calls below to
-%% `eta_time`, so commit versions advance with the virtual clock when one is
-%% running. Outside a simulation build this module has no `eta` dependency at all.
+%% In a simulation build, this rewrites the `erlang:monotonic_time/1` calls below to
+%% use `eta_time`, so commit versions advance with the virtual clock when one is
+%% running. Outside a simulation build this module doesn't depend on `eta` at all.
 -include("../include/dgen_eta.hrl").
 
 -define(DOCATTRS, ?OTP_RELEASE >= 27).
@@ -12,72 +12,74 @@
 -moduledoc """
 A pure-Erlang, in-memory `dgen_backend`.
 
-Implements the FoundationDB semantics the registry actually depends on — MVCC read
-versions, read-conflict detection, versionstamps, watches — with no NIF, no server,
-and no I/O. Two things follow:
+It implements the FoundationDB semantics the registry actually depends on: MVCC
+read versions, read-conflict detection, versionstamps, and watches. It needs no
+NIF, no server, and no I/O. That gives us two things.
 
-- **The suite runs without FoundationDB installed.** Worth having on its own.
-- **Commit timing stops being a source of nondeterminism**, which is the last one
+- **The suite runs without FoundationDB installed.** That is worth having on its own.
+- **Commit timing is no longer a source of nondeterminism.** It was the last one
   outside `eta_sched` and `eta_time`. Commits happen synchronously, in the calling
   process, in a deterministic order.
 
 ## Fidelity, and where it stops
 
-Key layout is *exactly* FDB's: `erlfdb_subspace` and `erlfdb_tuple` are pure Erlang,
-so this reuses them rather than reimplementing order-preserving tuple encoding,
-where a subtle error would surface as ordering bugs in `dgen_queue`.
+Key layout is exactly the same as FDB's. `erlfdb_subspace` and `erlfdb_tuple` are
+pure Erlang, so we reuse them instead of reimplementing order-preserving tuple
+encoding. A subtle error there would show up as ordering bugs in `dgen_queue`.
 
 What is modelled faithfully:
 
 - **Read versions.** A read sees the newest value written at or before the
-  transaction's read version. Pinning a read version (`set_read_version/2`) really
-  does read the past, which is what makes the registry's fencing test meaningful.
+  transaction's read version. Pinning an older read version with
+  `set_read_version/2` really does read the past. That is what makes the registry's
+  fencing test meaningful.
 - **Read conflicts.** A commit aborts with `not_committed` (1020) if any key in a
-  read-conflict range was written after the transaction's read version. This is the
-  mechanism the leader fence rests on (§5.1), so it has to be real.
-- **Versionstamps.** `set_versionstamped_value/3` substitutes a 10-byte stamp —
-  8-byte commit version, 2-byte in-transaction batch order — so the registry's
-  version key decodes and orders exactly as it does against FDB.
+  read-conflict range was written after the transaction's read version. The leader
+  fence depends on this (§5.1), so it has to be real.
+- **Versionstamps.** `set_versionstamped_value/3` fills in a 10-byte stamp, made of
+  an 8-byte commit version and a 2-byte batch order within the transaction. The
+  registry's version key then decodes and sorts exactly as it does against FDB.
 - **Watches.** A watch fires when its key is written by a later commit.
 
 What is not:
 
 - **No storage-level partitioning, no coordinators, no real distribution.** A
-  simulation runs in one VM, so the database is a single serialisation point rather
-  than a cluster that can partition beneath the system under test.
-- **Write conflicts are not tracked.** FDB conflicts a commit whose *write* set
-  overlaps another transaction's read set. Here commits are serialised, so the
-  losing transaction is simply the one that commits second, and it sees the other's
-  writes. Nothing in `dgen` depends on the distinction.
-- **No transaction *size* limit** (`transaction_too_large`). Nothing in `dgen`
-  approaches FoundationDB's 10MB transaction cap.
-- **No retry backoff.** FoundationDB backs off exponentially with jitter;
-  `transactional/2` here retries at once, up to 100 attempts. A `timer:sleep/1`
-  would be wrong under a virtual clock — a sleeper is neither runnable nor blocked
-  on a receive, so `eta_sched` can never step it.
+  simulation runs in one VM, so the database is a single point where every commit
+  is serialised. It is not a cluster that can partition underneath the system
+  under test.
+- **Write conflicts are not tracked.** FDB fails a commit whose write set overlaps
+  another transaction's read set. Here commits are serialised, so the losing
+  transaction is simply the one that commits second, and it sees the other's
+  writes. Nothing in `dgen` depends on the difference.
+- **No transaction size limit** (`transaction_too_large`). Nothing in `dgen` comes
+  near FoundationDB's 10MB transaction cap.
+- **No retry backoff.** FoundationDB backs off exponentially with jitter. Here
+  `transactional/2` retries at once, up to 100 attempts. A `timer:sleep/1` would be
+  wrong under a virtual clock. A sleeping process is neither runnable nor blocked
+  on a receive, so `eta_sched` could never step it.
 
 **The MVCC window is modelled.** Versions advance at FoundationDB's rate
-(`VERSIONS_PER_SECOND` = 1e6) and the window is the same version distance
-(`MAX_READ_TRANSACTION_LIFE_VERSIONS`, 5 seconds' worth), so a read older than the
-window raises `transaction_too_old` as it would against the real thing — and under
-a virtual clock those five seconds are reachable instantly.
+(`VERSIONS_PER_SECOND` = 1e6), and the window is the same version distance
+(`MAX_READ_TRANSACTION_LIFE_VERSIONS`, 5 seconds' worth). A read older than the
+window raises `transaction_too_old`, as it would against the real thing. Under a
+virtual clock, those five seconds pass instantly.
 
-The version rate follows whatever clock `eta_time` exposes, so start the clock
-before opening the database; doing it part-way through shifts the origin the rate
-is measured from.
+The version rate follows whatever clock `eta_time` exposes. Start the clock before
+opening the database. Starting it later shifts the origin we measure the rate from.
 
 ## Fault injection
 
-`set_faults/2` makes the failures the registry is built to survive reproducible:
-`conflict_p` (spurious `not_committed`, which a correct caller retries) and
-`commit_fail_p` (a non-retryable error). Both draw from a seeded RNG, so a run
-replays.
+`set_faults/2` injects the failures the registry is built to survive, in a way
+that can be reproduced. `conflict_p` causes spurious `not_committed` errors, which a
+correct caller retries. `commit_fail_p` causes a non-retryable error. Both draw from
+a seeded RNG, so a run can be replayed.
 
 ## Determinism
 
-State lives in ETS keyed by the database handle and nothing runs in a process of
-its own, so no call into this module can read as quiescence to `eta_sched`. Commit
-versions come from a counter, not a clock.
+State lives in ETS, keyed by the database handle, and nothing runs in a process of
+its own. So no call into this module can look like quiescence to `eta_sched`.
+Commit versions come from the clock that `eta_time` exposes, so they are
+deterministic under a virtual clock.
 
 *This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
@@ -122,23 +124,24 @@ versions come from a counter, not a clock.
 
 -export_type([db/0, fault_opts/0]).
 
-%% FDB error codes. The retryable set is what `on_error/2` resets for, and it has
-%% to match FoundationDB's — a code missing from it turns a recoverable error into
-%% a fatal one, which is exactly the kind of infidelity that makes a simulation
-%% backend worse than useless.
+%% FDB error codes. `on_error/2` resets the transaction for the retryable set, and
+%% that set has to match FoundationDB's. A missing code turns a recoverable error
+%% into a fatal one, and that kind of mismatch makes a simulation backend worse
+%% than useless.
 -define(TRANSACTION_TOO_OLD, 1007).
-%% Reading a key whose value this transaction has already made unreadable — a
-%% pending versionstamped write, whose value is not known until commit.
+%% Raised when a transaction reads a key it has a pending versionstamped write to.
+%% That value isn't known until commit.
 -define(ACCESSED_UNREADABLE, 1036).
 
-%% FoundationDB advances the read version at a fixed rate rather than per commit,
-%% and expresses its MVCC window as a *version distance*: `VERSIONS_PER_SECOND` is
-%% 1e6, and `MAX_READ_TRANSACTION_LIFE_VERSIONS` is 5 seconds' worth. Reading at a
-%% version older than that raises `transaction_too_old`.
+%% FoundationDB advances the read version at a fixed rate rather than once per
+%% commit, and it defines its MVCC window as a distance in versions.
+%% `VERSIONS_PER_SECOND` is 1e6, and `MAX_READ_TRANSACTION_LIFE_VERSIONS` is 5
+%% seconds' worth. Reading at a version older than that raises
+%% `transaction_too_old`.
 %%
-%% Modelling it the same way costs nothing and buys the behaviour outright — and
-%% under a virtual clock it becomes *controllable*: five seconds of MVCC window is
-%% five simulated seconds, reachable instantly, instead of a six-second sleep.
+%% Modelling it the same way costs nothing and gets us the same behaviour. Under a
+%% virtual clock it also becomes controllable. Five seconds of MVCC window are five
+%% simulated seconds, which pass instantly instead of needing a six-second sleep.
 -define(VERSIONS_PER_MS, 1000).
 -define(MAX_READ_TRANSACTION_LIFE_VERSIONS, 5000000).
 -define(NOT_COMMITTED, 1020).
@@ -180,8 +183,8 @@ open(Opts = #{name := Name}) ->
     _ = ets:new(watch_tab(Name), [named_table, public, bag]),
     Seed = maps:get(seed, Opts, 0),
     ets:insert(meta_tab(Name), [
-        %% Starts above zero so a pinned read version of 0 is meaningfully "before
-        %% everything", matching how the registry treats an unwritten version key.
+        %% Starts above zero so that a pinned read version of 0 really is "before
+        %% everything". That matches how the registry treats an unwritten version key.
         {version, 1},
         %% Versions advance with the clock (see ?VERSIONS_PER_MS), so the database
         %% needs an origin to measure from. Under the transform this reads the
@@ -202,11 +205,11 @@ open(Opts = #{name := Name}) ->
 close({dgen_mem_db, Name}) ->
     lists:foreach(
         fun(Tab) ->
-            %% Tables are owned by whichever process opened the database, so the VM
-            %% destroys them when it exits. A checked delete would race that: the
-            %% table can vanish between the existence check and the delete, which
-            %% is exactly what an ExUnit `on_exit` — running after the test process
-            %% is gone — hits. Deleting something already deleted is a no-op here.
+            %% The process that opened the database owns the tables, so the VM
+            %% destroys them when that process exits. Checking first and then
+            %% deleting would race with that, because the table can vanish in
+            %% between. An ExUnit `on_exit` hits exactly this, since it runs after
+            %% the test process is gone. So we just delete, and ignore a missing table.
             try
                 ets:delete(Tab)
             catch
@@ -229,11 +232,11 @@ reset({dgen_mem_db, Name}) ->
 -doc """
 Sets the commit fault policy.
 
-- `conflict_p` — probability a commit is rejected with `not_committed` (1020) even
-  though nothing actually conflicted. Retryable, so a correct caller recovers; the
-  point is to exercise that it does.
-- `commit_fail_p` — probability a commit fails with a non-retryable error, which
-  must surface to the caller rather than be retried away.
+- `conflict_p` is the probability that a commit is rejected with `not_committed`
+  (1020) even though nothing conflicted. The error is retryable, so a correct caller
+  recovers. The point is to check that it does.
+- `commit_fail_p` is the probability that a commit fails with a non-retryable
+  error. That error must reach the caller rather than being retried away.
 """.
 -endif.
 -spec set_faults(db(), fault_opts()) -> ok.
@@ -242,7 +245,7 @@ set_faults({dgen_mem_db, Name}, Faults) ->
     ok.
 
 -if(?DOCATTRS).
--doc "Commit count, conflict count, current version, and key count.".
+-doc "Returns the commit count, conflict count, current version, and key count.".
 -endif.
 -spec stats(db()) -> #{atom() => non_neg_integer()}.
 stats({dgen_mem_db, Name}) ->
@@ -260,9 +263,10 @@ watch_tab(Name) -> list_to_atom("dgen_mem_watch_" ++ atom_to_list(Name)).
 
 meta(Name, Key) -> ets:lookup_element(meta_tab(Name), Key, 2).
 
-%% The current read version: whichever is further ahead, the last commit or the
-%% clock. Commits therefore never go backwards, and an idle database still advances
-%% — which is what makes the MVCC window mean elapsed time rather than commit count.
+%% Returns the current read version, which is the last commit version or the clock
+%% version, whichever is further ahead. So versions never go backwards, and an idle
+%% database still advances. That is what makes the MVCC window measure elapsed time
+%% rather than a number of commits.
 current_version(Name) ->
     max(meta(Name, version), clock_version(Name)).
 
@@ -270,8 +274,8 @@ clock_version(Name) ->
     Elapsed = erlang:monotonic_time(millisecond) - meta(Name, start_ms),
     max(0, Elapsed) * ?VERSIONS_PER_MS.
 
-%% FoundationDB's transaction_too_old: a read at a version the storage servers no
-%% longer retain.
+%% Raises FoundationDB's `transaction_too_old` for a read at a version the storage
+%% servers would no longer keep.
 check_not_too_old(Name, RV) ->
     case current_version(Name) - RV > ?MAX_READ_TRANSACTION_LIFE_VERSIONS of
         true -> erlang:error({erlfdb_error, ?TRANSACTION_TOO_OLD});
@@ -295,11 +299,12 @@ create_transaction({dgen_mem_db, Name}) ->
 
 new_tx_state() ->
     #{
-        %% `undefined` means "assign lazily on first read or at commit", which is
-        %% how FDB's GRV works — a transaction that only writes never pays for one.
+        %% `undefined` means we assign it on the first read or at commit. FDB works
+        %% the same way, so a transaction that only writes never fetches a read
+        %% version.
         read_version => undefined,
-        %% Mutations in issue order. clear_range and set interleave, so a map keyed
-        %% by key would lose the ordering that decides the outcome.
+        %% Mutations, newest first. Sets and clear_ranges interleave, and their order
+        %% decides the outcome, so a map keyed by key would lose information.
         muts => [],
         read_conflicts => [],
         committed_version => undefined,
@@ -347,9 +352,9 @@ get_committed_version(Tx) ->
 
 -if(?DOCATTRS).
 -doc """
-Runs `Fun` in a transaction, retrying on retryable errors — the same contract as
-`erlfdb:transactional/2`. A transaction handle passed in is used directly, so
-nesting composes.
+Runs `Fun` in a transaction and retries it on retryable errors. This is the same
+contract as `erlfdb:transactional/2`. If you pass in a transaction handle, it is
+used directly, so nested calls work.
 """.
 -endif.
 -spec transactional(db() | tx(), fun((tx()) -> Result)) -> Result when Result :: term().
@@ -381,8 +386,8 @@ get(Tx = {dgen_mem_tx, Name, _}, Key) ->
     RV = read_version(Tx),
     check_not_too_old(Name, RV),
     add_read_conflict_range(Tx, Key, key_strinc(Key)),
-    %% Read-your-writes: the transaction's own uncommitted mutations shadow the
-    %% store, as they do in FDB.
+    %% The transaction reads its own writes. Its uncommitted mutations take
+    %% precedence over the store, as they do in FDB.
     case pending_value(tx_state(Tx), Key) of
         {ok, Value} -> ready(Value);
         cleared -> ready(not_found);
@@ -408,8 +413,8 @@ get_range(Tx = {dgen_mem_tx, Name, _}, StartKey, EndKey, Opts) ->
         Limit -> lists:sublist(Ordered, Limit)
     end.
 
-%% Every live key in [StartKey, EndKey) as of `RV`, with the transaction's own
-%% mutations overlaid.
+%% Returns every live key in [StartKey, EndKey) as of `RV`, with the transaction's
+%% own mutations applied on top.
 range_rows(Name, StartKey, EndKey, RV, S) ->
     Stored = [
         {K, V}
@@ -431,10 +436,10 @@ merge_rows(Stored, Pending) ->
     Cleared = [K || {K, cleared} <- Pending],
     lists:keysort(1, [{K, V} || {K, V} <- Merged, not lists:member(K, Cleared)]).
 
-%% Every stored key in [StartKey, EndKey). `ets:next/2` gives the first key
-%% *strictly greater* than its argument, so the start key has to be checked for
-%% membership separately — omitting that silently drops it from every range, which
-%% breaks single-key clear_range and, more quietly, read-conflict detection on a
+%% Returns every stored key in [StartKey, EndKey). `ets:next/2` returns the first
+%% key strictly greater than its argument, so we check the start key separately.
+%% Without that check the start key would silently drop out of every range. That
+%% breaks single-key clear_range and, less visibly, read-conflict detection on a
 %% key that exists.
 keys_in_range(Name, StartKey, EndKey) ->
     Tab = data_tab(Name),
@@ -452,8 +457,8 @@ keys_from(Tab, Key, EndKey, Acc) when Key < EndKey ->
 keys_from(_Tab, _Key, _EndKey, Acc) ->
     lists:reverse(Acc).
 
-%% The newest version at or before `RV`; `not_found` if the key did not exist then
-%% (or was cleared).
+%% Returns the newest value at or before `RV`. Returns `not_found` if the key didn't
+%% exist then or had been cleared.
 stored_value(Name, Key, RV) ->
     case ets:lookup(data_tab(Name), Key) of
         [] ->
@@ -468,18 +473,18 @@ stored_value(Name, Key, RV) ->
 value_or_not_found(cleared) -> not_found;
 value_or_not_found(Value) -> Value.
 
-%% What this transaction's own mutations say about a key.
+%% Returns what this transaction's own mutations say about a key.
 pending_value(#{muts := Muts}, Key) ->
     lists:foldl(
         fun
             ({set, K, V}, _Acc) when K =:= Key -> {ok, V};
-            %% A pending versionstamped write makes the key *unreadable* for the
-            %% rest of the transaction: its value is not decided until commit
-            %% assigns the stamp. FoundationDB raises accessed_unreadable (1036)
-            %% here, and matching that matters more than it might seem — falling
-            %% through to the last committed value instead returns a stale answer
-            %% silently, which is how a caller comparing a cached version against
-            %% this key gets a spurious match and serves stale state.
+            %% A pending versionstamped write makes the key unreadable for the
+            %% rest of the transaction, because its value isn't decided until the
+            %% commit assigns the stamp. FoundationDB raises accessed_unreadable
+            %% (1036) here, and matching that matters. If we fell through to the
+            %% last committed value instead, we would silently return a stale
+            %% answer. A caller comparing a cached version against this key would
+            %% then get a false match and serve stale state.
             ({vs_value, K, _}, _Acc) when K =:= Key -> unreadable;
             ({clear_range, S, E}, _Acc) when Key >= S, Key < E -> cleared;
             (_, Acc) -> Acc
@@ -536,17 +541,16 @@ stage(Tx, Mut) ->
 add_read_conflict_key(Tx, Key) ->
     add_read_conflict_range(Tx, Key, key_strinc(Key)).
 
-%% Every non-snapshot read records a read conflict, because that is what
-%% FoundationDB does — and it is load-bearing far more often than the explicit
+%% Every non-snapshot read records a read conflict, because FoundationDB does the
+%% same. Far more code depends on this than the few explicit
 %% `add_read_conflict_key/2` calls suggest.
 %%
-%% Across all of `dgen` there is exactly *one* explicit conflict: the registry's
-%% leader fence. Everything else relies on the implicit ones — most importantly
-%% `dgen_queue:peek_k/3`, where two consumers read the same pending items and the
-%% conflict is what stops both from consuming them. Without this, a backend offers
-%% no serializable isolation for any read-then-write, and the failures it produces
-%% (a double-consumed message, a lost increment) look nothing like a missing
-%% conflict range.
+%% Across all of `dgen` there is exactly one explicit conflict, the registry's
+%% leader fence. Everything else relies on the implicit ones. The most important is
+%% `dgen_queue:peek_k/3`. Two consumers can read the same pending items, and the
+%% conflict is what stops both of them from consuming them. Without it, no
+%% read-then-write would be serializable. The resulting failures, such as a message
+%% consumed twice or a lost increment, look nothing like a missing conflict range.
 -spec add_read_conflict_range(tx(), dgen_backend:key(), dgen_backend:key()) -> ok.
 add_read_conflict_range(Tx, StartKey, EndKey) ->
     update_tx(Tx, fun(S = #{read_conflicts := Rs}) ->
@@ -577,13 +581,13 @@ commit(Tx = {dgen_mem_tx, Name, _}) ->
         {error, Code} -> erlang:error({erlfdb_error, Code})
     end.
 
-%% Runs under the commit lock. Raising from here would escape before the lock's
-%% `after` clause has run in some orderings, so failures come back as a value and
-%% are raised by the caller once the lock is released.
+%% Runs under the commit lock. In some orderings, raising here would escape before
+%% the lock's `after` clause has run. So we return failures as a value, and the
+%% caller raises them once the lock is released.
 try_commit(_Tx, _Name, #{muts := []}, _RV) ->
-    %% A read-only transaction commits trivially and can never conflict — FDB
-    %% treats it as a no-op, and now that every read records a conflict range,
-    %% checking them here would fail read-only transactions for no reason.
+    %% A read-only transaction always commits and can never conflict. FDB treats
+    %% it as a no-op. Every read records a conflict range, so checking them here
+    %% would fail read-only transactions for no reason.
     ok;
 try_commit(Tx, Name, S, RV) ->
     case commit_fault(Name) of
@@ -602,14 +606,15 @@ try_commit(Tx, Name, S, RV) ->
     end.
 
 do_commit(Tx = {dgen_mem_tx, _, TxRef}, Name, S) ->
-    %% Strictly ahead of the last commit *and* of the clock — that is, of
-    %% `current_version/1`, which is what every read version already handed out was
-    %% drawn from. Equality there is not a rounding detail: both `has_conflict/3`
-    %% and `watch/3` ask whether a key was written *after* a read version, so a
-    %% commit landing exactly on one is a conflict that is not detected and a watch
-    %% that never fires. `max(Version + 1, Clock)` allowed exactly that whenever the
-    %% clock was ahead of the commit counter, which is most of the time.
-    %% Runs under the commit lock, so the read-modify-write is safe.
+    %% The commit version must be strictly ahead of both the last commit and the
+    %% clock. In other words, it must be ahead of `current_version/1`, which every
+    %% read version handed out so far came from. Landing exactly on a read version
+    %% is a real bug, not a rounding detail. Both `has_conflict/3` and `watch/3` ask
+    %% whether a key was written after a read version. A commit at that same
+    %% version would be a conflict we miss and a watch that never fires. An earlier
+    %% `max(Version + 1, Clock)` did exactly that whenever the clock was ahead of
+    %% the commit counter, which is most of the time. This runs under the commit
+    %% lock, so the read-modify-write is safe.
     Version = current_version(Name) + 1,
     ets:insert(meta_tab(Name), {version, Version}),
     Stamp = versionstamp(Version, 0),
@@ -619,23 +624,23 @@ do_commit(Tx = {dgen_mem_tx, _, TxRef}, Name, S) ->
     fire_watches(Name, Written, TxRef),
     ok.
 
-%% Serialise the commit critical section.
+%% Runs `Fun` while holding the commit lock, so commits happen one at a time.
 %%
 %% Checking the conflict ranges, assigning a version, and applying the mutations
-%% have to be one indivisible step. FoundationDB serialises commits; without the
-%% same guarantee here a second transaction slips into the gap and three things
-%% break, all of them quietly:
+%% have to be one indivisible step. FoundationDB serialises commits. Without the
+%% same guarantee here, a second transaction can slip into the gap, and three
+%% things break quietly.
 %%
-%%   - a conflict is missed, so a transaction that should have been fenced commits
-%%     — which is precisely the safety property the registry's leader fence rests
-%%     on (§5.1);
-%%   - `write/4`'s read-modify-write of a key's version list loses an entry;
-%%   - versions land out of order in that list, and `stored_value/3` takes the head
-%%     of the matching entries, so a read returns an *older* value than it should.
+%%   - A conflict is missed, so a transaction that should have been fenced
+%%     commits. The registry's leader fence depends on exactly this (§5.1).
+%%   - The read-modify-write of a key's version list in `write/4` loses an entry.
+%%   - Versions land out of order in that list. `stored_value/3` takes the first
+%%     matching entry, so a read returns an older value than it should.
 %%
-%% An ETS lock rather than a serialising process: a blocking call into a process
-%% reads as quiescence to `eta_sched`, so every commit would end a scheduling step.
-%% The critical section is pure in-memory work, so spinning is cheap.
+%% We use an ETS lock rather than a process that serialises commits. A blocking
+%% call into a process looks like quiescence to `eta_sched`, so every commit would
+%% end a scheduling step. The critical section is pure in-memory work, so spinning
+%% is cheap.
 with_commit_lock(Name, Fun) ->
     Tab = meta_tab(Name),
     case ets:insert_new(Tab, {commit_lock, self()}) of
@@ -650,14 +655,14 @@ with_commit_lock(Name, Fun) ->
             with_commit_lock(Name, Fun)
     end.
 
-%% A lock holder can die without releasing: `try ... after` does not run when a
-%% process is killed untrappably, and killing a process mid-flight is routine here
-%% — a simulated member crash is exactly that. Left alone, one such death wedges
-%% every subsequent commit in the VM, which presents as the whole suite hanging in
-%% an unrelated place.
+%% A lock holder can die without releasing the lock. `try ... after` doesn't run
+%% when a process is killed with an untrappable exit, and that happens routinely
+%% here, since a simulated member crash is exactly that. If we did nothing, one such
+%% death would block every later commit in the VM. It would look like the whole
+%% suite hanging somewhere unrelated.
 %%
-%% `delete_object/2` rather than `delete/2` so the reclaim can only remove the
-%% *dead* holder's lock, never one a live process has just taken.
+%% We use `delete_object/2` rather than `delete/2` so that we can only remove the
+%% dead holder's lock, never one a live process has just taken.
 reclaim_or_wait(Tab) ->
     case ets:lookup(Tab, commit_lock) of
         [{commit_lock, Holder}] ->
@@ -669,8 +674,8 @@ reclaim_or_wait(Tab) ->
             ok
     end.
 
-%% A read conflict is a key in a read-conflict range written after our read version
-%% — precisely the check the registry's leader fence relies on (§5.1).
+%% Returns whether any key in a read-conflict range was written after our read
+%% version. The registry's leader fence relies on this check (§5.1).
 has_conflict(_Name, [], _RV) ->
     false;
 has_conflict(Name, Ranges, RV) ->
@@ -736,14 +741,14 @@ add_to(Current, N) ->
     <<Cur:(Size * 8)/little-unsigned>> = Padded,
     <<((Cur + N) band ((1 bsl (Size * 8)) - 1)):(Size * 8)/little-unsigned>>.
 
-%% A 10-byte FDB versionstamp: 8-byte big-endian commit version, 2-byte batch
-%% order. The registry decodes this as a big-endian integer and shifts the batch
-%% bytes off to recover the commit version, so the layout has to match.
+%% Builds a 10-byte FDB versionstamp from an 8-byte big-endian commit version and a
+%% 2-byte batch order. The registry decodes it as a big-endian integer and shifts
+%% off the batch bytes to get the commit version, so the layout has to match.
 versionstamp(Version, Batch) ->
     <<Version:64/big-unsigned, Batch:16/big-unsigned>>.
 
-%% A versionstamped value carries a 10-byte placeholder plus a 4-byte little-endian
-%% offset saying where it sits.
+%% A versionstamped value carries a 10-byte placeholder, followed by a 4-byte
+%% little-endian offset that says where the placeholder is.
 substitute_stamp(Value, Stamp) when byte_size(Value) >= 14 ->
     Body = binary:part(Value, 0, byte_size(Value) - 4),
     <<Offset:32/little-unsigned>> = binary:part(Value, byte_size(Value) - 4, 4),
@@ -755,13 +760,15 @@ substitute_stamp(Value, _Stamp) ->
 
 -if(?DOCATTRS).
 -doc """
-The transaction's versionstamp, as a future that resolves **after** it commits.
+Returns the transaction's versionstamp as a future that resolves **after** the
+transaction commits.
 
-Laziness is not an optimisation here, it is the contract. Callers capture this
-future *before* committing and wait it afterwards — `set_mod_state/4` in `dgen_server`
-does exactly that to version its state cache. Resolving eagerly hands back the
-`undefined` that exists before a commit version has been assigned, and the cache
-then keys itself on a value that never matches, or worse, spuriously does.
+Resolving late isn't an optimisation here. It is the contract. Callers take this
+future before committing and wait on it afterwards. `set_mod_state/4` in
+`dgen_server` does exactly that to version its state cache. If we resolved it
+early, we would return `undefined`, because no commit version exists yet. The cache
+would then key itself on a value that never matches, or worse, one that matches by
+accident.
 """.
 -endif.
 -spec get_versionstamp(tx()) -> dgen_backend:future().
@@ -781,10 +788,10 @@ error_code(_) -> error.
 
 -if(?DOCATTRS).
 -doc """
-Resets a transaction for retry when `Code` is retryable, mirroring
-`erlfdb:on_error/2`: the returned future succeeds for a retryable error and raises
-otherwise. A reset drops staged mutations and conflict ranges, cancels the
-transaction's watches, and takes a fresh read version.
+Resets a transaction for a retry when `Code` is retryable, like
+`erlfdb:on_error/2`. For a retryable error it returns a future that succeeds.
+Otherwise it raises. A reset drops staged mutations and conflict ranges, cancels
+the transaction's watches, and takes a fresh read version.
 """.
 -endif.
 -spec on_error(tx(), integer()) -> dgen_backend:future().
@@ -820,8 +827,8 @@ roll(Name) ->
 %% Futures and watches
 %% ---------------------------------------------------------------------------
 
-%% Every read here is already resolved, so a future is just a box. Watches are the
-%% exception and carry a real ref.
+%% Every read here is already resolved, so a future just wraps the value. Watches
+%% are the exception and carry a real ref.
 ready(Value) -> {dgen_mem_future, Value}.
 
 -spec wait(dgen_backend:future()) -> term().
@@ -836,29 +843,28 @@ wait_for_all(Futures) -> [wait(F) || F <- Futures].
 
 -if(?DOCATTRS).
 -doc """
-Watches `Key`, firing `{Ref, ready}` at the watcher when its value changes.
+Watches `Key` and sends `{Ref, ready}` to the watcher when its value changes.
 
 **A watch is anchored to the transaction that creates it, not to the moment it is
 registered.** FoundationDB reports a change relative to the value the creating
-transaction would read, and getting that wrong is not a subtle infidelity — it is
-a silently lost wakeup:
+transaction would read. Getting that wrong silently loses a wakeup.
 
-- A write that lands *after* the transaction's read version but *before* the watch
-  is registered still fires it. `consume_queued/5` in `dgen_server` reads an empty queue
-  and then watches the push key; without this, a push committed in that window
-  leaves the consumer asleep on a queue that already has work, and the caller's
-  `call/4` in `dgen` times out with nothing wrong anywhere else. The check and the
-  registration run under the commit lock so no write can slip between them either.
+- A write that lands after the transaction's read version, but before the watch is
+  registered, still fires the watch. `consume_queued/5` in `dgen_server` reads an
+  empty queue and then watches the push key. Without this rule, a push committed in
+  between leaves the consumer asleep on a queue that already has work. The caller's
+  `call/4` in `dgen` then times out with nothing wrong anywhere else. The check and
+  the registration run under the commit lock, so no write can slip between them.
 
-- The creating transaction's *own* writes do not fire it — they are part of the
-  value it would read. `push_call/7` in `dgen` writes the reply sentinel and watches it
-  in one transaction; firing there costs a read-and-rewatch round trip on every
-  call, and that round trip is precisely the window the first case then loses a
-  reply in.
+- The creating transaction's own writes don't fire the watch, because they are part
+  of the value it would read. `push_call/7` in `dgen` writes the reply sentinel and
+  watches it in one transaction. Firing there would cost a read-and-rewatch round
+  trip on every call. That round trip is exactly the window in which the first case
+  loses a reply.
 
-Firing happens at registration rather than at commit, which is a deliberate
-simplification: a watch that fires early is safe here because every consumer
-re-reads the watched state before acting, whereas one that fires late is not.
+We fire at registration rather than at commit. This is a deliberate
+simplification. Firing early is safe here, because every consumer re-reads the
+watched state before acting. Firing late is not.
 """.
 -endif.
 -spec watch(tx(), dgen_backend:key()) -> dgen_backend:future().
@@ -873,8 +879,8 @@ watch(Tx = {dgen_mem_tx, Name, TxRef}, Key, Opts) ->
     with_commit_lock(Name, fun() ->
         case newest_version(Name, Key) > RV of
             true ->
-                %% Already changed out from under the transaction. Nothing later
-                %% will fire this, so fire it now.
+                %% The key already changed after the transaction's read version.
+                %% Nothing later will fire this watch, so we fire it now.
                 catch To ! {Ref, ready};
             false ->
                 ets:insert(watch_tab(Name), Entry),
@@ -884,7 +890,7 @@ watch(Tx = {dgen_mem_tx, Name, TxRef}, Key, Opts) ->
     {dgen_future, Ref, {dgen_mem_future, ok}}.
 
 %% Runs under the commit lock, as part of `do_commit/3`. `TxRef` is the committing
-%% transaction: its own writes leave its own watches armed and unfired.
+%% transaction. Its writes don't fire its own watches, which stay armed.
 fire_watches(Name, Keys, TxRef) ->
     lists:foreach(
         fun(Key) ->
@@ -903,8 +909,8 @@ fire_watches(Name, Keys, TxRef) ->
     ).
 
 %% Cancels a transaction's watches, as FoundationDB does when a transaction is
-%% reset. Without this a retried transaction leaves an armed watch behind for every
-%% attempt, each of which fires once and delivers to a caller that has moved on.
+%% reset. Without this, a retried transaction leaves an armed watch behind for every
+%% attempt. Each one later fires and delivers to a caller that has moved on.
 cancel_watches(Tx = {dgen_mem_tx, Name, _}) ->
     lists:foreach(
         fun(Entry) -> ets:delete_object(watch_tab(Name), Entry) end,
@@ -912,9 +918,10 @@ cancel_watches(Tx = {dgen_mem_tx, Name, _}) ->
     ),
     update_tx(Tx, fun(S) -> S#{watches := []} end).
 
-%% Drops a transaction that will never be used again. Only safe for one abandoned
-%% by `do_transactional/3`, which replaces it wholesale — `on_error/2` resets a
-%% transaction the caller still holds, so it resets state rather than removing it.
+%% Drops a transaction that will never be used again. This is only safe for a
+%% transaction that `do_transactional/3` abandons and replaces with a new one.
+%% `on_error/2` works on a transaction the caller still holds, so it resets the
+%% state instead of removing it.
 discard_tx(Tx = {dgen_mem_tx, Name, Ref}) ->
     cancel_watches(Tx),
     ets:delete(tx_tab(Name), Ref),
@@ -924,14 +931,14 @@ discard_tx(Tx = {dgen_mem_tx, Name, Ref}) ->
 %% Directory layer
 %% ---------------------------------------------------------------------------
 %%
-%% A directory is an `erlfdb_subspace` over a prefix this module allocates. Reusing
-%% erlfdb's (NIF-free) subspace and tuple modules means the key layout is byte-for-
-%% byte what the FoundationDB backend produces, so ordering — which `dgen_queue`'s
-%% FIFO depends on — is identical rather than merely similar.
+%% A directory is an `erlfdb_subspace` over a prefix this module chooses. We reuse
+%% erlfdb's subspace and tuple modules, which need no NIF. That makes the key
+%% layout byte-for-byte the same as the FoundationDB backend's, so key order is
+%% identical, not just similar. The FIFO in `dgen_queue` depends on that order.
 %%
-%% Prefixes are derived from the directory name rather than allocated from a
-%% counter, so the same directory name always yields the same keyspace. That is
-%% both simpler than FDB's allocator and better for replay.
+%% Prefixes come from the directory name rather than from a counter, so the same
+%% directory name always gives the same keyspace. That is simpler than FDB's
+%% allocator, and it makes runs easier to replay.
 
 -spec dir_range(dgen_backend:dir(), dgen_backend:tuple_key()) ->
     {dgen_backend:key(), dgen_backend:key()}.
@@ -966,8 +973,8 @@ to_bin(A) when is_atom(A) -> atom_to_binary(A, utf8).
 
 -if(?DOCATTRS).
 -doc """
-Opens a database and a root directory, mirroring `dgen_erlfdb:sandbox_open/2` so
-`DGen.Case` can swap backends without knowing which one it has.
+Opens a database and a root directory, like `dgen_erlfdb:sandbox_open/2`. This
+lets `DGen.Case` swap backends without knowing which one it has.
 """.
 -endif.
 -spec sandbox_open(term(), term()) -> dgen_backend:tenant().

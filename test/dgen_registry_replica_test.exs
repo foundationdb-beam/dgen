@@ -22,7 +22,7 @@ defmodule DGen.RegistryReplicaTest do
   defp reg(name, pid, index \\ %{}), do: {:name_registered, name, pid, index, nil}
   defp unreg(name, pid), do: {:name_unregistered, name, pid}
 
-  defp pids(r), do: Map.new(Replica.records(r), fn {n, {p, _, _}} -> {n, p} end)
+  defp pids(r), do: Map.new(Replica.get_records(r), fn {n, {p, _, _}} -> {n, p} end)
 
   setup do
     {:ok,
@@ -34,7 +34,7 @@ defmodule DGen.RegistryReplicaTest do
       r = replica(1, 10)
 
       assert {:applied, r} = Replica.offer_batch(1, 10, 20, [reg(:a, p1), reg(:b, p2)], r)
-      assert Replica.version(r) == 20
+      assert Replica.get_version(r) == 20
       assert pids(r) == %{a: p1, b: p2}
     end
 
@@ -45,19 +45,21 @@ defmodule DGen.RegistryReplicaTest do
       assert pids(r) == %{}
     end
 
-    test "a newer epoch's contiguous batch applies but does not raise the epoch", %{p1: p1} do
+    test "a newer epoch's batch is a gap, even when contiguous", %{p1: p1} do
+      # Only the new leader's snapshot moves us into its epoch. Applying its batch
+      # would let a held `yes` from our epoch be released by the new leader's
+      # versions.
       r = replica(1, 10)
 
-      assert {:applied, r} = Replica.offer_batch(2, 10, 20, [reg(:a, p1)], r)
-      assert Replica.epoch(r) == 1
-      assert Replica.version(r) == 20
+      assert :gap = Replica.offer_batch(2, 10, 20, [reg(:a, p1)], r)
+      assert :gap = Replica.offer_batch(2, 10, 10, [], r)
     end
 
     test "the heartbeat (an empty batch at {V, V}) is a no-op on a caught-up replica" do
       r = replica(1, 10)
 
       assert {:applied, r} = Replica.offer_batch(1, 10, 10, [], r)
-      assert Replica.version(r) == 10
+      assert Replica.get_version(r) == 10
     end
 
     test "metadata changes keep the inverted index in step", %{p1: p1} do
@@ -92,7 +94,7 @@ defmodule DGen.RegistryReplicaTest do
 
       assert :gap = Replica.offer_batch(1, 15, 20, [reg(:a, p1)], r)
       assert pids(r) == %{}
-      assert Replica.version(r) == 10
+      assert Replica.get_version(r) == 10
     end
 
     test "a heartbeat ahead of us reveals a lost tail" do
@@ -108,14 +110,14 @@ defmodule DGen.RegistryReplicaTest do
 
       assert {:accepted, r} = Replica.offer_snapshot(1, 20, %{b: {p2, %{}, nil}}, r)
       assert pids(r) == %{b: p2}
-      assert Replica.version(r) == 20
+      assert Replica.get_version(r) == 20
     end
 
     test "a newer epoch's snapshot sets the epoch", %{p1: p1} do
       r = replica(1, 10)
 
       assert {:accepted, r} = Replica.offer_snapshot(3, 10, %{a: {p1, %{}, nil}}, r)
-      assert Replica.epoch(r) == 3
+      assert Replica.get_epoch(r) == 3
     end
 
     test "a snapshot behind our version is refused — no rollback", %{p1: p1, p2: p2} do
@@ -143,7 +145,7 @@ defmodule DGen.RegistryReplicaTest do
       assert pids(r) == %{a: p2, c: p2}
       assert [] = Replica.query(r, {:all, %{k: 1}})
       assert [%{name: :a}] = Replica.query(r, {:all, %{k: 2}})
-      assert {Replica.epoch(r), Replica.version(r)} == {2, 20}
+      assert {Replica.get_epoch(r), Replica.get_version(r)} == {2, 20}
     end
   end
 
@@ -153,7 +155,7 @@ defmodule DGen.RegistryReplicaTest do
 
       r = Replica.commit(20, %{a: :clear}, %{}, %{}, r)
       assert pids(r) == %{b: p2}
-      assert Replica.version(r) == 20
+      assert Replica.get_version(r) == 20
     end
 
     test "a metadata-only op never resurrects an optimistically deleted row", %{p1: p1} do

@@ -2,49 +2,69 @@
 
 -define(DOCATTRS, ?OTP_RELEASE >= 27).
 
+-include("dgen_registry_member.hrl").
+
 -if(?DOCATTRS).
 -moduledoc false.
 -endif.
 
-%% The leader's write pipeline: every op it has accepted and not yet answered.
+%% Tracks the leader's writes, meaning every op it has accepted and not yet answered.
 %% `§N.N` refers to docs/design/dgen_registry_design.md.
 %%
-%% Phases, one field each:
-%%   queued      `pending`     waiting for the next group commit.
-%%   committing  `committing`  the single in-flight commit; arrivals ride the next one.
-%%   awaiting    `acks`        a committed direct registration waiting for a follower
-%%   holders                   copy before its `yes` (§5.5); the follower-side twin is
-%%                             an intent's `awaiting_version` (dgen_registry_intents).
-%% The member plans and applies the ops (plan_batch/4, apply_committed_plan/3).
+%% An op moves through these phases. Each phase has its own field:
 %%
-%% One surrender rule, surrender/2, for ops the leader cannot finish. `failed` (the
-%% commit did not land, or landed under a moved view) retries them; `deposed` hands
-%% them off by kind, by the same idempotence rule as the follower's intents:
-%%   add, local       becomes a follower intent, re-driven to the next leader.
-%%   add, forwarded   no reply: the forwarding follower re-drives its own intent.
-%%   set_meta         `{error, no_leader}`, also on failed: a replace is unsafe to re-send.
-%%   remove/retract   a waiting caller gets `ok`, also on failed; then an answered,
-%%                    pid-guarded unregister intent.
-%%   down             dropped: the next leader monitors the pid itself.
-%% So `no` stays an adjudicated refusal (§3), never "the leader could not finish".
+%%   queued      `pending`     Waiting for the next group commit.
+%%   committing  `committing`  The one commit in flight. New ops wait for the next one.
+%%   awaiting    `acks`        A committed direct registration. Before replying `yes`,
+%%   holders                   we wait until a follower holds a copy (§5.5). On the
+%%                             follower side, the matching phase is `awaiting_version`
+%%                             in dgen_registry_intents.
 %%
-%% Pure: surrender/2 returns effects for the member to carry out.
+%% The member plans and applies the ops itself, in plan_batch/4 and
+%% apply_committed_plan/3.
+%%
+%% surrender/2 decides what happens to ops the leader can't finish. With `failed`, the
+%% commit didn't land, or it landed under an older epoch, so we retry the ops.
+%% With `deposed`, we hand each op off according to its kind. The rules match the ones
+%% the follower uses for its intents:
+%%
+%%   add, local       Becomes a follower intent and is re-sent to the next leader.
+%%   add, forwarded   No reply. The follower that forwarded it re-sends its own intent.
+%%   set_meta         Replies `{error, no_leader}`, on `failed` too. It replaces the
+%%                    value, so re-sending it is unsafe.
+%%   remove/retract   A waiting caller gets `ok`, on `failed` too. The removal then
+%%                    continues as an already-answered unregister intent that only
+%%                    removes the name if the same pid still holds it.
+%%   down             Dropped, because the next leader monitors the pid itself.
+%%
+%% So `no` always means the name is taken (§3). It never means the leader couldn't
+%% finish.
+%%
+%% surrender/2 has no side effects. It returns effects for the member to carry out.
 %%
 %% *This documentation is LLM-generated. See the AI disclosure in README.md.*
 
--export([new/0, enqueue/2, num_pending/1, in_flight/1, take_batch/2, take_pending/1]).
--export([start/4, finish/2, worker_down/2, committed/2, read_version/1, new_term/1]).
--export([await_acks/5, ack/3, ack_timeout/2, take_acks/1]).
+-export([new/0, enqueue/2, get_num_pending/1, is_in_flight/1, take_batch/2, take_pending/1]).
+-export([
+    start_commit/4,
+    finish_commit/2,
+    handle_worker_down/2,
+    set_last_version/2,
+    get_read_version/1,
+    start_new_term/1
+]).
+-export([await_acks/5, record_ack/3, handle_ack_timeout/2, take_acks/1]).
 -export([surrender/2]).
 
--export_type([t/0, op/0, origin/0, effect/0]).
+-export_type([t/0, op/0, origin/0, direct/0, effect/0]).
 
 -type member_id() :: dgen_registry_elector:member_id().
 -type from() :: gen_server:from().
 
-%% Where an op came from, so how to answer it: plain variants are direct calls answered
-%% via `From`; `forward*` ones get a `{register_reply | set_meta_reply |
-%% unregister_reply, Ref, ...}` cast to the forwarding member.
+%% Where an op came from, which tells us how to answer it. The plain variants are
+%% direct calls, answered through `From`. For the `forward*` variants we cast a
+%% `{register_reply | set_meta_reply | unregister_reply, Ref, ...}` to the forwarding
+%% member.
 -type origin() ::
     {local, from()}
     | {forward, member_id(), reference()}
@@ -53,10 +73,11 @@
     | {unreg, from()}
     | {forward_unreg, member_id(), reference()}.
 
-%% A leader write op. A batch rides one fenced commit and applies in arrival order, so
-%% it equals one-at-a-time processing. `remove`'s ReleasedPid is captured before the
-%% optimistic local delete; when set it drives the durable clear and feeds the
-%% conflict trail (§5.6). `down` is Ref-guarded against a stale DOWN.
+%% A write op on the leader. A batch goes through one fenced commit and is applied in
+%% arrival order, so the result is the same as processing ops one at a time. For
+%% `remove`, we capture `ReleasedPid` before the optimistic local delete. When it is
+%% set, it drives the durable clear and is added to the conflict trail (§5.6). `down`
+%% carries the monitor reference, so we can ignore a stale DOWN.
 -type op() ::
     {add, Name :: term(), pid(), Meta :: {map(), term()}, origin()}
     | {set_meta, Name :: term(), Index :: map(), Data :: term(), origin()}
@@ -64,32 +85,16 @@
     | {retract, Name :: term(), pid()}
     | {down, Name :: term(), reference()}.
 
-%% Awaiting holders: origin plus binding, so a fail-closed timeout can retract it.
+%% A registration awaiting holders. We keep the binding along with the origin, so that
+%% under strict replication a timed-out wait can retract the binding and refuse the
+%% call.
 -type direct() :: {origin(), Name :: term(), pid()}.
 
--record(pipeline, {
-    pending = queue:new() :: queue:queue(op()),
-    num_pending = 0 :: non_neg_integer(),
-    %% Monitored so a worker dying without a result cannot wedge the pipeline.
-    committing = undefined :: undefined | #{ref := reference(), mref := reference(), plan := map()},
-    %% Pinned as the next read version to skip a GRV; if stale, the worker retries.
-    last_version = undefined :: undefined | integer(),
-    %% BatchRef => {Seq, Direct, TimerRef, Needed, Acked}. Answered in Seq order, never
-    %% reference order, so simulated schedules are reproducible.
-    acks = #{} :: #{
-        reference() =>
-            {non_neg_integer(), [direct()], reference(), non_neg_integer(), #{
-                member_id() => true
-            }}
-    },
-    next_ack_seq = 0 :: non_neg_integer()
-}).
-
--opaque t() :: #pipeline{}.
+-type t() :: #pipeline{}.
 
 -type effect() ::
     {reply, origin(), term()}
-    %% Hand the kind to the follower-side intents (dgen_registry_intents:submit/5).
+    %% Hand the request to the follower-side intents (dgen_registry_intents:submit/5).
     | {intent, dgen_registry_intents:kind(), from() | answered}
     | {retry, [op()]}.
 
@@ -104,14 +109,15 @@ new() -> #pipeline{}.
 enqueue(Op, P = #pipeline{pending = Q, num_pending = N}) ->
     P#pipeline{pending = queue:in(Op, Q), num_pending = N + 1}.
 
--spec num_pending(t()) -> non_neg_integer().
-num_pending(#pipeline{num_pending = N}) -> N.
+-spec get_num_pending(t()) -> non_neg_integer().
+get_num_pending(#pipeline{num_pending = N}) -> N.
 
--spec in_flight(t()) -> boolean().
-in_flight(#pipeline{committing = C}) -> C =/= undefined.
+-spec is_in_flight(t()) -> boolean().
+is_in_flight(#pipeline{committing = C}) -> C =/= undefined.
 
-%% Take up to `Max` oldest ops. The bound keeps a burst (a DOWN flood) from becoming
-%% one huge commit whose plan/apply/broadcast would freeze the loop.
+%% Takes up to `Max` of the oldest ops. The limit keeps a burst, such as a flood of
+%% DOWNs, from turning into one huge commit whose planning, applying and broadcasting
+%% would freeze the loop.
 -spec take_batch(pos_integer(), t()) -> {[op()], t()}.
 take_batch(Max, P = #pipeline{pending = Q, num_pending = N}) ->
     Size = min(N, Max),
@@ -132,32 +138,34 @@ take_n(Q, N, Acc) ->
 %% Committing
 %% ---------------------------------------------------------------------------
 
--spec start(reference(), reference(), map(), t()) -> t().
-start(Ref, MRef, Plan, P = #pipeline{committing = undefined}) ->
+-spec start_commit(reference(), reference(), map(), t()) -> t().
+start_commit(Ref, MRef, Plan, P = #pipeline{committing = undefined}) ->
     P#pipeline{committing = #{ref => Ref, mref => MRef, plan => Plan}}.
 
--spec finish(reference(), t()) -> {ok, map(), reference(), t()} | stale.
-finish(Ref, P = #pipeline{committing = #{ref := Ref, mref := MRef, plan := Plan}}) ->
+-spec finish_commit(reference(), t()) -> {ok, map(), reference(), t()} | stale.
+finish_commit(Ref, P = #pipeline{committing = #{ref := Ref, mref := MRef, plan := Plan}}) ->
     {ok, Plan, MRef, P#pipeline{committing = undefined}};
-finish(_Ref, _P) ->
+finish_commit(_Ref, _P) ->
     stale.
 
-%% A monitored process died: if it is the commit worker, release the slot.
--spec worker_down(reference(), t()) -> {ok, map(), t()} | stale.
-worker_down(MRef, P = #pipeline{committing = #{mref := MRef, plan := Plan}}) ->
+%% Handles the death of a monitored process. If it was the commit worker, we free the
+%% commit slot.
+-spec handle_worker_down(reference(), t()) -> {ok, map(), t()} | stale.
+handle_worker_down(MRef, P = #pipeline{committing = #{mref := MRef, plan := Plan}}) ->
     {ok, Plan, P#pipeline{committing = undefined}};
-worker_down(_MRef, _P) ->
+handle_worker_down(_MRef, _P) ->
     stale.
 
--spec committed(integer(), t()) -> t().
-committed(Version, P) -> P#pipeline{last_version = Version}.
+-spec set_last_version(integer(), t()) -> t().
+set_last_version(Version, P) -> P#pipeline{last_version = Version}.
 
--spec read_version(t()) -> undefined | integer().
-read_version(#pipeline{last_version = V}) -> V.
+-spec get_read_version(t()) -> undefined | integer().
+get_read_version(#pipeline{last_version = V}) -> V.
 
-%% The cached version belongs to the ended term: never pin a later term's read to it.
--spec new_term(t()) -> t().
-new_term(P) -> P#pipeline{last_version = undefined}.
+%% Clears the cached version, because it belongs to the term that just ended. A later
+%% term must never pin its read version to it.
+-spec start_new_term(t()) -> t().
+start_new_term(P) -> P#pipeline{last_version = undefined}.
 
 %% ---------------------------------------------------------------------------
 %% Awaiting holders
@@ -169,10 +177,11 @@ await_acks(BatchRef, Direct, TimerRef, Needed, P = #pipeline{acks = A, next_ack_
         acks = A#{BatchRef => {Seq, Direct, TimerRef, Needed, #{}}}, next_ack_seq = Seq + 1
     }.
 
-%% Distinct followers count once; at `Needed` the batch's direct registrations are done.
--spec ack(reference(), member_id(), t()) ->
+%% Records an ack from `Follower`. Each follower counts once. When `Needed` followers
+%% have acked, the batch's direct registrations are done.
+-spec record_ack(reference(), member_id(), t()) ->
     {done, [direct()], reference(), t()} | {waiting, t()}.
-ack(BatchRef, Follower, P = #pipeline{acks = A}) ->
+record_ack(BatchRef, Follower, P = #pipeline{acks = A}) ->
     case A of
         #{BatchRef := {Seq, Direct, TimerRef, Needed, Acked}} ->
             Acked1 = Acked#{Follower => true},
@@ -187,9 +196,9 @@ ack(BatchRef, Follower, P = #pipeline{acks = A}) ->
             {waiting, P}
     end.
 
--spec ack_timeout(reference(), t()) ->
+-spec handle_ack_timeout(reference(), t()) ->
     {expired, [direct()], non_neg_integer(), non_neg_integer(), t()} | none.
-ack_timeout(BatchRef, P = #pipeline{acks = A}) ->
+handle_ack_timeout(BatchRef, P = #pipeline{acks = A}) ->
     case maps:take(BatchRef, A) of
         {{_Seq, Direct, _TimerRef, Needed, Acked}, A1} ->
             {expired, Direct, Needed, map_size(Acked), P#pipeline{acks = A1}};
@@ -197,7 +206,7 @@ ack_timeout(BatchRef, P = #pipeline{acks = A}) ->
             none
     end.
 
-%% Every batch still awaiting holders, in arrival order.
+%% Takes every batch still awaiting holders, in arrival order.
 -spec take_acks(t()) ->
     {[{[direct()], reference(), non_neg_integer(), non_neg_integer()}], t()}.
 take_acks(P = #pipeline{acks = A}) ->
@@ -211,7 +220,7 @@ take_acks(P = #pipeline{acks = A}) ->
 %% Exits
 %% ---------------------------------------------------------------------------
 
-%% Effects come out in op order.
+%% Returns the effects in op order.
 -spec surrender(failed | deposed, [op()]) -> [effect()].
 surrender(failed, Ops) ->
     {Replies, Retry} = lists:foldl(
@@ -232,26 +241,27 @@ surrender(failed, Ops) ->
             _ -> [{retry, lists:reverse(Retry)}]
         end;
 surrender(deposed, Ops) ->
-    lists:flatmap(fun deposed/1, Ops).
+    lists:flatmap(fun get_deposed_effects/1, Ops).
 
-deposed({add, Name, Pid, Meta, {local, From}}) ->
+get_deposed_effects({add, Name, Pid, Meta, {local, From}}) ->
     [{intent, {register, Name, Pid, Meta}, From}];
-deposed({add, _Name, _Pid, _Meta, _Forwarded}) ->
+get_deposed_effects({add, _Name, _Pid, _Meta, _Forwarded}) ->
     [];
-deposed({set_meta, _Name, _Index, _Data, Origin}) ->
+get_deposed_effects({set_meta, _Name, _Index, _Data, Origin}) ->
     [{reply, Origin, {error, no_leader}}];
-deposed({remove, Name, Pid, Origin}) ->
+get_deposed_effects({remove, Name, Pid, Origin}) ->
     Reply =
         case Origin of
             undefined -> [];
             _ -> [{reply, Origin, ok}]
         end,
-    Reply ++ retract(Name, Pid);
-deposed({retract, Name, Pid}) ->
-    retract(Name, Pid);
-deposed({down, _Name, _Ref}) ->
+    Reply ++ get_retract_effects(Name, Pid);
+get_deposed_effects({retract, Name, Pid}) ->
+    get_retract_effects(Name, Pid);
+get_deposed_effects({down, _Name, _Ref}) ->
     [].
 
-%% Nothing was bound when an unregister was asked: nothing to retract.
-retract(_Name, undefined) -> [];
-retract(Name, Pid) -> [{intent, {unregister, Name, Pid}, answered}].
+%% The name wasn't bound when the caller asked to unregister, so there's nothing to
+%% retract.
+get_retract_effects(_Name, undefined) -> [];
+get_retract_effects(Name, Pid) -> [{intent, {unregister, Name, Pid}, answered}].

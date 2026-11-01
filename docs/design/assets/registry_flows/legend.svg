@@ -1,0 +1,39 @@
+<svg class="legend" viewBox="0 0 280 172" width="280" role="img" aria-label="Legend for arrow styles" xmlns="http://www.w3.org/2000/svg"><style>
+:root{--surface:#ffffff;--fg:#1a2226;--muted:#5a676d;--rule:#c9d2d5;--lane:#e6ecee;
+--accent:#0a6a86;--durable:#8c5a06;--warn:#b0281f;--note:#f8f4e6;--note-rule:#c9b98a}
+@media (prefers-color-scheme: dark){:root{--surface:#172024;--fg:#e1e8ea;--muted:#97a5ab;
+--rule:#33424a;--lane:#1e2a30;--accent:#56c2df;--durable:#e2ab52;--warn:#ff8074;
+--note:#23241d;--note-rule:#6d6440}}
+.bg{fill:var(--surface)}
+.leg-t{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:12px;fill:var(--fg)}
+.life{stroke:var(--rule);stroke-width:1;stroke-dasharray:3 4}
+.lane-head{fill:var(--lane);stroke:var(--rule)}
+.lane-n{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-weight:600;font-size:13.5px;fill:var(--fg)}
+.lane-s,.lbl,.phase-t,.num{font-family:ui-monospace,"SF Mono",Menlo,Consolas,"DejaVu Sans Mono",monospace}
+.lane-s{font-size:10.5px;fill:var(--muted)}
+.ln{stroke-width:1.4;fill:none}
+.lbl{font-size:11px;paint-order:stroke;stroke-width:4px;stroke-linejoin:round}
+.m-cast,.m-call{stroke:var(--fg);fill:var(--fg)}
+.m-reply{stroke:var(--muted);fill:var(--muted)}
+.ln.m-reply{stroke-dasharray:5 4}
+.m-db{stroke:var(--durable);fill:var(--durable)}
+.ln.m-db{stroke-dasharray:1.5 3;stroke-width:1.8;stroke-linecap:round}
+.m-signal{stroke:var(--warn);fill:var(--warn)}
+.accent{stroke:var(--accent);fill:var(--accent)}
+.ln.accent{stroke-width:2.2}
+.lbl{stroke:var(--surface)}
+.lbl.accent{font-weight:600}
+.head,.dot{stroke:none}
+.lost{stroke:var(--warn);stroke-width:2;fill:none;stroke-linecap:round}
+.act{fill:var(--surface);stroke:var(--rule)}
+.act.warn{stroke:var(--warn)}
+.act-t,.note-t{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:11.5px;fill:var(--fg)}
+.act-t.warn{fill:var(--warn)}
+.note{fill:var(--note);stroke:var(--note-rule);stroke-dasharray:4 3}
+.note-t{font-style:italic}
+.phase-ln{stroke:var(--rule);stroke-width:1}
+.phase-bg{fill:var(--surface)}
+.phase-t{font-size:10.5px;letter-spacing:.08em;fill:var(--muted)}
+.num-dot{fill:none;stroke:var(--rule)}
+.num{font-size:10px;fill:var(--muted)}
+</style><rect class="bg" width="100%" height="100%"/><line class="ln m-cast" x1="4" y1="14" x2="44" y2="14"/><polygon class="head m-cast" points="52,14 44,9.5 44,18.5"/><text class="leg-t" x="60" y="18">cast (async)</text><line class="ln m-call" x1="4" y1="38" x2="44" y2="38"/><polygon class="head m-call" points="52,38 44,33.5 44,42.5"/><circle class="dot m-call" cx="4" cy="38" r="3.2"/><text class="leg-t" x="60" y="42">call (waits for a reply)</text><line class="ln m-reply" x1="4" y1="62" x2="44" y2="62"/><polygon class="head m-reply" points="52,62 44,57.5 44,66.5"/><text class="leg-t" x="60" y="66">reply</text><line class="ln m-db" x1="4" y1="86" x2="44" y2="86"/><polygon class="head m-db" points="52,86 44,81.5 44,90.5"/><text class="leg-t" x="60" y="90">durable: backend or elector queue</text><line class="ln m-signal" x1="4" y1="110" x2="44" y2="110"/><polygon class="head m-signal" points="52,110 44,105.5 44,114.5"/><text class="leg-t" x="60" y="114">monitor signal</text><line class="ln m-cast accent" x1="4" y1="134" x2="44" y2="134"/><polygon class="head m-cast accent" points="52,134 44,129.5 44,138.5"/><text class="leg-t" x="60" y="138">the hop the flow is about</text><line class="ln m-cast" x1="4" y1="158" x2="30" y2="158"/><path class="lost" d="M25,153 L35,163 M35,153 L25,163"/><text class="leg-t" x="60" y="162">message lost or delayed</text></svg>

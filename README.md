@@ -73,8 +73,8 @@ end
   configuration.
 - [formal/README.md](formal/README.md) — the TLA+ model of `dgen_registry`'s
   replication protocol.
-- [test/support/sim/README.md](test/support/sim/README.md) — deterministic
-  simulation testing of `dgen_registry` against the same invariants, driven by
+- [test/support/sim/dgen_registry_simulation.md](test/support/sim/dgen_registry_simulation.md)
+  — deterministic simulation testing of `dgen_registry` against the same invariants, driven by
   [`eta`](https://hexdocs.pm/eta).
 - API reference and getting-started guides: <https://hexdocs.pm/dgen>.
 - [CHANGELOG.md](CHANGELOG.md) — release notes.

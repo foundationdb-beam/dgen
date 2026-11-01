@@ -63,7 +63,7 @@ defmodule DGen.RegistryGuaranteesTest do
   # The member's current applied version, read through the same snapshot call the
   # handoff gather uses, so tests can craft contiguous (or gapped) broadcasts.
   defp applied_version(member) do
-    {_records, version, _released} = GenServer.call(member, :get_names_snapshot)
+    {_records, version, _released, _leader_down} = GenServer.call(member, :get_names_snapshot)
     version
   end
 

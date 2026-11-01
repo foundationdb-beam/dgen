@@ -63,7 +63,7 @@ defmodule DGen.Sim.RegistryHarness do
   machine; the last one only showed up with several simulation suites running at
   once, because what it turned on was how much real time a run took.
 
-  1. **`dgen_registry_member:telemetry_available/0`.** `code:ensure_loaded/1`
+  1. **`dgen_registry_member:is_telemetry_available/0`.** `code:ensure_loaded/1`
      short-circuits on a loaded module but not on a missing one, so the first
      telemetry event in a VM was a synchronous call into `code_server` — a process
      the scheduler does not own — from inside a member. Resolved in `init/1` now,

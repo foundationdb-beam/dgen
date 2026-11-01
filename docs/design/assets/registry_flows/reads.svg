@@ -1,0 +1,95 @@
+<svg viewBox="0 0 1020 521" width="1020" role="img" aria-label="A snapshot read is a lock-free ETS lookup with no messages. A consistent read goes to the leader, and a helper checks the durable leader key before it replies to the caller directly." xmlns="http://www.w3.org/2000/svg"><style>
+:root{--surface:#ffffff;--fg:#1a2226;--muted:#5a676d;--rule:#c9d2d5;--lane:#e6ecee;
+--accent:#0a6a86;--durable:#8c5a06;--warn:#b0281f;--note:#f8f4e6;--note-rule:#c9b98a}
+@media (prefers-color-scheme: dark){:root{--surface:#172024;--fg:#e1e8ea;--muted:#97a5ab;
+--rule:#33424a;--lane:#1e2a30;--accent:#56c2df;--durable:#e2ab52;--warn:#ff8074;
+--note:#23241d;--note-rule:#6d6440}}
+.bg{fill:var(--surface)}
+.leg-t{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:12px;fill:var(--fg)}
+.life{stroke:var(--rule);stroke-width:1;stroke-dasharray:3 4}
+.lane-head{fill:var(--lane);stroke:var(--rule)}
+.lane-n{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-weight:600;font-size:13.5px;fill:var(--fg)}
+.lane-s,.lbl,.phase-t,.num{font-family:ui-monospace,"SF Mono",Menlo,Consolas,"DejaVu Sans Mono",monospace}
+.lane-s{font-size:10.5px;fill:var(--muted)}
+.ln{stroke-width:1.4;fill:none}
+.lbl{font-size:11px;paint-order:stroke;stroke-width:4px;stroke-linejoin:round}
+.m-cast,.m-call{stroke:var(--fg);fill:var(--fg)}
+.m-reply{stroke:var(--muted);fill:var(--muted)}
+.ln.m-reply{stroke-dasharray:5 4}
+.m-db{stroke:var(--durable);fill:var(--durable)}
+.ln.m-db{stroke-dasharray:1.5 3;stroke-width:1.8;stroke-linecap:round}
+.m-signal{stroke:var(--warn);fill:var(--warn)}
+.accent{stroke:var(--accent);fill:var(--accent)}
+.ln.accent{stroke-width:2.2}
+.lbl{stroke:var(--surface)}
+.lbl.accent{font-weight:600}
+.head,.dot{stroke:none}
+.lost{stroke:var(--warn);stroke-width:2;fill:none;stroke-linecap:round}
+.act{fill:var(--surface);stroke:var(--rule)}
+.act.warn{stroke:var(--warn)}
+.act-t,.note-t{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:11.5px;fill:var(--fg)}
+.act-t.warn{fill:var(--warn)}
+.note{fill:var(--note);stroke:var(--note-rule);stroke-dasharray:4 3}
+.note-t{font-style:italic}
+.phase-ln{stroke:var(--rule);stroke-width:1}
+.phase-bg{fill:var(--surface)}
+.phase-t{font-size:10.5px;letter-spacing:.08em;fill:var(--muted)}
+.num-dot{fill:none;stroke:var(--rule)}
+.num{font-size:10px;fill:var(--muted)}
+</style><rect class="bg" width="100%" height="100%"/>
+<line class="life" x1="121.0" y1="52" x2="121.0" y2="515"/>
+<rect class="lane-head" x="48.0" y="4" width="146" height="46" rx="6"/><text class="lane-n" x="121.0" y="24" text-anchor="middle">Caller</text><text class="lane-s" x="121.0" y="40" text-anchor="middle">any process</text>
+<line class="life" x1="283.0" y1="52" x2="283.0" y2="515"/>
+<rect class="lane-head" x="210.0" y="4" width="146" height="46" rx="6"/><text class="lane-n" x="283.0" y="24" text-anchor="middle">Names table</text><text class="lane-s" x="283.0" y="40" text-anchor="middle">local ETS</text>
+<line class="life" x1="445.0" y1="52" x2="445.0" y2="515"/>
+<rect class="lane-head" x="372.0" y="4" width="146" height="46" rx="6"/><text class="lane-n" x="445.0" y="24" text-anchor="middle">Follower</text><text class="lane-s" x="445.0" y="40" text-anchor="middle">member</text>
+<line class="life" x1="607.0" y1="52" x2="607.0" y2="515"/>
+<rect class="lane-head" x="534.0" y="4" width="146" height="46" rx="6"/><text class="lane-n" x="607.0" y="24" text-anchor="middle">Leader</text><text class="lane-s" x="607.0" y="40" text-anchor="middle">member</text>
+<line class="life" x1="769.0" y1="52" x2="769.0" y2="515"/>
+<rect class="lane-head" x="696.0" y="4" width="146" height="46" rx="6"/><text class="lane-n" x="769.0" y="24" text-anchor="middle">Helper</text><text class="lane-s" x="769.0" y="40" text-anchor="middle">spawned process</text>
+<line class="life" x1="931.0" y1="52" x2="931.0" y2="515"/>
+<rect class="lane-head" x="858.0" y="4" width="146" height="46" rx="6"/><text class="lane-n" x="931.0" y="24" text-anchor="middle">Backend</text><text class="lane-s" x="931.0" y="40" text-anchor="middle">FDB keys</text>
+<line class="phase-ln" x1="10" y1="92" x2="1016" y2="92"/>
+<rect class="phase-bg" x="10" y="83" width="112.6" height="18"/><text class="phase-t" x="16" y="96">WHEREIS_NAME/1</text>
+<line class="ln m-call" x1="121.0" y1="128" x2="275.0" y2="128"/>
+<circle class="dot m-call" cx="121.0" cy="128" r="3.2"/>
+<polygon class="head m-call" points="283.0,128.0 275.0,123.5 275.0,132.5"/>
+<text class="lbl m-call" x="202.0" y="121" text-anchor="middle">ets:lookup(Table, Name)</text>
+<circle class="num-dot" cx="18" cy="124.0" r="9"/><text class="num" x="18" y="127.5" text-anchor="middle">1</text>
+<line class="ln m-reply" x1="283.0" y1="162" x2="129.0" y2="162"/>
+<polygon class="head m-reply" points="121.0,162.0 129.0,157.5 129.0,166.5"/>
+<text class="lbl m-reply" x="202.0" y="155" text-anchor="middle">Pid or undefined</text>
+<circle class="num-dot" cx="18" cy="158.0" r="9"/><text class="num" x="18" y="161.5" text-anchor="middle">2</text>
+<line class="phase-ln" x1="10" y1="194" x2="1016" y2="194"/>
+<rect class="phase-bg" x="10" y="185" width="333.4" height="18"/><text class="phase-t" x="16" y="198">WHEREIS_NAME_CONSISTENT/1 ON A FOLLOWER&#x27;S NODE</text>
+<line class="ln m-call" x1="121.0" y1="230" x2="437.0" y2="230"/>
+<circle class="dot m-call" cx="121.0" cy="230" r="3.2"/>
+<polygon class="head m-call" points="445.0,230.0 437.0,225.5 437.0,234.5"/>
+<text class="lbl m-call" x="283.0" y="223" text-anchor="middle">{whereis, Name}</text>
+<circle class="num-dot" cx="18" cy="226.0" r="9"/><text class="num" x="18" y="229.5" text-anchor="middle">3</text>
+<line class="ln m-cast" x1="445.0" y1="264" x2="599.0" y2="264"/>
+<polygon class="head m-cast" points="607.0,264.0 599.0,259.5 599.0,268.5"/>
+<text class="lbl m-cast" x="526.0" y="257" text-anchor="middle">{whereis_req, Name, From}</text>
+<circle class="num-dot" cx="18" cy="260.0" r="9"/><text class="num" x="18" y="263.5" text-anchor="middle">4</text>
+<rect class="act " x="489.0" y="282" width="236.0" height="25" rx="5"/>
+<text class="act-t " x="607.0" y="298" text-anchor="middle">Reads the value from its replica now</text>
+<line class="ln m-cast" x1="607.0" y1="333" x2="761.0" y2="333"/>
+<polygon class="head m-cast" points="769.0,333.0 761.0,328.5 761.0,337.5"/>
+<text class="lbl m-cast" x="688.0" y="326" text-anchor="middle">spawn verify_leader(L, E)</text>
+<circle class="num-dot" cx="18" cy="329.0" r="9"/><text class="num" x="18" y="332.5" text-anchor="middle">5</text>
+<line class="ln m-db" x1="769.0" y1="367" x2="923.0" y2="367"/>
+<polygon class="head m-db" points="931.0,367.0 923.0,362.5 923.0,371.5"/>
+<text class="lbl m-db" x="850.0" y="360" text-anchor="middle">read leader key</text>
+<circle class="num-dot" cx="18" cy="363.0" r="9"/><text class="num" x="18" y="366.5" text-anchor="middle">6</text>
+<line class="ln m-reply" x1="931.0" y1="401" x2="777.0" y2="401"/>
+<polygon class="head m-reply" points="769.0,401.0 777.0,396.5 777.0,405.5"/>
+<text class="lbl m-reply" x="850.0" y="394" text-anchor="middle">{L, E}</text>
+<circle class="num-dot" cx="18" cy="397.0" r="9"/><text class="num" x="18" y="400.5" text-anchor="middle">7</text>
+<line class="ln m-reply accent" x1="769.0" y1="435" x2="129.0" y2="435"/>
+<polygon class="head m-reply accent" points="121.0,435.0 129.0,430.5 129.0,439.5"/>
+<text class="lbl m-reply accent" x="445.0" y="428" text-anchor="middle">gen_server:reply(From, Pid)</text>
+<circle class="num-dot" cx="18" cy="431.0" r="9"/><text class="num" x="18" y="434.5" text-anchor="middle">8</text>
+<rect class="note" x="50.0" y="455" width="466.0" height="42" rx="4"/>
+<text class="note-t" x="62.0" y="472">If the leader is unreachable, F answers undefined itself. If the key</text>
+<text class="note-t" x="62.0" y="487">shows another leader, the helper answers undefined.</text>
+</svg>

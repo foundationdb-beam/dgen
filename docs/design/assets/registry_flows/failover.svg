@@ -1,0 +1,125 @@
+<svg viewBox="0 0 1044 848" width="1044" role="img" aria-label="When the leader dies, survivors report it to the elector, which elects a new leader in a new epoch. The new leader gathers every replica, waits until it has caught up to the durable version, and sends each member a snapshot in the new epoch." xmlns="http://www.w3.org/2000/svg"><style>
+:root{--surface:#ffffff;--fg:#1a2226;--muted:#5a676d;--rule:#c9d2d5;--lane:#e6ecee;
+--accent:#0a6a86;--durable:#8c5a06;--warn:#b0281f;--note:#f8f4e6;--note-rule:#c9b98a}
+@media (prefers-color-scheme: dark){:root{--surface:#172024;--fg:#e1e8ea;--muted:#97a5ab;
+--rule:#33424a;--lane:#1e2a30;--accent:#56c2df;--durable:#e2ab52;--warn:#ff8074;
+--note:#23241d;--note-rule:#6d6440}}
+.bg{fill:var(--surface)}
+.leg-t{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:12px;fill:var(--fg)}
+.life{stroke:var(--rule);stroke-width:1;stroke-dasharray:3 4}
+.lane-head{fill:var(--lane);stroke:var(--rule)}
+.lane-n{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-weight:600;font-size:13.5px;fill:var(--fg)}
+.lane-s,.lbl,.phase-t,.num{font-family:ui-monospace,"SF Mono",Menlo,Consolas,"DejaVu Sans Mono",monospace}
+.lane-s{font-size:10.5px;fill:var(--muted)}
+.ln{stroke-width:1.4;fill:none}
+.lbl{font-size:11px;paint-order:stroke;stroke-width:4px;stroke-linejoin:round}
+.m-cast,.m-call{stroke:var(--fg);fill:var(--fg)}
+.m-reply{stroke:var(--muted);fill:var(--muted)}
+.ln.m-reply{stroke-dasharray:5 4}
+.m-db{stroke:var(--durable);fill:var(--durable)}
+.ln.m-db{stroke-dasharray:1.5 3;stroke-width:1.8;stroke-linecap:round}
+.m-signal{stroke:var(--warn);fill:var(--warn)}
+.accent{stroke:var(--accent);fill:var(--accent)}
+.ln.accent{stroke-width:2.2}
+.lbl{stroke:var(--surface)}
+.lbl.accent{font-weight:600}
+.head,.dot{stroke:none}
+.lost{stroke:var(--warn);stroke-width:2;fill:none;stroke-linecap:round}
+.act{fill:var(--surface);stroke:var(--rule)}
+.act.warn{stroke:var(--warn)}
+.act-t,.note-t{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:11.5px;fill:var(--fg)}
+.act-t.warn{fill:var(--warn)}
+.note{fill:var(--note);stroke:var(--note-rule);stroke-dasharray:4 3}
+.note-t{font-style:italic}
+.phase-ln{stroke:var(--rule);stroke-width:1}
+.phase-bg{fill:var(--surface)}
+.phase-t{font-size:10.5px;letter-spacing:.08em;fill:var(--muted)}
+.num-dot{fill:none;stroke:var(--rule)}
+.num{font-size:10px;fill:var(--muted)}
+</style><rect class="bg" width="100%" height="100%"/>
+<line class="life" x1="123.0" y1="52" x2="123.0" y2="842"/>
+<rect class="lane-head" x="48.0" y="4" width="150" height="46" rx="6"/><text class="lane-n" x="123.0" y="24" text-anchor="middle">Old leader</text><text class="lane-s" x="123.0" y="40" text-anchor="middle">member</text>
+<line class="life" x1="289.0" y1="52" x2="289.0" y2="842"/>
+<rect class="lane-head" x="214.0" y="4" width="150" height="46" rx="6"/><text class="lane-n" x="289.0" y="24" text-anchor="middle">New leader</text><text class="lane-s" x="289.0" y="40" text-anchor="middle">member</text>
+<line class="life" x1="455.0" y1="52" x2="455.0" y2="842"/>
+<rect class="lane-head" x="380.0" y="4" width="150" height="46" rx="6"/><text class="lane-n" x="455.0" y="24" text-anchor="middle">Helper</text><text class="lane-s" x="455.0" y="40" text-anchor="middle">spawned process</text>
+<line class="life" x1="621.0" y1="52" x2="621.0" y2="842"/>
+<rect class="lane-head" x="546.0" y="4" width="150" height="46" rx="6"/><text class="lane-n" x="621.0" y="24" text-anchor="middle">Follower</text><text class="lane-s" x="621.0" y="40" text-anchor="middle">member</text>
+<line class="life" x1="787.0" y1="52" x2="787.0" y2="842"/>
+<rect class="lane-head" x="712.0" y="4" width="150" height="46" rx="6"/><text class="lane-n" x="787.0" y="24" text-anchor="middle">Elector</text><text class="lane-s" x="787.0" y="40" text-anchor="middle">dgen_server</text>
+<line class="life" x1="953.0" y1="52" x2="953.0" y2="842"/>
+<rect class="lane-head" x="878.0" y="4" width="150" height="46" rx="6"/><text class="lane-n" x="953.0" y="24" text-anchor="middle">Backend</text><text class="lane-s" x="953.0" y="40" text-anchor="middle">FDB keys</text>
+<rect class="act warn" x="53.0" y="78" width="140.0" height="25" rx="5"/>
+<text class="act-t warn" x="123.0" y="94" text-anchor="middle">Process or node dies</text>
+<line class="ln m-signal" x1="123.0" y1="129" x2="613.0" y2="129"/>
+<polygon class="head m-signal" points="289.0,129.0 281.0,124.5 281.0,133.5"/>
+<polygon class="head m-signal" points="621.0,129.0 613.0,124.5 613.0,133.5"/>
+<text class="lbl m-signal" x="206.0" y="122" text-anchor="middle">&#x27;DOWN&#x27; on the peer monitor</text>
+<circle class="num-dot" cx="18" cy="125.0" r="9"/><text class="num" x="18" y="128.5" text-anchor="middle">1</text>
+<rect class="act " x="144.0" y="147" width="290.0" height="40" rx="5"/>
+<text class="act-t " x="289.0" y="163" text-anchor="middle">Sets leader_down. A helper reads L0&#x27;s current</text>
+<text class="act-t " x="289.0" y="178" text-anchor="middle">token.</text>
+<line class="ln m-db" x1="289.0" y1="213" x2="779.0" y2="213"/>
+<polygon class="head m-db" points="787.0,213.0 779.0,208.5 779.0,217.5"/>
+<text class="lbl m-db" x="538.0" y="206" text-anchor="middle">{member_down, L0, Token}</text>
+<circle class="num-dot" cx="18" cy="209.0" r="9"/><text class="num" x="18" y="212.5" text-anchor="middle">2</text>
+<rect class="act " x="648.0" y="231" width="278.0" height="25" rx="5"/>
+<text class="act-t " x="787.0" y="247" text-anchor="middle">Removes L0 and elects N. Epoch becomes E+1.</text>
+<line class="ln m-db accent" x1="787.0" y1="282" x2="945.0" y2="282"/>
+<polygon class="head m-db accent" points="953.0,282.0 945.0,277.5 945.0,286.5"/>
+<text class="lbl m-db accent" x="870.0" y="275" text-anchor="middle">commit leader key {N, E+1}</text>
+<circle class="num-dot" cx="18" cy="278.0" r="9"/><text class="num" x="18" y="281.5" text-anchor="middle">3</text>
+<line class="ln m-call" x1="787.0" y1="316" x2="297.0" y2="316"/>
+<circle class="dot m-call" cx="787.0" cy="316" r="3.2"/>
+<polygon class="head m-call" points="289.0,316.0 297.0,311.5 297.0,320.5"/>
+<text class="lbl m-call" x="538.0" y="309" text-anchor="middle">{elector_assume_and_distribute, undefined, …, E+1}</text>
+<circle class="num-dot" cx="18" cy="312.0" r="9"/><text class="num" x="18" y="315.5" text-anchor="middle">4</text>
+<rect class="act " x="150.0" y="334" width="278.0" height="40" rx="5"/>
+<text class="act-t " x="289.0" y="350" text-anchor="middle">Moves to assuming. Captures its own records</text>
+<text class="act-t " x="289.0" y="365" text-anchor="middle">and version.</text>
+<line class="ln m-reply" x1="289.0" y1="400" x2="779.0" y2="400"/>
+<polygon class="head m-reply" points="787.0,400.0 779.0,395.5 779.0,404.5"/>
+<text class="lbl m-reply" x="538.0" y="393" text-anchor="middle">ok</text>
+<circle class="num-dot" cx="18" cy="396.0" r="9"/><text class="num" x="18" y="399.5" text-anchor="middle">5</text>
+<line class="ln m-cast" x1="289.0" y1="434" x2="447.0" y2="434"/>
+<polygon class="head m-cast" points="455.0,434.0 447.0,429.5 447.0,438.5"/>
+<text class="lbl m-cast" x="372.0" y="427" text-anchor="middle">spawn the gather</text>
+<circle class="num-dot" cx="18" cy="430.0" r="9"/><text class="num" x="18" y="433.5" text-anchor="middle">6</text>
+<line class="ln m-call" x1="455.0" y1="468" x2="613.0" y2="468"/>
+<circle class="dot m-call" cx="455.0" cy="468" r="3.2"/>
+<polygon class="head m-call" points="621.0,468.0 613.0,463.5 613.0,472.5"/>
+<text class="lbl m-call" x="538.0" y="461" text-anchor="middle">get_names_snapshot</text>
+<circle class="num-dot" cx="18" cy="464.0" r="9"/><text class="num" x="18" y="467.5" text-anchor="middle">7</text>
+<line class="ln m-reply" x1="621.0" y1="502" x2="463.0" y2="502"/>
+<polygon class="head m-reply" points="455.0,502.0 463.0,497.5 463.0,506.5"/>
+<text class="lbl m-reply" x="538.0" y="495" text-anchor="middle">{Records, V, Released, LeaderGone}</text>
+<circle class="num-dot" cx="18" cy="498.0" r="9"/><text class="num" x="18" y="501.5" text-anchor="middle">8</text>
+<line class="ln m-db" x1="455.0" y1="536" x2="945.0" y2="536"/>
+<polygon class="head m-db" points="953.0,536.0 945.0,531.5 945.0,540.5"/>
+<text class="lbl m-db" x="704.0" y="529" text-anchor="middle">read committed frontier</text>
+<circle class="num-dot" cx="18" cy="532.0" r="9"/><text class="num" x="18" y="535.5" text-anchor="middle">9</text>
+<rect class="act " x="319.0" y="554" width="272.0" height="55" rx="5"/>
+<text class="act-t " x="455.0" y="570" text-anchor="middle">Gathers again every 25 ms until MaxVersion</text>
+<text class="act-t " x="455.0" y="585" text-anchor="middle">reaches the frontier, every peer reports</text>
+<text class="act-t " x="455.0" y="600" text-anchor="middle">LeaderGone, or 2 s pass</text>
+<line class="ln m-call" x1="455.0" y1="635" x2="779.0" y2="635"/>
+<circle class="dot m-call" cx="455.0" cy="635" r="3.2"/>
+<polygon class="head m-call" points="787.0,635.0 779.0,630.5 779.0,639.5"/>
+<text class="lbl m-call" x="621.0" y="628" text-anchor="middle">get_subscriptions</text>
+<circle class="num-dot" cx="18" cy="631.0" r="9"/><text class="num" x="18" y="634.5" text-anchor="middle">10</text>
+<line class="ln m-cast" x1="455.0" y1="669" x2="297.0" y2="669"/>
+<polygon class="head m-cast" points="289.0,669.0 297.0,664.5 297.0,673.5"/>
+<text class="lbl m-cast" x="372.0" y="662" text-anchor="middle">{assume_gathered, …, Freshest, {MaxVersion, Frontier}, …}</text>
+<circle class="num-dot" cx="18" cy="665.0" r="9"/><text class="num" x="18" y="668.5" text-anchor="middle">11</text>
+<rect class="act " x="147.0" y="687" width="284.0" height="55" rx="5"/>
+<text class="act-t " x="289.0" y="703" text-anchor="middle">Repairs conflicts. Adopts the replica at</text>
+<text class="act-t " x="289.0" y="718" text-anchor="middle">(E+1, MaxVersion). Becomes leader and starts</text>
+<text class="act-t " x="289.0" y="733" text-anchor="middle">the monitor sweep.</text>
+<line class="ln m-cast accent" x1="289.0" y1="768" x2="613.0" y2="768"/>
+<polygon class="head m-cast accent" points="621.0,768.0 613.0,763.5 613.0,772.5"/>
+<text class="lbl m-cast accent" x="455.0" y="761" text-anchor="middle">{apply_names_snapshot, Records, N, …, E+1, MaxVersion}</text>
+<circle class="num-dot" cx="18" cy="764.0" r="9"/><text class="num" x="18" y="767.5" text-anchor="middle">12</text>
+<rect class="act " x="488.0" y="786" width="266.0" height="40" rx="5"/>
+<text class="act-t " x="621.0" y="802" text-anchor="middle">Follows N. Releases or re-drives its held</text>
+<text class="act-t " x="621.0" y="817" text-anchor="middle">replies.</text>
+</svg>
